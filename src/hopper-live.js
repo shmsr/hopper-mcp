@@ -184,7 +184,7 @@ def safe_call(default, func, *args):
 def stable_id(prefix, *parts):
     h = hashlib.sha256()
     for part in parts:
-        h.update(safe_string(part).encode("utf-8", "replace"))
+        h.update((safe_string(part) or "<none>").encode("utf-8", "replace"))
         h.update(b"\x00")
     return "%s-%s" % (prefix, h.hexdigest()[:16])
 

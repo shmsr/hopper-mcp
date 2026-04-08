@@ -45,7 +45,18 @@ export async function ingestWithLiveHopper({
   });
 
   try {
-    const session = await waitForJson(outputPath, timeoutMs, () => ({ stdout, stderr, childExit, hopperLauncher, args }));
+    const session = await waitForJson(outputPath, timeoutMs, () => ({
+      stdout,
+      stderr,
+      childExit,
+      hopperLauncher,
+      args,
+      parseObjectiveC,
+      parseSwift,
+      analysis,
+      executablePath,
+      outputPath,
+    }));
     return {
       session: normalizeSession(session),
       launch: {
@@ -84,13 +95,24 @@ async function waitForJson(path, timeoutMs, diagnostics) {
   }
 
   const details = diagnostics();
-  throw new Error(`Timed out waiting for Hopper live export after ${timeoutMs}ms.${lastError ? ` Last error: ${lastError.message}` : ""} Diagnostics: ${JSON.stringify({
+  throw new Error(`Timed out waiting for Hopper live export after ${timeoutMs}ms.${lastError ? ` Last error: ${lastError.message}` : ""} ${timeoutHint(details)} Diagnostics: ${JSON.stringify({
     childExit: details.childExit,
     hopperLauncher: details.hopperLauncher,
     args: details.args,
+    outputPath: details.outputPath,
     stdoutTail: details.stdout.slice(-1000),
     stderrTail: details.stderr.slice(-1000),
   })}`);
+}
+
+function timeoutHint(details) {
+  if (details.childExit?.code === 0) {
+    return "Hopper accepted the AppleScript request, but the exporter did not write a session file before the timeout. If this is a large binary, retry with parse_objective_c=false, parse_swift=false, smaller max_functions/max_strings, or use open_session with an imported session.";
+  }
+  if (details.parseObjectiveC || details.parseSwift) {
+    return "For large Mach-O files, retry with parse_objective_c=false and parse_swift=false first.";
+  }
+  return "Hopper may still be analyzing the target or waiting for UI input.";
 }
 
 function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock }) {

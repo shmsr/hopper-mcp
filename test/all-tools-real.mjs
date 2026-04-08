@@ -11,6 +11,7 @@ const expectedTools = [
   "open_session",
   "ingest_sample",
   "ingest_live_hopper",
+  "import_macho",
   "resolve",
   "analyze_function_deep",
   "get_graph_slice",
@@ -117,6 +118,19 @@ try {
     sessionId = ingest.session.sessionId;
     assert(ingest.session.counts.functions > 0, "live ingest did not return functions.");
     assert(ingest.session.counts.strings > 0, "live ingest did not return strings.");
+  });
+
+  await check("import_macho", async () => {
+    const imported = toolPayload(await rpc("tools/call", {
+      name: "import_macho",
+      arguments: {
+        executable_path: target,
+        arch: "arm64",
+        max_strings: 200,
+      },
+    }));
+    assert(imported.session.counts.strings > 0, "import_macho did not return strings.");
+    assert(imported.source === "local-macho-importer", "import_macho returned unexpected source.");
   });
 
   let functions;

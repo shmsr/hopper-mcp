@@ -55,6 +55,14 @@ try {
     arguments: {},
     _meta: { progressToken: "ingest-sample-test" },
   });
+  const strings = await rpc(6, "tools/call", {
+    name: "search_strings",
+    arguments: { regex: "license" },
+  });
+  const matches = await rpc(7, "tools/call", {
+    name: "resolve",
+    arguments: { query: "license" },
+  });
 
   if (initialized.protocolVersion !== "2025-11-25") {
     throw new Error(`Expected protocolVersion 2025-11-25, got ${initialized.protocolVersion}`);
@@ -80,6 +88,12 @@ try {
   }
   if (!ingest.structuredContent?.counts?.functions) {
     throw new Error("Tool call did not return structuredContent with the ingested session counts.");
+  }
+  if (!Array.isArray(strings.structuredContent?.result)) {
+    throw new Error("Array tool result was not wrapped in structuredContent.result.");
+  }
+  if (!Array.isArray(matches.structuredContent?.result)) {
+    throw new Error("Resolve tool result was not wrapped in structuredContent.result.");
   }
   if (!notifications.some((message) => message.method === "notifications/progress")) {
     throw new Error("Progress notification was not emitted for a progress-tokened tool call.");

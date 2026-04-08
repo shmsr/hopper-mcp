@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { KnowledgeStore } from "./knowledge-store.js";
 import { TransactionManager } from "./transaction-manager.js";
 import { HopperAdapter } from "./hopper-adapter.js";
+import { importMachO } from "./macho-importer.js";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const store = new KnowledgeStore(process.env.HOPPER_MCP_STORE ?? join(ROOT, "data", "knowledge-store.json"));
@@ -41,6 +42,11 @@ const tools = [
     analysis: { type: "boolean" },
     parse_objective_c: { type: "boolean" },
     parse_swift: { type: "boolean" },
+  }, ["executable_path"]),
+  tool("import_macho", "Import Mach-O symbols, imports, libraries, and strings using local macOS command-line tools.", {
+    executable_path: { type: "string" },
+    arch: { type: "string" },
+    max_strings: { type: "number" },
   }, ["executable_path"]),
   tool("resolve", "Resolve an address, name, string, import, or semantic query against the knowledge store.", {
     query: { type: "string" },
@@ -229,6 +235,16 @@ async function callTool(name, args, meta = {}) {
     notifyResourceListChanged();
     notifyProgress(progressToken, 2, 2, "Live Hopper session ingested.");
     result = { session: store.describeSession(session), launch: live.launch };
+  } else if (name === "import_macho") {
+    notifyProgress(progressToken, 0, 1, "Importing Mach-O metadata.");
+    const imported = await importMachO(args.executable_path, {
+      arch: args.arch ?? "arm64",
+      maxStrings: args.max_strings ?? 5000,
+    });
+    const session = await store.upsertSession(imported);
+    notifyResourceListChanged();
+    notifyProgress(progressToken, 1, 1, "Mach-O metadata imported.");
+    result = { session: store.describeSession(session), source: "local-macho-importer" };
   } else if (name === "resolve") {
     result = store.resolve(args.query, sessionId);
   } else if (name === "analyze_function_deep") {
@@ -262,8 +278,13 @@ async function callTool(name, args, meta = {}) {
 function toolResult(result) {
   return {
     content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-    structuredContent: result,
+    structuredContent: structuredToolContent(result),
   };
+}
+
+function structuredToolContent(result) {
+  if (result && typeof result === "object" && !Array.isArray(result)) return result;
+  return { result };
 }
 
 function toolError(error) {

@@ -39,6 +39,18 @@ LIVE_HOPPER_PARSE_OBJC=0 LIVE_HOPPER_PARSE_SWIFT=0 LIVE_HOPPER_TIMEOUT_MS=120000
 
 If macOS blocks Automation, allow the launcher app to control Hopper in `System Settings > Privacy & Security > Automation`.
 
+For large binaries, start with the faster local importer:
+
+```json
+{
+  "executable_path": "/path/to/binary",
+  "arch": "arm64",
+  "max_strings": 10000
+}
+```
+
+Call that as `import_macho`. Use `ingest_live_hopper` when you need Hopper's current document state.
+
 ## Add To Clients
 
 Replace `/path/to/hopper-mcp` with the absolute path to this repo.
@@ -144,6 +156,7 @@ Tools:
 - `open_session`
 - `ingest_sample`
 - `ingest_live_hopper`
+- `import_macho`
 - `resolve`
 - `analyze_function_deep`
 - `get_graph_slice`

@@ -1,9 +1,9 @@
 {
-  "name": "hopper-mcp-knowledge-engine",
+  "name": "hopper-mcp",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Stateful Hopper reverse-engineering knowledge engine with an MCP facade.",
+  "description": "MCP server for Hopper with indexed state and transaction-safe annotations.",
   "bin": {
     "hopper-mcp": "./src/mcp-server.js"
   },

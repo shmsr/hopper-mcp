@@ -16,10 +16,10 @@ const adapter = new HopperAdapter({
 await store.load();
 
 const serverInfo = {
-  name: "hopper-mcp-knowledge-engine",
-  title: "Hopper MCP Knowledge Engine",
+  name: "hopper-mcp",
+  title: "Hopper MCP",
   version: "0.1.0",
-  description: "Stateful reverse-engineering knowledge engine for Hopper with resources, compound tools, prompts, and transactional annotations.",
+  description: "MCP server for Hopper with resources, tools, prompts, and transaction-safe annotations.",
 };
 
 const latestProtocolVersion = "2025-11-25";
@@ -119,7 +119,7 @@ const prompts = [
   {
     name: "hypothesis_workspace",
     title: "Hypothesis Workspace",
-    description: "Create a cautious reverse-engineering hypothesis with evidence gates.",
+    description: "Create a cautious Hopper hypothesis with evidence gates.",
     arguments: [{ name: "topic", description: "Hypothesis topic, e.g. license check path", required: true }],
   },
 ];

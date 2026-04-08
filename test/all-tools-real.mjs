@@ -80,7 +80,7 @@ async function check(name, fn) {
 try {
   await check("initialize", async () => {
     const initialized = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "all-tools-real-test", version: "0.1.0" } });
-    assert(initialized.serverInfo.name === "hopper-mcp-knowledge-engine", "initialize returned unexpected server name.");
+    assert(initialized.serverInfo.name === "hopper-mcp", "initialize returned unexpected server name.");
   });
 
   await check("tools/list", async () => {

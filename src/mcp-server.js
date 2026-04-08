@@ -34,6 +34,7 @@ const latestProtocolVersion = "2025-11-25";
 const supportedProtocolVersions = new Set([latestProtocolVersion, "2025-06-18", "2025-03-26"]);
 const logLevels = new Set(["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"]);
 const defaultMaxToolTextChars = 120000;
+const enableDebugTools = process.env.HOPPER_MCP_ENABLE_DEBUG_TOOLS === "1";
 let logLevel = "info";
 
 const tools = [
@@ -46,11 +47,7 @@ const tools = [
     include_full_result: { type: "boolean" },
   }, ["name"]),
   tool("official_hopper_tools", "List tools exposed by Hopper's installed official MCP server.", {}),
-  tool("debug_echo", "Internal test helper that echoes a payload through the MCP result formatter.", {
-    value: { type: "string" },
-    max_result_chars: { type: "number" },
-    include_full_result: { type: "boolean" },
-  }, ["value"]),
+  ...debugTools(),
   tool("ingest_official_hopper", "Refresh the local snapshot store from Hopper's installed official MCP server.", {
     max_procedures: { type: "number" },
     include_procedure_info: { type: "boolean" },
@@ -420,14 +417,14 @@ async function callTool(name, args, meta = {}) {
     const officialResult = await officialBackend.callTool(args.name, args.arguments ?? {}, { confirmLiveWrite: Boolean(args.confirm_live_write) });
     result = officialToolPayload(officialResult);
     return toolResult(result, {
-      maxTextChars: Number(args.max_result_chars ?? defaultMaxToolTextChars),
+      maxTextChars: boundedNumber(args.max_result_chars, defaultMaxToolTextChars),
       includeFullResult: Boolean(args.include_full_result),
     });
   } else if (name === "official_hopper_tools") {
     result = await officialBackend.listTools();
   } else if (name === "debug_echo") {
     return toolResult(args.value, {
-      maxTextChars: Number(args.max_result_chars ?? defaultMaxToolTextChars),
+      maxTextChars: boundedNumber(args.max_result_chars, defaultMaxToolTextChars),
       includeFullResult: Boolean(args.include_full_result),
     });
   } else if (name === "ingest_official_hopper" || name === "refresh_snapshot") {
@@ -904,6 +901,12 @@ function limitResults(items, maxResults) {
   return items.slice(0, limit);
 }
 
+function boundedNumber(value, fallback) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.floor(parsed));
+}
+
 function objectFromFunctions(functions, mapper) {
   return Object.fromEntries(functions.map((fn) => [fn.addr, mapper(fn)]));
 }
@@ -1046,6 +1049,17 @@ function tool(name, description, properties, required = []) {
       additionalProperties: false,
     },
   };
+}
+
+function debugTools() {
+  if (!enableDebugTools) return [];
+  return [
+    tool("debug_echo", "Internal test helper that echoes a payload through the MCP result formatter.", {
+      value: { type: "string" },
+      max_result_chars: { type: "number" },
+      include_full_result: { type: "boolean" },
+    }, ["value"]),
+  ];
 }
 
 function titleize(name) {

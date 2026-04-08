@@ -52,6 +52,7 @@ Reference: https://go.dev/wiki/CommitMessage
 Run the fast checks before pushing:
 
 ```bash
+npm run check
 npm run test:protocol
 npm run smoke
 npm run test:real

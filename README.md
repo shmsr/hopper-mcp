@@ -306,7 +306,9 @@ Tools:
 - `preview_transaction`
 - `commit_transaction`
 - `rollback_transaction`
-- `debug_echo` (internal formatter test helper)
+
+Internal test helpers such as `debug_echo` are hidden unless
+`HOPPER_MCP_ENABLE_DEBUG_TOOLS=1` is set.
 
 Prompts:
 

@@ -7,7 +7,11 @@ import { dirname, join } from "node:path";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const child = spawn(process.execPath, [join(root, "src", "mcp-server.js")], {
   stdio: ["pipe", "pipe", "inherit"],
-  env: { ...process.env, HOPPER_MCP_STORE: join(root, "data", "protocol-compat-store.json") },
+  env: {
+    ...process.env,
+    HOPPER_MCP_ENABLE_DEBUG_TOOLS: "1",
+    HOPPER_MCP_STORE: join(root, "data", "protocol-compat-store.json"),
+  },
 });
 
 const rl = createInterface({ input: child.stdout });

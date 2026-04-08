@@ -42,6 +42,7 @@ const tools = [
     analysis: { type: "boolean" },
     parse_objective_c: { type: "boolean" },
     parse_swift: { type: "boolean" },
+    wait_for_analysis: { type: "boolean" },
   }, ["executable_path"]),
   tool("import_macho", "Import Mach-O symbols, imports, libraries, and strings using local macOS command-line tools.", {
     executable_path: { type: "string" },
@@ -231,6 +232,7 @@ async function callTool(name, args, meta = {}) {
       analysis: args.analysis,
       parseObjectiveC: args.parse_objective_c,
       parseSwift: args.parse_swift,
+      waitForAnalysis: args.wait_for_analysis,
     });
     notifyProgress(progressToken, 1, 2, "Ingesting Hopper export.");
     const session = await store.upsertSession(live.session);

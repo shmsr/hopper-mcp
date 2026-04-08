@@ -44,6 +44,7 @@ try {
       timeout_ms: timeoutMs,
       max_functions: Number(process.env.LIVE_HOPPER_MAX_FUNCTIONS ?? 200),
       max_strings: Number(process.env.LIVE_HOPPER_MAX_STRINGS ?? 500),
+      analysis: process.env.LIVE_HOPPER_ANALYSIS !== "0",
       parse_objective_c: process.env.LIVE_HOPPER_PARSE_OBJC !== "0",
       parse_swift: process.env.LIVE_HOPPER_PARSE_SWIFT !== "0",
     },
@@ -52,6 +53,9 @@ try {
   const binaryStrings = await rpc("resources/read", { uri: "hopper://binary/strings" });
   const resources = await rpc("resources/list");
 
+  if (ingest.isError) {
+    throw new Error(ingest.content?.[0]?.text ?? "Live Hopper ingest failed.");
+  }
   const ingestResult = JSON.parse(ingest.content[0].text);
   const metadataResult = JSON.parse(metadata.contents[0].text);
   const stringResult = JSON.parse(binaryStrings.contents[0].text);

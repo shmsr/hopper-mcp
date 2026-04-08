@@ -17,21 +17,52 @@ export async function ingestWithLiveHopper({
   maxStrings = 5000,
   maxBlocksPerFunction = 64,
   maxInstructionsPerBlock = 24,
+  waitForAnalysis = false,
 } = {}) {
   if (!executablePath) throw new Error("ingest_live_hopper requires executable_path.");
 
+  return runHopperExporter({
+    hopperLauncher,
+    timeoutMs,
+    maxFunctions,
+    maxStrings,
+    maxBlocksPerFunction,
+    maxInstructionsPerBlock,
+    waitForAnalysis,
+    buildAppleScript: (scriptPath) => buildOpenExecutableAppleScript({
+      executablePath,
+      scriptPath,
+      analysis,
+      parseObjectiveC,
+      parseSwift,
+    }),
+    diagnostics: {
+      mode: "open_executable",
+      parseObjectiveC,
+      parseSwift,
+      analysis,
+      executablePath,
+    },
+  });
+}
+
+async function runHopperExporter({
+  hopperLauncher,
+  timeoutMs,
+  maxFunctions,
+  maxStrings,
+  maxBlocksPerFunction,
+  maxInstructionsPerBlock,
+  waitForAnalysis,
+  buildAppleScript,
+  diagnostics,
+}) {
   const workdir = await mkdtemp(join(tmpdir(), "hopper-live-"));
   const outputPath = join(workdir, "session.json");
   const scriptPath = join(workdir, "export_live_session.py");
-  await writeFile(scriptPath, buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock }), "utf8");
+  await writeFile(scriptPath, buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, waitForAnalysis }), "utf8");
 
-  const appleScript = buildOpenExecutableAppleScript({
-    executablePath,
-    scriptPath,
-    analysis,
-    parseObjectiveC,
-    parseSwift,
-  });
+  const appleScript = buildAppleScript(scriptPath);
   const args = ["-e", appleScript];
 
   const child = spawn(hopperLauncher, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -51,10 +82,7 @@ export async function ingestWithLiveHopper({
       childExit,
       hopperLauncher,
       args,
-      parseObjectiveC,
-      parseSwift,
-      analysis,
-      executablePath,
+      ...diagnostics,
       outputPath,
     }));
     return {
@@ -107,7 +135,7 @@ async function waitForJson(path, timeoutMs, diagnostics) {
 
 function timeoutHint(details) {
   if (details.childExit?.code === 0) {
-    return "Hopper accepted the AppleScript request, but the exporter did not write a session file before the timeout. If this is a large binary, retry with parse_objective_c=false, parse_swift=false, smaller max_functions/max_strings, or use open_session with an imported session.";
+    return "Hopper accepted the AppleScript request, but the exporter did not write a session file before the timeout. If this is a large binary, retry with import_macho or smaller max_functions/max_strings.";
   }
   if (details.parseObjectiveC || details.parseSwift) {
     return "For large Mach-O files, retry with parse_objective_c=false and parse_swift=false first.";
@@ -115,8 +143,9 @@ function timeoutHint(details) {
   return "Hopper may still be analyzing the target or waiting for UI input.";
 }
 
-function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock }) {
+function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, waitForAnalysis }) {
   return String.raw`
+import hashlib
 import json
 import traceback
 
@@ -125,6 +154,7 @@ MAX_FUNCTIONS = ${JSON.stringify(maxFunctions)}
 MAX_STRINGS = ${JSON.stringify(maxStrings)}
 MAX_BLOCKS_PER_FUNCTION = ${JSON.stringify(maxBlocksPerFunction)}
 MAX_INSTRUCTIONS_PER_BLOCK = ${JSON.stringify(maxInstructionsPerBlock)}
+WAIT_FOR_ANALYSIS = ${pythonBool(waitForAnalysis)}
 
 def hx(value):
     try:
@@ -150,6 +180,13 @@ def safe_call(default, func, *args):
         return value
     except Exception:
         return default
+
+def stable_id(prefix, *parts):
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(safe_string(part).encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return "%s-%s" % (prefix, h.hexdigest()[:16])
 
 def procedure_addr(proc):
     return safe_call(None, proc.getEntryPoint)
@@ -284,13 +321,14 @@ def collect_functions(doc):
 
 try:
     doc = Document.getCurrentDocument()
-    doc.waitForBackgroundProcessToEnd()
+    if WAIT_FOR_ANALYSIS:
+        doc.waitForBackgroundProcessToEnd()
     executable_path = safe_call(None, doc.getExecutableFilePath)
     database_path = safe_call(None, doc.getDatabaseFilePath)
     document_name = safe_call("Hopper Document", doc.getDocumentName)
     session = {
-        "sessionId": "hopper-live-%s" % abs(hash((document_name, executable_path, database_path))),
-        "binaryId": "hopper-live-%s" % abs(hash((executable_path, document_name))),
+        "sessionId": stable_id("hopper-live", document_name, executable_path, database_path),
+        "binaryId": stable_id("hopper-live", executable_path, document_name),
         "binary": {
             "name": safe_string(document_name),
             "path": safe_string(executable_path),
@@ -336,6 +374,10 @@ function buildOpenExecutableAppleScript({ executablePath, scriptPath, analysis, 
     " execute Python script POSIX file ",
     quoteAppleScriptString(scriptPath),
   ].join("");
+}
+
+function pythonBool(value) {
+  return value ? "True" : "False";
 }
 
 function quoteAppleScriptString(value) {

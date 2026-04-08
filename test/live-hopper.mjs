@@ -64,6 +64,10 @@ try {
     name: "ingest_live_hopper",
     arguments: ingestArgs,
   });
+  const repeatedIngest = await rpc("tools/call", {
+    name: "ingest_live_hopper",
+    arguments: ingestArgs,
+  });
   const metadata = await rpc("resources/read", { uri: "hopper://binary/metadata" });
   const binaryStrings = await rpc("resources/read", { uri: "hopper://binary/strings" });
   const resources = await rpc("resources/list");
@@ -71,7 +75,11 @@ try {
   if (ingest.isError) {
     throw new Error(ingest.content?.[0]?.text ?? "Live Hopper ingest failed.");
   }
+  if (repeatedIngest.isError) {
+    throw new Error(repeatedIngest.content?.[0]?.text ?? "Repeated live Hopper ingest failed.");
+  }
   const ingestResult = JSON.parse(ingest.content[0].text);
+  const repeatedIngestResult = JSON.parse(repeatedIngest.content[0].text);
   const metadataResult = JSON.parse(metadata.contents[0].text);
   const stringResult = JSON.parse(binaryStrings.contents[0].text);
 
@@ -83,6 +91,9 @@ try {
   }
   if (!metadataResult.segments || !ingestResult.session.capabilities?.liveExport) {
     throw new Error("Live Hopper ingest did not include live export metadata.");
+  }
+  if (repeatedIngestResult.launch?.skipped !== true || repeatedIngestResult.launch?.mode !== "reuse_current_document") {
+    throw new Error("Repeated live Hopper ingest reopened Hopper instead of reusing the current document.");
   }
 
   console.log(JSON.stringify({
@@ -98,6 +109,7 @@ try {
       segments: metadataResult.segments.length,
     },
     liveExport: ingestResult.session.capabilities.liveExport,
+    repeatedLaunch: repeatedIngestResult.launch,
   }, null, 2));
 } catch (error) {
   const message = String(error.message ?? error);

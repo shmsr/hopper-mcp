@@ -1,12 +1,67 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { promisify } from "node:util";
 import { normalizeSession } from "./knowledge-store.js";
+import { OfficialHopperBackend, officialToolPayload } from "./official-hopper-backend.js";
+import { buildOfficialSnapshot } from "./official-snapshot.js";
 
 const DEFAULT_OSASCRIPT = "/usr/bin/osascript";
+const DEFAULT_HOPPER_CLI = "/Applications/Hopper Disassembler.app/Contents/MacOS/Hopper Disassembler";
+const execFileAsync = promisify(execFile);
+const PREFERRED_ARCHS = ["arm64e", "arm64", "x86_64"];
+const liveIngestInFlight = new Map();
+let liveIngestQueue = Promise.resolve();
 
 export async function ingestWithLiveHopper({
+  executablePath,
+  hopperLauncher = DEFAULT_OSASCRIPT,
+  analysis = true,
+  parseObjectiveC = true,
+  parseSwift = true,
+  timeoutMs = 600000,
+  maxFunctions,
+  maxStrings,
+  maxBlocksPerFunction,
+  maxInstructionsPerBlock,
+  includePseudocode = false,
+  maxPseudocodeFunctions,
+  waitForAnalysis = false,
+  fullExport = false,
+  failOnTruncation = fullExport,
+} = {}) {
+  if (!executablePath) throw new Error("ingest_live_hopper requires executable_path.");
+  const executableKey = normalizeExecutableKey(executablePath);
+  const existing = liveIngestInFlight.get(executableKey);
+  if (existing) return await existing;
+
+  const task = enqueueLiveIngest(() => ingestWithLiveHopperUnlocked({
+    executablePath,
+    hopperLauncher,
+    analysis,
+    parseObjectiveC,
+    parseSwift,
+    timeoutMs,
+    maxFunctions,
+    maxStrings,
+    maxBlocksPerFunction,
+    maxInstructionsPerBlock,
+    includePseudocode,
+    maxPseudocodeFunctions,
+    waitForAnalysis,
+    fullExport,
+    failOnTruncation,
+  }));
+  liveIngestInFlight.set(executableKey, task);
+  try {
+    return await task;
+  } finally {
+    if (liveIngestInFlight.get(executableKey) === task) liveIngestInFlight.delete(executableKey);
+  }
+}
+
+async function ingestWithLiveHopperUnlocked({
   executablePath,
   hopperLauncher = DEFAULT_OSASCRIPT,
   analysis = true,
@@ -31,36 +86,380 @@ export async function ingestWithLiveHopper({
   const effectiveMaxBlocksPerFunction = fullExport ? (maxBlocksPerFunction ?? null) : (maxBlocksPerFunction ?? 64);
   const effectiveMaxInstructionsPerBlock = fullExport ? (maxInstructionsPerBlock ?? null) : (maxInstructionsPerBlock ?? 24);
   const effectiveMaxPseudocodeFunctions = includePseudocode ? (maxPseudocodeFunctions ?? 25) : 0;
+  const officialBackend = new OfficialHopperBackend({
+    timeoutMs: Math.min(Math.max(10000, Math.floor(timeoutMs / 4)), 30000),
+  });
 
-  return runHopperExporter({
-    hopperLauncher,
-    timeoutMs,
-    maxFunctions: effectiveMaxFunctions,
-    maxStrings: effectiveMaxStrings,
-    maxBlocksPerFunction: effectiveMaxBlocksPerFunction,
-    maxInstructionsPerBlock: effectiveMaxInstructionsPerBlock,
-    includePseudocode,
-    maxPseudocodeFunctions: effectiveMaxPseudocodeFunctions,
-    waitForAnalysis: effectiveWaitForAnalysis,
-    fullExport,
-    failOnTruncation,
-    buildAppleScript: (scriptPath) => buildOpenExecutableAppleScript({
+  try {
+    const baselineCurrentDocument = await safeCurrentDocument(officialBackend);
+    const reusableCurrentDocument = await shouldReuseCurrentDocument({
+      officialBackend,
       executablePath,
-      scriptPath,
+      currentDocument: baselineCurrentDocument,
+    });
+    const launch = await launchExecutableInHopper({
+      executablePath,
+      hopperLauncher,
       analysis,
       parseObjectiveC,
       parseSwift,
-    }),
-    diagnostics: {
-      mode: "open_executable",
-      parseObjectiveC,
-      parseSwift,
-      analysis,
+      skipLaunch: reusableCurrentDocument,
+    });
+    const snapshot = await waitForOfficialSnapshot({
+      officialBackend,
       executablePath,
+      baselineCurrentDocument,
+      timeoutMs,
+      maxFunctions: effectiveMaxFunctions,
+      includePseudocode,
+      failOnTruncation,
+    });
+    snapshot.sessionId = `live-${snapshot.sessionId ?? safeId(basename(executablePath))}`;
+    snapshot.binaryId = `live-${snapshot.binaryId ?? safeId(basename(executablePath))}`;
+    applyLiveExportLimits(snapshot, {
+      maxStrings: effectiveMaxStrings,
+      maxPseudocodeFunctions: effectiveMaxPseudocodeFunctions,
       fullExport,
       waitForAnalysis: effectiveWaitForAnalysis,
-    },
+      failOnTruncation,
+      maxFunctions: effectiveMaxFunctions,
+      maxBlocksPerFunction: effectiveMaxBlocksPerFunction,
+      maxInstructionsPerBlock: effectiveMaxInstructionsPerBlock,
+    });
+    await enrichSnapshotBinary(snapshot, executablePath);
+    return {
+      session: normalizeSession(snapshot),
+      launch,
+    };
+  } finally {
+    officialBackend.close();
+  }
+}
+
+function enqueueLiveIngest(work) {
+  const task = liveIngestQueue
+    .catch(() => {})
+    .then(work);
+  liveIngestQueue = task.catch(() => {});
+  return task;
+}
+
+async function launchExecutableInHopper({
+  executablePath,
+  hopperLauncher,
+  analysis,
+  parseObjectiveC,
+  parseSwift,
+  skipLaunch = false,
+}) {
+  if (skipLaunch) {
+    return {
+      hopperLauncher: null,
+      args: [],
+      mode: "reuse_current_document",
+      appleScript: null,
+      stdout: "",
+      stderr: "",
+      skipped: true,
+    };
+  }
+
+  const launch = buildLaunchSpec({
+    executablePath,
+    analysis,
+    parseObjectiveC,
+    parseSwift,
+    hopperLauncher,
   });
+
+  if (launch.mode === "cli") {
+    const child = spawn(launch.command, launch.args, {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    return {
+      hopperLauncher: launch.command,
+      args: launch.args,
+      mode: launch.mode,
+      appleScript: null,
+      stdout: "",
+      stderr: "",
+      skipped: false,
+    };
+  }
+
+  const launched = await execFileAsync(launch.command, launch.args, {
+    timeout: 30000,
+    maxBuffer: 1024 * 1024,
+  });
+  return {
+    hopperLauncher: launch.command,
+    args: launch.args,
+    mode: launch.mode,
+    appleScript: launch.appleScript ?? null,
+    stdout: launched.stdout ?? "",
+    stderr: launched.stderr ?? "",
+    skipped: false,
+  };
+}
+
+async function shouldReuseCurrentDocument({
+  officialBackend,
+  executablePath,
+  currentDocument,
+}) {
+  if (currentDocument !== basename(executablePath)) return false;
+  try {
+    const procedures = await officialBackend.callTool("list_procedures", {});
+    const procedureIndex = officialToolPayload(procedures);
+    if (procedureIndex && typeof procedureIndex === "object" && Object.keys(procedureIndex).length > 0) return true;
+  } catch {
+    return true;
+  }
+  return true;
+}
+
+async function waitForOfficialSnapshot({
+  officialBackend,
+  executablePath,
+  baselineCurrentDocument,
+  timeoutMs,
+  maxFunctions,
+  includePseudocode,
+  failOnTruncation,
+}) {
+  const deadline = Date.now() + timeoutMs;
+  const expectedName = basename(executablePath);
+  let lastError = null;
+
+  while (Date.now() < deadline) {
+    try {
+      const currentDocument = await safeCurrentDocument(officialBackend);
+      const documents = await safeDocumentList(officialBackend);
+      const shouldProbe =
+        currentDocument === expectedName ||
+        (currentDocument && currentDocument !== baselineCurrentDocument) ||
+        documents.includes(expectedName);
+
+      if (shouldProbe) {
+        const procedures = await officialBackend.callTool("list_procedures", {});
+        const procedureIndex = officialToolPayload(procedures);
+        if (procedureIndex && typeof procedureIndex === "object" && Object.keys(procedureIndex).length > 0) {
+          return await buildOfficialSnapshot(officialBackend, {
+            maxProcedures: maxFunctions,
+            includeProcedureInfo: true,
+            includeAssembly: true,
+            includePseudocode,
+            includeCallGraph: true,
+            failOnTruncation,
+          });
+        }
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  throw new Error(`Timed out waiting for Hopper to analyze '${expectedName}' through the official backend.${lastError ? ` Last error: ${String(lastError.message ?? lastError)}` : ""}`);
+}
+
+async function safeCurrentDocument(officialBackend) {
+  try {
+    const result = await officialBackend.callTool("current_document", {});
+    return officialToolPayload(result);
+  } catch {
+    return null;
+  }
+}
+
+async function safeDocumentList(officialBackend) {
+  try {
+    const result = await officialBackend.callTool("list_documents", {});
+    const payload = officialToolPayload(result);
+    return Array.isArray(payload) ? payload : [];
+  } catch {
+    return [];
+  }
+}
+
+function applyLiveExportLimits(snapshot, {
+  maxStrings,
+  maxPseudocodeFunctions,
+  fullExport,
+  waitForAnalysis,
+  failOnTruncation,
+  maxFunctions,
+  maxBlocksPerFunction,
+  maxInstructionsPerBlock,
+}) {
+  const stringLimit = normalizeLimit(maxStrings);
+  const pseudocodeLimit = normalizeLimit(maxPseudocodeFunctions);
+  const originalStringCount = snapshot.strings?.length ?? 0;
+  let stringsTruncated = false;
+
+  if (stringLimit !== null && originalStringCount > stringLimit) {
+    snapshot.strings = snapshot.strings.slice(0, stringLimit);
+    stringsTruncated = true;
+  }
+
+  if (pseudocodeLimit !== null && pseudocodeLimit >= 0) {
+    let exportedPseudocode = 0;
+    for (const fn of snapshot.functions ?? []) {
+      if (!fn.pseudocode) continue;
+      if (exportedPseudocode >= pseudocodeLimit) {
+        fn.pseudocode = null;
+      } else {
+        exportedPseudocode += 1;
+      }
+    }
+  }
+
+  const totals = snapshot.capabilities?.officialSnapshot?.totals ?? {};
+  const exported = snapshot.capabilities?.officialSnapshot?.exported ?? {};
+  const truncated = snapshot.capabilities?.officialSnapshot?.truncated ?? {};
+  snapshot.capabilities = {
+    ...(snapshot.capabilities ?? {}),
+    liveExport: {
+      backend: "official-hopper-mcp",
+      fullExport,
+      waitForAnalysis,
+      failOnTruncation,
+      limits: {
+        functions: maxFunctions ?? null,
+        strings: maxStrings ?? null,
+        blocksPerFunction: maxBlocksPerFunction ?? null,
+        instructionsPerBlock: maxInstructionsPerBlock ?? null,
+        pseudocodeFunctions: maxPseudocodeFunctions ?? null,
+      },
+      totals: {
+        functions: totals.procedures ?? snapshot.functions?.length ?? 0,
+        strings: totals.strings ?? originalStringCount,
+        pseudocode: (snapshot.functions ?? []).filter((fn) => Boolean(fn.pseudocode)).length,
+      },
+      exported: {
+        functions: exported.procedures ?? snapshot.functions?.length ?? 0,
+        strings: snapshot.strings?.length ?? 0,
+        pseudocode: (snapshot.functions ?? []).filter((fn) => Boolean(fn.pseudocode)).length,
+      },
+      truncated: {
+        functions: Boolean(truncated.procedures),
+        strings: stringsTruncated,
+      },
+    },
+  };
+}
+
+async function enrichSnapshotBinary(snapshot, executablePath) {
+  const metadata = await readMachOBinaryMetadata(executablePath);
+  snapshot.binary = {
+    ...(snapshot.binary ?? {}),
+    name: snapshot.binary?.name ?? basename(executablePath),
+    path: executablePath,
+    arch: metadata.arch,
+    requestedArch: metadata.requestedArch,
+    availableArchs: metadata.availableArchs,
+    fileInfo: metadata.fileInfo,
+    libraries: metadata.libraries,
+    entryPoint: metadata.entryPoint,
+  };
+}
+
+async function readMachOBinaryMetadata(executablePath) {
+  const archSelection = await resolveMachOArch(executablePath);
+  const selectedArch = archSelection.arch;
+  const [fileInfo, libraries, loadCommands] = await Promise.all([
+    execFileAsync("file", [executablePath], { maxBuffer: 1024 * 1024 }),
+    execFileAsync("otool", ["-arch", selectedArch, "-L", executablePath], { maxBuffer: 8 * 1024 * 1024 }),
+    execFileAsync("otool", ["-arch", selectedArch, "-l", executablePath], { maxBuffer: 16 * 1024 * 1024 }),
+  ]);
+
+  return {
+    arch: selectedArch,
+    requestedArch: archSelection.requestedArch,
+    availableArchs: archSelection.availableArchs,
+    fileInfo: fileInfo.stdout.trim(),
+    libraries: parseDylibs(libraries.stdout),
+    entryPoint: parseEntryPoint(loadCommands.stdout),
+  };
+}
+
+function parseEntryPoint(loadCommandsOutput) {
+  const entryoffMatch = loadCommandsOutput.match(/cmd LC_MAIN[\s\S]*?entryoff\s+(\d+)/);
+  if (!entryoffMatch) return null;
+  const entryoff = Number(entryoffMatch[1]);
+  if (!Number.isFinite(entryoff)) return null;
+
+  const textMatch = loadCommandsOutput.match(/segname __TEXT[\s\S]*?vmaddr\s+0x([0-9a-fA-F]+)[\s\S]*?fileoff\s+(\d+)/);
+  if (!textMatch) return null;
+  const vmaddr = parseInt(textMatch[1], 16);
+  const fileoff = Number(textMatch[2]);
+  if (!Number.isFinite(vmaddr) || !Number.isFinite(fileoff)) return null;
+  return `0x${(vmaddr + entryoff - fileoff).toString(16)}`;
+}
+
+async function resolveMachOArch(executablePath, requestedArch = "auto") {
+  const requested = requestedArch ?? "auto";
+  const availableArchs = await listMachOArchitectures(executablePath);
+  if (!availableArchs.length) {
+    if (requested === "auto") throw new Error(`Could not determine Mach-O architecture for ${executablePath}.`);
+    return { arch: requested, requestedArch: requested, availableArchs };
+  }
+  if (requested !== "auto") {
+    if (availableArchs.includes(requested)) return { arch: requested, requestedArch: requested, availableArchs };
+    if (requested === "arm64" && availableArchs.includes("arm64e")) {
+      return { arch: "arm64e", requestedArch: requested, availableArchs };
+    }
+    throw new Error(`Mach-O file ${executablePath} does not contain architecture '${requested}'. Available architectures: ${availableArchs.join(", ")}.`);
+  }
+  const preferred = PREFERRED_ARCHS.find((candidate) => availableArchs.includes(candidate));
+  return {
+    arch: preferred ?? availableArchs[0],
+    requestedArch: requested,
+    availableArchs,
+  };
+}
+
+async function listMachOArchitectures(executablePath) {
+  try {
+    const result = await execFileAsync("lipo", ["-archs", executablePath], { maxBuffer: 1024 * 1024 });
+    return result.stdout.trim().split(/\s+/).filter(Boolean);
+  } catch (error) {
+    const output = `${error.stdout ?? ""}\n${error.stderr ?? ""}`;
+    const match = output.match(/Non-fat file: .+ is architecture: (\S+)/);
+    if (match) return [match[1]];
+    throw error;
+  }
+}
+
+function normalizeLimit(value) {
+  if (value === null || value === undefined) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+}
+
+function safeId(value) {
+  return String(value)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "document";
+}
+
+function normalizeExecutableKey(executablePath) {
+  return resolve(String(executablePath));
+}
+
+function parseDylibs(output) {
+  return output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("/") || line.startsWith("@"))
+    .map((line) => line.replace(/\s+\(.+$/, ""))
+    .filter(Boolean);
 }
 
 async function runHopperExporter({
@@ -75,7 +474,7 @@ async function runHopperExporter({
   waitForAnalysis,
   fullExport,
   failOnTruncation,
-  buildAppleScript,
+  buildLaunchSpec,
   diagnostics,
 }) {
   const workdir = await mkdtemp(join(tmpdir(), "hopper-live-"));
@@ -83,10 +482,10 @@ async function runHopperExporter({
   const scriptPath = join(workdir, "export_live_session.py");
   await writeFile(scriptPath, buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, includePseudocode, maxPseudocodeFunctions, waitForAnalysis, fullExport, failOnTruncation }), "utf8");
 
-  const appleScript = buildAppleScript(scriptPath);
-  const args = ["-e", appleScript];
+  const launch = buildLaunchSpec(scriptPath);
+  const { command, args, mode } = launch;
 
-  const child = spawn(hopperLauncher, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
   let childExit = null;
@@ -101,17 +500,19 @@ async function runHopperExporter({
       stdout,
       stderr,
       childExit,
-      hopperLauncher,
+      hopperLauncher: command,
       args,
+      mode,
       ...diagnostics,
       outputPath,
     }));
     return {
       session: normalizeSession(session),
       launch: {
-        hopperLauncher,
+        hopperLauncher: command,
         args,
-        appleScript,
+        mode,
+        appleScript: launch.appleScript ?? null,
         stdout: stdout.slice(-4000),
         stderr: stderr.slice(-4000),
         outputPath,
@@ -130,6 +531,17 @@ async function waitForJson(path, timeoutMs, diagnostics) {
   let lastError = null;
 
   while (Date.now() < deadline) {
+    const details = diagnostics();
+    if (details.childExit && details.childExit.code !== 0) {
+      throw new Error(`Hopper launcher exited before writing a session file.${launcherFailureHint(details)} Diagnostics: ${JSON.stringify({
+        childExit: details.childExit,
+        hopperLauncher: details.hopperLauncher,
+        args: details.args,
+        outputPath: details.outputPath,
+        stdoutTail: details.stdout.slice(-1000),
+        stderrTail: details.stderr.slice(-1000),
+      })}`);
+    }
     try {
       const text = await readFile(path, "utf8");
       if (text.trim()) {
@@ -162,6 +574,9 @@ async function waitForJson(path, timeoutMs, diagnostics) {
 }
 
 function timeoutHint(details) {
+  if (details.mode === "cli") {
+    return "Hopper launched through its CLI, but the exporter did not write a session file before the timeout.";
+  }
   if (details.childExit?.code === 0) {
     return "Hopper accepted the AppleScript request, but the exporter did not write a session file before the timeout. If this is a large binary, retry with import_macho or smaller max_functions/max_strings.";
   }
@@ -169,6 +584,17 @@ function timeoutHint(details) {
     return "For large Mach-O files, retry with parse_objective_c=false and parse_swift=false first.";
   }
   return "Hopper may still be analyzing the target or waiting for UI input.";
+}
+
+function launcherFailureHint(details) {
+  const tail = [details.stderr, details.stdout].filter(Boolean).join("\n");
+  if (/Not authorized to send Apple events/i.test(tail)) {
+    return " macOS blocked Automation access.";
+  }
+  if (details.mode === "osascript") {
+    return " AppleScript failed before Hopper started the exporter.";
+  }
+  return " Hopper CLI failed before the exporter script ran.";
 }
 
 function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, includePseudocode, maxPseudocodeFunctions, waitForAnalysis, fullExport, failOnTruncation }) {
@@ -581,7 +1007,7 @@ except Exception as error:
 `;
 }
 
-function buildOpenExecutableAppleScript({ executablePath, scriptPath, analysis, parseObjectiveC, parseSwift }) {
+function buildOpenExecutableAppleScript({ executablePath, analysis, parseObjectiveC, parseSwift }) {
   return [
     'tell application "Hopper Disassembler" to open executable POSIX file ',
     quoteAppleScriptString(executablePath),
@@ -591,9 +1017,32 @@ function buildOpenExecutableAppleScript({ executablePath, scriptPath, analysis, 
     parseObjectiveC ? "true" : "false",
     " parse swift ",
     parseSwift ? "true" : "false",
-    " execute Python script POSIX file ",
-    quoteAppleScriptString(scriptPath),
   ].join("");
+}
+
+function buildLaunchSpec({ executablePath, analysis, parseObjectiveC, parseSwift, hopperLauncher }) {
+  const launcher = hopperLauncher ?? DEFAULT_HOPPER_CLI;
+  if (isOsaScriptLauncher(launcher)) {
+    const appleScript = buildOpenExecutableAppleScript({ executablePath, analysis, parseObjectiveC, parseSwift });
+    return {
+      command: launcher,
+      args: ["-e", appleScript],
+      mode: "osascript",
+      appleScript,
+    };
+  }
+  return {
+    command: launcher,
+    args: [
+      "-executable",
+      executablePath,
+    ],
+    mode: "cli",
+  };
+}
+
+function isOsaScriptLauncher(value) {
+  return /(?:^|\/)osascript$/i.test(String(value ?? ""));
 }
 
 function pythonBool(value) {

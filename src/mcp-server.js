@@ -792,7 +792,20 @@ function officialSegment(segment) {
 
 function listProcedures(sessionId, { maxResults } = {}) {
   const session = store.getSession(sessionId);
-  return limitResults(Object.values(session.functions ?? {}).sort((a, b) => (parseAddress(a.addr) ?? 0) - (parseAddress(b.addr) ?? 0)), maxResults);
+  return limitResults(
+    Object.values(session.functions ?? {}).sort((a, b) => {
+      const aNamed = isMeaningfullyNamedProcedure(a) ? 0 : 1;
+      const bNamed = isMeaningfullyNamedProcedure(b) ? 0 : 1;
+      if (aNamed !== bNamed) return aNamed - bNamed;
+      return (parseAddress(a.addr) ?? 0) - (parseAddress(b.addr) ?? 0);
+    }),
+    maxResults,
+  );
+}
+
+function isMeaningfullyNamedProcedure(fn) {
+  const name = String(fn?.name ?? "");
+  return Boolean(name) && !name.startsWith("sub_");
 }
 
 function defaultProcedureQuery(procedure, sessionId) {

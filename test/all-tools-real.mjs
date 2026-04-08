@@ -1,0 +1,278 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const target = process.env.LIVE_HOPPER_BINARY ?? "/bin/ls";
+const expectedTools = [
+  "capabilities",
+  "open_session",
+  "ingest_sample",
+  "ingest_live_hopper",
+  "resolve",
+  "analyze_function_deep",
+  "get_graph_slice",
+  "search_strings",
+  "begin_transaction",
+  "queue_rename",
+  "queue_comment",
+  "queue_inline_comment",
+  "queue_type_patch",
+  "preview_transaction",
+  "commit_transaction",
+  "rollback_transaction",
+];
+
+const child = spawn(process.execPath, [join(root, "src", "mcp-server.js")], {
+  stdio: ["pipe", "pipe", "inherit"],
+  env: { ...process.env, HOPPER_MCP_STORE: join(root, "data", "all-tools-real-store.json") },
+});
+
+const rl = createInterface({ input: child.stdout });
+const responses = new Map();
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  responses.set(message.id, message);
+});
+
+let id = 0;
+async function rpc(method, params = {}, { timeoutMs = 180000 } = {}) {
+  const requestId = ++id;
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params }) + "\n");
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (responses.has(requestId)) {
+      const response = responses.get(requestId);
+      responses.delete(requestId);
+      if (response.error) throw new Error(response.error.message);
+      return response.result;
+    }
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${method} response ${requestId}.`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function toolPayload(result) {
+  return JSON.parse(result.content[0].text);
+}
+
+function resourcePayload(result) {
+  return JSON.parse(result.contents[0].text);
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+const checks = [];
+
+async function check(name, fn) {
+  await fn();
+  checks.push(name);
+}
+
+try {
+  await check("initialize", async () => {
+    const initialized = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "all-tools-real-test", version: "0.1.0" } });
+    assert(initialized.serverInfo.name === "hopper-mcp-knowledge-engine", "initialize returned unexpected server name.");
+  });
+
+  await check("tools/list", async () => {
+    const listed = await rpc("tools/list");
+    const names = listed.tools.map((tool) => tool.name);
+    for (const name of expectedTools) assert(names.includes(name), `Missing tool from tools/list: ${name}`);
+  });
+
+  await check("prompts/list and prompts/get", async () => {
+    const listed = await rpc("prompts/list");
+    assert(listed.prompts.some((prompt) => prompt.name === "function_triage"), "function_triage prompt missing.");
+    const prompt = await rpc("prompts/get", { name: "hypothesis_workspace", arguments: { topic: "real binary triage" } });
+    assert(prompt.messages[0].content.text.includes("real binary triage"), "hypothesis_workspace prompt did not include topic.");
+  });
+
+  await check("capabilities", async () => {
+    const capabilities = toolPayload(await rpc("tools/call", { name: "capabilities", arguments: {} }));
+    assert(capabilities.adapter.liveIngest === true, "capabilities did not report live ingest.");
+  });
+
+  let sessionId;
+  await check("ingest_live_hopper", async () => {
+    const ingest = toolPayload(await rpc("tools/call", {
+      name: "ingest_live_hopper",
+      arguments: {
+        executable_path: target,
+        timeout_ms: Number(process.env.LIVE_HOPPER_TIMEOUT_MS ?? 180000),
+        max_functions: Number(process.env.LIVE_HOPPER_MAX_FUNCTIONS ?? 80),
+        max_strings: Number(process.env.LIVE_HOPPER_MAX_STRINGS ?? 200),
+        parse_objective_c: process.env.LIVE_HOPPER_PARSE_OBJC !== "0",
+        parse_swift: process.env.LIVE_HOPPER_PARSE_SWIFT !== "0",
+      },
+    }, { timeoutMs: Number(process.env.LIVE_HOPPER_TIMEOUT_MS ?? 180000) + 30000 }));
+    sessionId = ingest.session.sessionId;
+    assert(ingest.session.counts.functions > 0, "live ingest did not return functions.");
+    assert(ingest.session.counts.strings > 0, "live ingest did not return strings.");
+  });
+
+  let functions;
+  let targetFunction;
+  let strings;
+  await check("resources/list and resources/read", async () => {
+    const resources = await rpc("resources/list");
+    assert(resources.resources.some((resource) => resource.uri === "hopper://binary/metadata"), "binary metadata resource missing.");
+    const metadata = resourcePayload(await rpc("resources/read", { uri: "hopper://binary/metadata" }));
+    assert(metadata.path === target, "metadata path does not match target.");
+    functions = resourcePayload(await rpc("resources/read", { uri: "hopper://functions" }));
+    strings = resourcePayload(await rpc("resources/read", { uri: "hopper://binary/strings" }));
+    assert(functions.length > 0, "function resource is empty.");
+    assert(strings.length > 0, "string resource is empty.");
+    targetFunction = functions.find((fn) => fn.name && !fn.name.startsWith("sub_")) ?? functions[0];
+    const evidence = resourcePayload(await rpc("resources/read", { uri: `hopper://function/${targetFunction.addr}/evidence` }));
+    assert(evidence.function.addr === targetFunction.addr, "function evidence resource returned wrong function.");
+  });
+
+  await check("resolve", async () => {
+    const byAddress = toolPayload(await rpc("tools/call", { name: "resolve", arguments: { query: targetFunction.addr } }));
+    assert(byAddress.some((result) => result.kind === "function"), "resolve by address did not find function.");
+    const stringValue = strings.find((item) => item.value?.length)?.value;
+    const byString = toolPayload(await rpc("tools/call", { name: "resolve", arguments: { query: stringValue } }));
+    assert(byString.some((result) => result.kind === "string"), "resolve by string did not find string.");
+  });
+
+  await check("analyze_function_deep", async () => {
+    const analysis = toolPayload(await rpc("tools/call", {
+      name: "analyze_function_deep",
+      arguments: { addr: targetFunction.addr, detail_level: "full" },
+    }));
+    assert(analysis.function.addr === targetFunction.addr, "analyze_function_deep returned wrong function.");
+    assert(Array.isArray(analysis.evidenceAnchors), "analyze_function_deep missing evidence anchors.");
+    assert(analysis.provenance.source, "analyze_function_deep missing provenance source.");
+  });
+
+  await check("get_graph_slice", async () => {
+    const graph = toolPayload(await rpc("tools/call", {
+      name: "get_graph_slice",
+      arguments: { seed: targetFunction.addr, radius: 1, kind: "calls" },
+    }));
+    assert(graph.root.addr === targetFunction.addr, "get_graph_slice returned wrong root.");
+    assert(Array.isArray(graph.nodes) && Array.isArray(graph.edges), "get_graph_slice missing nodes/edges.");
+  });
+
+  await check("search_strings", async () => {
+    const stringValue = strings.find((item) => item.value?.length)?.value;
+    const results = toolPayload(await rpc("tools/call", {
+      name: "search_strings",
+      arguments: { regex: escapeRegex(stringValue), semantic: true },
+    }));
+    assert(results.some((result) => result.value === stringValue), "search_strings did not find selected real string.");
+    assert("referencedBy" in results[0], "semantic search_strings did not include referencedBy.");
+  });
+
+  await check("transaction rollback", async () => {
+    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "real rollback test", rationale: "Exercise queue_comment and rollback." } }));
+    const queued = toolPayload(await rpc("tools/call", {
+      name: "queue_comment",
+      arguments: {
+        transaction_id: begun.transactionId,
+        addr: targetFunction.addr,
+        comment: "Temporary all-tools test comment.",
+        rationale: "Testing rollback path.",
+      },
+    }));
+    assert(queued.operations.length === 1, "queue_comment did not queue operation.");
+    const preview = toolPayload(await rpc("tools/call", { name: "preview_transaction", arguments: { transaction_id: begun.transactionId } }));
+    assert(preview.operations[0].newValue.includes("Temporary"), "preview_transaction did not show queued comment.");
+    const rollback = toolPayload(await rpc("tools/call", { name: "rollback_transaction", arguments: { transaction_id: begun.transactionId } }));
+    assert(rollback.status === "rolled_back", "rollback_transaction did not roll back.");
+  });
+
+  await check("inline comment and type patch rollback", async () => {
+    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "inline/type rollback test", rationale: "Exercise queue_inline_comment and queue_type_patch." } }));
+    const inlineQueued = toolPayload(await rpc("tools/call", {
+      name: "queue_inline_comment",
+      arguments: {
+        transaction_id: begun.transactionId,
+        addr: targetFunction.addr,
+        comment: "Temporary inline all-tools test comment.",
+        rationale: "Testing inline comment queue path.",
+      },
+    }));
+    assert(inlineQueued.operations.some((op) => op.kind === "inline_comment"), "queue_inline_comment did not queue operation.");
+    const typeQueued = toolPayload(await rpc("tools/call", {
+      name: "queue_type_patch",
+      arguments: {
+        transaction_id: begun.transactionId,
+        addr: targetFunction.addr,
+        type: "int test_signature(void)",
+        rationale: "Testing type patch queue path.",
+      },
+    }));
+    assert(typeQueued.operations.some((op) => op.kind === "type_patch"), "queue_type_patch did not queue operation.");
+    const rollback = toolPayload(await rpc("tools/call", { name: "rollback_transaction", arguments: { transaction_id: begun.transactionId } }));
+    assert(rollback.status === "rolled_back", "inline/type rollback did not roll back.");
+  });
+
+  await check("transaction commit", async () => {
+    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "real commit test", rationale: "Exercise queue_rename and local commit." } }));
+    const newName = `mcp_test_${targetFunction.addr.replace(/[^0-9a-f]/gi, "_")}`;
+    const queued = toolPayload(await rpc("tools/call", {
+      name: "queue_rename",
+      arguments: {
+        transaction_id: begun.transactionId,
+        addr: targetFunction.addr,
+        new_name: newName,
+        rationale: "Testing local commit path.",
+      },
+    }));
+    assert(queued.operations[0].oldValue === targetFunction.name, "queue_rename did not capture old name.");
+    const committed = toolPayload(await rpc("tools/call", { name: "commit_transaction", arguments: { transaction_id: begun.transactionId } }));
+    assert(committed.status === "committed", "commit_transaction did not commit.");
+    assert(committed.adapterResult.appliedToHopper === false, "commit_transaction should not claim Hopper write-back yet.");
+    const analysis = toolPayload(await rpc("tools/call", { name: "analyze_function_deep", arguments: { addr: targetFunction.addr } }));
+    assert(analysis.function.name === newName, "committed rename was not reflected in knowledge store.");
+  });
+
+  await check("open_session", async () => {
+    const opened = toolPayload(await rpc("tools/call", {
+      name: "open_session",
+      arguments: {
+        session: {
+          sessionId: `${sessionId}-copy`,
+          binaryId: "all-tools-copy",
+          binary: { name: "copy", path: target, format: "test-copy", arch: "unknown" },
+          functions: [targetFunction],
+          strings: strings.slice(0, 1),
+        },
+      },
+    }));
+    assert(opened.sessionId === `${sessionId}-copy`, "open_session did not open supplied session.");
+  });
+
+  await check("ingest_sample", async () => {
+    const sample = toolPayload(await rpc("tools/call", { name: "ingest_sample", arguments: {} }));
+    assert(sample.sessionId === "sample", "ingest_sample did not load sample session.");
+  });
+
+  console.log(JSON.stringify({
+    status: "all MCP tools real-binary audit ok",
+    target,
+    checked: checks,
+  }, null, 2));
+} catch (error) {
+  const message = String(error.message ?? error);
+  if (message.includes("Not authorized to send Apple events")) {
+    console.error("macOS Automation blocked Hopper. Enable Ghostty -> Hopper Disassembler in Privacy & Security > Automation.");
+    process.exitCode = 78;
+  } else {
+    throw error;
+  }
+} finally {
+  child.stdin.end();
+  child.kill();
+  await once(child, "exit").catch(() => {});
+}

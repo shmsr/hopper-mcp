@@ -95,12 +95,14 @@ const tools = [
     kind: { type: "string", enum: ["calls", "callers", "callees"] },
     session_id: { type: "string" },
   }, ["seed"]),
-  tool("search_strings", "Search indexed strings, optionally expanding to semantic references.", {
+  tool("search_strings", "Search indexed strings. Use pattern/case_sensitive for official-compatible output, or regex/semantic for the extended result shape.", {
+    pattern: { type: "string" },
+    case_sensitive: { type: "boolean" },
     regex: { type: "string" },
     semantic: { type: "boolean" },
     session_id: { type: "string" },
     max_results: { type: "number" },
-  }, ["regex"]),
+  }),
   tool("list_documents", "List loaded snapshot sessions.", {
     session_id: { type: "string" },
   }),
@@ -127,14 +129,16 @@ const tools = [
     max_results: { type: "number" },
   }),
   tool("search_procedures", "Search procedure names and metadata in the active snapshot.", {
+    pattern: { type: "string" },
+    case_sensitive: { type: "boolean" },
     regex: { type: "string" },
     session_id: { type: "string" },
     max_results: { type: "number" },
-  }, ["regex"]),
+  }),
   tool("procedure_info", "Return full procedure metadata for an address or name.", {
     procedure: { type: "string" },
     session_id: { type: "string" },
-  }, ["procedure"]),
+  }),
   tool("procedure_address", "Resolve a procedure name or contained address to its entry address.", {
     procedure: { type: "string" },
     session_id: { type: "string" },
@@ -143,23 +147,23 @@ const tools = [
     procedure: { type: "string" },
     session_id: { type: "string" },
     max_lines: { type: "number" },
-  }, ["procedure"]),
+  }),
   tool("procedure_pseudo_code", "Return pseudocode captured during live export, if include_pseudocode was enabled.", {
     procedure: { type: "string" },
     session_id: { type: "string" },
-  }, ["procedure"]),
+  }),
   tool("procedure_callers", "Return procedure callers from the active snapshot.", {
     procedure: { type: "string" },
     session_id: { type: "string" },
-  }, ["procedure"]),
+  }),
   tool("procedure_callees", "Return procedure callees from the active snapshot.", {
     procedure: { type: "string" },
     session_id: { type: "string" },
-  }, ["procedure"]),
+  }),
   tool("xrefs", "Return cross-references to and from an address from the active snapshot.", {
     address: { type: "string" },
     session_id: { type: "string" },
-  }, ["address"]),
+  }),
   tool("current_address", "Return the cursor address captured at export time.", {
     session_id: { type: "string" },
   }),
@@ -171,14 +175,16 @@ const tools = [
     max_results: { type: "number" },
   }),
   tool("search_name", "Search Hopper names captured in the snapshot.", {
+    pattern: { type: "string" },
+    case_sensitive: { type: "boolean" },
     regex: { type: "string" },
     session_id: { type: "string" },
     max_results: { type: "number" },
-  }, ["regex"]),
+  }),
   tool("address_name", "Return the name for an address, if captured.", {
     address: { type: "string" },
     session_id: { type: "string" },
-  }, ["address"]),
+  }),
   tool("list_bookmarks", "List Hopper bookmarks captured in the snapshot.", {
     session_id: { type: "string" },
     max_results: { type: "number" },
@@ -427,83 +433,82 @@ async function callTool(name, args, meta = {}) {
   } else if (name === "get_graph_slice") {
     result = store.getGraphSlice(args.seed, { radius: args.radius ?? 1, kind: args.kind ?? "calls", sessionId });
   } else if (name === "search_strings") {
-    result = store.searchStrings(args.regex, { semantic: Boolean(args.semantic), sessionId });
-    if (!result.length) {
-      result = await searchSessionBinaryStrings(args.regex, { semantic: Boolean(args.semantic), sessionId, maxResults: args.max_results });
+    const pattern = args.pattern ?? args.regex;
+    if (!pattern) throw rpcError(-32602, "search_strings requires pattern or regex.");
+    if (args.pattern !== undefined) {
+      result = objectFromAddressItems(searchStringsOfficial(pattern, { caseSensitive: Boolean(args.case_sensitive), sessionId, maxResults: args.max_results }), "value");
+    } else {
+      result = store.searchStrings(pattern, { semantic: Boolean(args.semantic), sessionId });
+      if (!result.length) {
+        result = await searchSessionBinaryStrings(pattern, { semantic: Boolean(args.semantic), sessionId, maxResults: args.max_results });
+      }
     }
   } else if (name === "list_documents") {
-    result = store.listSessions();
+    result = store.listSessions().map((session) => session.name);
   } else if (name === "current_document") {
-    result = store.describeSession(store.getSession(sessionId));
+    result = store.getSession(sessionId).binary?.name ?? "unknown";
   } else if (name === "list_segments") {
-    result = getSessionSegments(sessionId);
+    result = getSessionSegments(sessionId).map(officialSegment);
   } else if (name === "list_procedures") {
-    result = listProcedures(sessionId, { maxResults: args.max_results });
+    result = objectFromFunctions(listProcedures(sessionId, { maxResults: args.max_results }), (fn) => fn.name ?? fn.addr);
   } else if (name === "list_procedure_size") {
-    result = listProcedures(sessionId, { maxResults: args.max_results }).map((fn) => ({
-      addr: fn.addr,
-      name: fn.name,
+    result = objectFromFunctions(listProcedures(sessionId, { maxResults: args.max_results }), (fn) => ({
+      name: fn.name ?? null,
+      basicblock_count: fn.basicBlockCount ?? fn.basicBlocks?.length ?? 0,
       size: fn.size ?? null,
-      basicBlockCount: fn.basicBlockCount ?? fn.basicBlocks?.length ?? null,
     }));
   } else if (name === "list_procedure_info") {
-    result = listProcedures(sessionId, { maxResults: args.max_results }).map(procedureSummary);
+    result = objectFromFunctions(listProcedures(sessionId, { maxResults: args.max_results }), officialProcedureInfo);
   } else if (name === "list_strings") {
     const session = store.getSession(sessionId);
-    result = limitResults(session.strings ?? [], args.max_results);
+    result = objectFromAddressItems(limitResults(session.strings ?? [], args.max_results), "value");
   } else if (name === "search_procedures") {
-    const regex = new RegExp(args.regex, "i");
-    result = limitResults(listProcedures(sessionId).filter((fn) => regex.test([fn.addr, fn.name, fn.signature, fn.summary].filter(Boolean).join(" "))), args.max_results).map(procedureSummary);
+    const pattern = args.pattern ?? args.regex;
+    if (!pattern) throw rpcError(-32602, "search_procedures requires pattern or regex.");
+    const regex = new RegExp(pattern, args.case_sensitive ? "" : "i");
+    result = objectFromFunctions(
+      limitResults(listProcedures(sessionId).filter((fn) => regex.test([fn.addr, fn.name, fn.signature, fn.summary].filter(Boolean).join(" "))), args.max_results),
+      (fn) => fn.name ?? fn.addr,
+    );
   } else if (name === "procedure_info") {
-    result = resolveProcedure(args.procedure, sessionId);
+    result = officialProcedureInfo(resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId));
   } else if (name === "procedure_address") {
-    const fn = resolveProcedure(args.procedure, sessionId);
-    result = { addr: fn.addr, name: fn.name ?? null };
+    result = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId).addr;
   } else if (name === "procedure_assembly") {
-    const fn = resolveProcedure(args.procedure, sessionId);
+    const fn = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId);
     const lines = assemblyLines(fn);
-    result = {
-      addr: fn.addr,
-      name: fn.name ?? null,
-      lineCount: args.max_lines ? Math.min(lines.length, args.max_lines) : lines.length,
-      truncated: Boolean(args.max_lines && lines.length > args.max_lines),
-      assembly: args.max_lines ? lines.slice(0, args.max_lines).join("\n") : lines.join("\n"),
-    };
+    result = args.max_lines ? lines.slice(0, args.max_lines).join("\n") : lines.join("\n");
   } else if (name === "procedure_pseudo_code") {
-    const fn = resolveProcedure(args.procedure, sessionId);
-    result = {
-      addr: fn.addr,
-      name: fn.name ?? null,
-      pseudocode: fn.pseudocode ?? null,
-      available: Boolean(fn.pseudocode),
-      note: fn.pseudocode ? null : "Pseudocode was not captured. Re-run ingest_live_hopper with include_pseudocode=true for selected functions.",
-    };
+    const fn = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId);
+    result = fn.pseudocode ?? "Pseudocode was not captured. Re-run ingest_live_hopper with include_pseudocode=true for selected functions.";
   } else if (name === "procedure_callers") {
     const session = store.getSession(sessionId);
-    const fn = resolveProcedure(args.procedure, sessionId);
-    result = (fn.callers ?? []).map((addr) => procedureSummary(store.getFunctionIfKnown(session, addr)));
+    const fn = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId);
+    result = (fn.callers ?? []).map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr);
   } else if (name === "procedure_callees") {
     const session = store.getSession(sessionId);
-    const fn = resolveProcedure(args.procedure, sessionId);
-    result = (fn.callees ?? []).map((addr) => procedureSummary(store.getFunctionIfKnown(session, addr)));
+    const fn = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId);
+    result = (fn.callees ?? []).map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr);
   } else if (name === "xrefs") {
-    result = snapshotXrefs(args.address, sessionId);
+    result = snapshotXrefs(defaultAddressQuery(args.address, sessionId), sessionId);
   } else if (name === "current_address") {
     const session = store.getSession(sessionId);
-    result = { address: session.cursor?.address ?? null, selection: session.cursor?.selection ?? [] };
+    result = session.cursor?.address ?? null;
   } else if (name === "current_procedure") {
     const session = store.getSession(sessionId);
     const addr = session.cursor?.procedure;
-    result = addr ? procedureSummary(store.getFunctionIfKnown(session, addr)) : { addr: null, name: null };
+    result = addr ? store.getFunctionIfKnown(session, addr).name ?? addr : null;
   } else if (name === "list_names") {
     const session = store.getSession(sessionId);
-    result = limitResults(session.names ?? [], args.max_results);
+    result = objectFromAddressItems(limitResults(session.names ?? [], args.max_results), "name");
   } else if (name === "search_name") {
     const session = store.getSession(sessionId);
-    const regex = new RegExp(args.regex, "i");
-    result = limitResults((session.names ?? []).filter((item) => regex.test([item.addr, item.name, item.demangled].filter(Boolean).join(" "))), args.max_results);
+    const pattern = args.pattern ?? args.regex;
+    if (!pattern) throw rpcError(-32602, "search_name requires pattern or regex.");
+    const regex = new RegExp(pattern, args.case_sensitive ? "" : "i");
+    result = objectFromAddressItems(limitResults((session.names ?? []).filter((item) => regex.test([item.addr, item.name, item.demangled].filter(Boolean).join(" "))), args.max_results), "name");
   } else if (name === "address_name") {
-    result = lookupName(args.address, sessionId);
+    result = lookupName(defaultAddressQuery(args.address, sessionId), sessionId).name ?? "There is no name at this address";
   } else if (name === "list_bookmarks") {
     const session = store.getSession(sessionId);
     result = limitResults(session.bookmarks ?? [], args.max_results);
@@ -534,9 +539,46 @@ function getSessionSegments(sessionId) {
   return session.binary?.segments ?? [];
 }
 
+function officialSegment(segment) {
+  const start = parseAddress(segment.start);
+  const length = Number(segment.length ?? 0);
+  const end = segment.end ?? (start !== null && length > 0 ? formatAddress(start + length) : null);
+  return {
+    name: segment.name ?? null,
+    start: segment.start ?? null,
+    end,
+    writable: String(Boolean(segment.writable ?? segment.writeable ?? segment.protection?.includes?.("w"))),
+    executable: String(Boolean(segment.executable ?? segment.protection?.includes?.("x"))),
+    sections: (segment.sections ?? []).map((section) => {
+      const sectionStart = parseAddress(section.start);
+      const sectionLength = Number(section.length ?? 0);
+      return {
+        name: section.name ?? null,
+        start: section.start ?? null,
+        end: section.end ?? (sectionStart !== null && sectionLength > 0 ? formatAddress(sectionStart + sectionLength) : null),
+      };
+    }),
+  };
+}
+
 function listProcedures(sessionId, { maxResults } = {}) {
   const session = store.getSession(sessionId);
   return limitResults(Object.values(session.functions ?? {}).sort((a, b) => (parseAddress(a.addr) ?? 0) - (parseAddress(b.addr) ?? 0)), maxResults);
+}
+
+function defaultProcedureQuery(procedure, sessionId) {
+  if (procedure) return procedure;
+  const session = store.getSession(sessionId);
+  if (session.cursor?.procedure) return session.cursor.procedure;
+  if (session.cursor?.address) return session.cursor.address;
+  throw rpcError(-32602, "No procedure supplied and no current procedure was captured in the snapshot.");
+}
+
+function defaultAddressQuery(address, sessionId) {
+  if (address) return address;
+  const session = store.getSession(sessionId);
+  if (session.cursor?.address) return session.cursor.address;
+  throw rpcError(-32602, "No address supplied and no current address was captured in the snapshot.");
 }
 
 function resolveProcedure(query, sessionId) {
@@ -570,16 +612,18 @@ function scoreProcedureNameMatch(fn, lower) {
   return 0;
 }
 
-function procedureSummary(fn) {
+function officialProcedureInfo(fn) {
   return {
-    addr: fn.addr,
     name: fn.name ?? null,
-    size: fn.size ?? null,
-    basicBlockCount: fn.basicBlockCount ?? fn.basicBlocks?.length ?? null,
+    entrypoint: fn.addr,
+    basicblock_count: fn.basicBlockCount ?? fn.basicBlocks?.length ?? 0,
+    basicblocks: (fn.basicBlocks ?? []).map((block) => ({
+      from: block.from ?? block.addr ?? null,
+      to: block.to ?? block.end ?? block.addr ?? null,
+    })),
+    length: fn.size ?? null,
     signature: fn.signature ?? null,
-    callers: fn.callers ?? [],
-    callees: fn.callees ?? [],
-    source: fn.source ?? null,
+    locals: fn.locals ?? [],
   };
 }
 
@@ -591,42 +635,26 @@ function assemblyLines(fn) {
 function snapshotXrefs(address, sessionId) {
   const session = store.getSession(sessionId);
   const target = formatAddress(address);
-  const refsTo = [];
-  const refsFrom = [];
+  const refs = [];
 
   for (const fn of Object.values(session.functions ?? {})) {
     for (const ref of fn.callerRefs ?? []) {
-      if (formatAddress(ref.to) === target || formatAddress(ref.from) === target) refsTo.push({ ...ref, procedure: procedureSummary(fn) });
+      if (formatAddress(ref.to) === target) refs.push(ref.from);
     }
     for (const ref of fn.calleeRefs ?? []) {
-      if (formatAddress(ref.to) === target || formatAddress(ref.from) === target) refsFrom.push({ ...ref, procedure: procedureSummary(fn) });
+      if (formatAddress(ref.to) === target) refs.push(ref.from);
     }
-    if ((fn.callees ?? []).map(formatAddress).includes(target)) refsFrom.push({ from: fn.addr, to: target, type: "procedure_callee", procedure: procedureSummary(fn) });
-    if ((fn.callers ?? []).map(formatAddress).includes(target)) refsTo.push({ from: target, to: fn.addr, type: "procedure_caller", procedure: procedureSummary(fn) });
+    if ((fn.callees ?? []).map(formatAddress).includes(target)) refs.push(fn.addr);
     for (const block of fn.basicBlocks ?? []) {
       for (const instruction of block.instructions ?? []) {
         for (const ref of instruction.refsFrom ?? []) {
-          if (formatAddress(ref) === target) refsTo.push({ from: instruction.addr, to: target, type: "instruction_ref", procedure: procedureSummary(fn), instruction: instruction.text ?? null });
+          if (formatAddress(ref) === target) refs.push(instruction.addr);
         }
       }
     }
   }
 
-  return {
-    address: target,
-    refsTo: dedupeRefs(refsTo),
-    refsFrom: dedupeRefs(refsFrom),
-  };
-}
-
-function dedupeRefs(refs) {
-  const seen = new Set();
-  return refs.filter((ref) => {
-    const key = JSON.stringify([ref.from, ref.to, ref.type, ref.procedure?.addr, ref.instruction]);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  return [...new Set(refs.filter(Boolean).map(formatAddress))];
 }
 
 function lookupName(address, sessionId) {
@@ -642,6 +670,20 @@ function limitResults(items, maxResults) {
   const limit = Number(maxResults ?? 0);
   if (!limit || limit < 0) return items;
   return items.slice(0, limit);
+}
+
+function objectFromFunctions(functions, mapper) {
+  return Object.fromEntries(functions.map((fn) => [fn.addr, mapper(fn)]));
+}
+
+function objectFromAddressItems(items, field) {
+  return Object.fromEntries(items.filter((item) => item.addr).map((item) => [formatAddress(item.addr), item[field] ?? null]));
+}
+
+function searchStringsOfficial(pattern, { caseSensitive, sessionId, maxResults }) {
+  const session = store.getSession(sessionId);
+  const regex = new RegExp(pattern, caseSensitive ? "" : "i");
+  return limitResults((session.strings ?? []).filter((item) => regex.test(item.value ?? "")), maxResults);
 }
 
 async function resolveFromBinaryStrings(query, { sessionId, maxResults }) {

@@ -107,6 +107,7 @@ Official-style Hopper snapshot tools:
 - `list_strings`, `list_names`, `search_name`, `address_name`, `list_bookmarks`
 
 These tools mirror Hopper concepts using the last ingested snapshot. They do not query the frontmost Hopper UI live after export; that still needs the future persistent Hopper-side adapter.
+The mirror follows the official server's observed shapes where possible: procedure/string/name lists are address-keyed objects, search tools accept `pattern` and optional `case_sensitive`, and procedure assembly/pseudocode/current address/name calls return strings. The extended `search_strings` path still accepts `regex` plus `semantic: true` for richer local-store results.
 
 ## Add To Clients
 
@@ -286,3 +287,4 @@ Main files:
 - `src/knowledge-store.js`
 - `src/transaction-manager.js`
 - `docs/adapter-protocol.md`
+- `docs/official-hopper-mcp-notes.md`

@@ -268,45 +268,52 @@ try {
 
   await check("Hopper API snapshot mirror tools", async () => {
     const documents = toolPayload(await rpc("tools/call", { name: "list_documents", arguments: {} }));
-    assert(documents.some((document) => document.sessionId), "list_documents did not return loaded sessions.");
+    assert(documents.some((document) => typeof document === "string"), "list_documents did not return loaded sessions.");
     const currentDocument = toolPayload(await rpc("tools/call", { name: "current_document", arguments: { session_id: sessionId } }));
-    assert(currentDocument.binary?.path === target, "current_document did not return the live Hopper snapshot.");
+    assert(typeof currentDocument === "string" && currentDocument.length > 0, "current_document did not return the live Hopper snapshot name.");
     const segments = toolPayload(await rpc("tools/call", { name: "list_segments", arguments: { session_id: sessionId } }));
     assert(Array.isArray(segments) && segments.length > 0, "list_segments returned no segments.");
     const procedures = toolPayload(await rpc("tools/call", { name: "list_procedures", arguments: { session_id: sessionId, max_results: 10 } }));
-    assert(procedures.some((procedure) => procedure.addr === targetFunction.addr), "list_procedures did not include the selected function.");
+    assert(procedures[targetFunction.addr] === targetFunction.name, "list_procedures did not include the selected function.");
     const sizes = toolPayload(await rpc("tools/call", { name: "list_procedure_size", arguments: { session_id: sessionId, max_results: 10 } }));
-    assert(sizes.some((procedure) => procedure.addr === targetFunction.addr), "list_procedure_size did not include the selected function.");
+    assert(sizes[targetFunction.addr]?.basicblock_count >= 0, "list_procedure_size did not include the selected function.");
     const infos = toolPayload(await rpc("tools/call", { name: "list_procedure_info", arguments: { session_id: sessionId, max_results: 10 } }));
-    assert(infos.some((procedure) => procedure.addr === targetFunction.addr), "list_procedure_info did not include the selected function.");
+    assert(infos[targetFunction.addr]?.entrypoint === targetFunction.addr, "list_procedure_info did not include the selected function.");
     const listedStrings = toolPayload(await rpc("tools/call", { name: "list_strings", arguments: { session_id: sessionId, max_results: 10 } }));
-    assert(listedStrings.length > 0, "list_strings returned no strings.");
-    const procedureSearch = toolPayload(await rpc("tools/call", { name: "search_procedures", arguments: { regex: escapeRegex(targetFunction.name ?? targetFunction.addr), session_id: sessionId, max_results: 10 } }));
-    assert(procedureSearch.some((procedure) => procedure.addr === targetFunction.addr), "search_procedures did not find selected function.");
+    assert(Object.keys(listedStrings).length > 0, "list_strings returned no strings.");
+    const officialStringSearch = toolPayload(await rpc("tools/call", {
+      name: "search_strings",
+      arguments: { pattern: escapeRegex(strings.find((item) => item.value?.length)?.value), session_id: sessionId, max_results: 10 },
+    }));
+    assert(Object.keys(officialStringSearch).length > 0, "official-compatible search_strings returned no strings.");
+    const procedureSearch = toolPayload(await rpc("tools/call", { name: "search_procedures", arguments: { pattern: escapeRegex(targetFunction.name ?? targetFunction.addr), session_id: sessionId, max_results: 10 } }));
+    assert(procedureSearch[targetFunction.addr] === targetFunction.name, "search_procedures did not find selected function.");
     const info = toolPayload(await rpc("tools/call", { name: "procedure_info", arguments: { procedure: targetFunction.addr, session_id: sessionId } }));
-    assert(info.addr === targetFunction.addr, "procedure_info returned wrong procedure.");
+    assert(info.entrypoint === targetFunction.addr, "procedure_info returned wrong procedure.");
     const address = toolPayload(await rpc("tools/call", { name: "procedure_address", arguments: { procedure: targetFunction.name ?? targetFunction.addr, session_id: sessionId } }));
-    assert(address.addr === targetFunction.addr, "procedure_address returned wrong address.");
+    assert(address === targetFunction.addr, "procedure_address returned wrong address.");
     const assembly = toolPayload(await rpc("tools/call", { name: "procedure_assembly", arguments: { procedure: targetFunction.addr, session_id: sessionId, max_lines: 20 } }));
-    assert(typeof assembly.assembly === "string", "procedure_assembly did not return assembly text.");
+    assert(typeof assembly === "string", "procedure_assembly did not return assembly text.");
     const pseudocode = toolPayload(await rpc("tools/call", { name: "procedure_pseudo_code", arguments: { procedure: targetFunction.addr, session_id: sessionId } }));
-    assert("available" in pseudocode, "procedure_pseudo_code did not report availability.");
+    assert(typeof pseudocode === "string", "procedure_pseudo_code did not return a string.");
     const callers = toolPayload(await rpc("tools/call", { name: "procedure_callers", arguments: { procedure: targetFunction.addr, session_id: sessionId } }));
     const callees = toolPayload(await rpc("tools/call", { name: "procedure_callees", arguments: { procedure: targetFunction.addr, session_id: sessionId } }));
     assert(Array.isArray(callers) && Array.isArray(callees), "procedure_callers/callees did not return arrays.");
     const refs = toolPayload(await rpc("tools/call", { name: "xrefs", arguments: { address: targetFunction.addr, session_id: sessionId } }));
-    assert(refs.address === targetFunction.addr && Array.isArray(refs.refsTo) && Array.isArray(refs.refsFrom), "xrefs returned malformed result.");
+    assert(Array.isArray(refs), "xrefs returned malformed result.");
     const currentAddress = toolPayload(await rpc("tools/call", { name: "current_address", arguments: { session_id: sessionId } }));
-    assert("address" in currentAddress, "current_address did not return captured cursor shape.");
+    assert(currentAddress === null || typeof currentAddress === "string", "current_address did not return captured cursor shape.");
     const currentProcedure = toolPayload(await rpc("tools/call", { name: "current_procedure", arguments: { session_id: sessionId } }));
-    assert("addr" in currentProcedure, "current_procedure did not return captured cursor shape.");
+    assert(currentProcedure === null || typeof currentProcedure === "string", "current_procedure did not return captured cursor shape.");
     const names = toolPayload(await rpc("tools/call", { name: "list_names", arguments: { session_id: sessionId, max_results: 20 } }));
-    assert(Array.isArray(names), "list_names did not return an array.");
-    if (names.length) {
-      const nameSearch = toolPayload(await rpc("tools/call", { name: "search_name", arguments: { regex: escapeRegex(names[0].name ?? names[0].addr), session_id: sessionId, max_results: 20 } }));
-      assert(nameSearch.length > 0, "search_name did not find a listed name.");
-      const addressName = toolPayload(await rpc("tools/call", { name: "address_name", arguments: { address: names[0].addr, session_id: sessionId } }));
-      assert(addressName.addr === names[0].addr, "address_name returned wrong address.");
+    assert(names && typeof names === "object" && !Array.isArray(names), "list_names did not return an object.");
+    const firstNameEntry = Object.entries(names)[0];
+    if (firstNameEntry) {
+      const [nameAddr, nameValue] = firstNameEntry;
+      const nameSearch = toolPayload(await rpc("tools/call", { name: "search_name", arguments: { pattern: escapeRegex(nameValue ?? nameAddr), session_id: sessionId, max_results: 20 } }));
+      assert(Object.keys(nameSearch).length > 0, "search_name did not find a listed name.");
+      const addressName = toolPayload(await rpc("tools/call", { name: "address_name", arguments: { address: nameAddr, session_id: sessionId } }));
+      assert(addressName === nameValue, "address_name returned wrong address.");
     }
     const bookmarks = toolPayload(await rpc("tools/call", { name: "list_bookmarks", arguments: { session_id: sessionId, max_results: 20 } }));
     assert(Array.isArray(bookmarks), "list_bookmarks did not return an array.");

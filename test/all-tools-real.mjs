@@ -6,12 +6,16 @@ import { dirname, join } from "node:path";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const target = process.env.LIVE_HOPPER_BINARY ?? "/bin/ls";
+const localMachOTarget = process.env.LOCAL_MACHO_BINARY ?? "/Applications/Hopper Disassembler.app/Contents/MacOS/Hopper Disassembler";
 const expectedTools = [
   "capabilities",
   "open_session",
   "ingest_sample",
   "ingest_live_hopper",
   "import_macho",
+  "disassemble_range",
+  "find_xrefs",
+  "find_functions",
   "resolve",
   "analyze_function_deep",
   "get_graph_slice",
@@ -101,6 +105,57 @@ try {
   await check("capabilities", async () => {
     const capabilities = toolPayload(await rpc("tools/call", { name: "capabilities", arguments: {} }));
     assert(capabilities.adapter.liveIngest === true, "capabilities did not report live ingest.");
+    assert(capabilities.adapter.currentDocumentIngest === false, "capabilities should not advertise unsupported current-document ingest.");
+  });
+
+  await check("local Mach-O helper tools", async () => {
+    const imported = toolPayload(await rpc("tools/call", {
+      name: "import_macho",
+      arguments: {
+        executable_path: localMachOTarget,
+        arch: "arm64",
+        max_strings: 100,
+      },
+    }));
+    const beforeFunctions = imported.session.counts.functions;
+    const found = toolPayload(await rpc("tools/call", {
+      name: "find_functions",
+      arguments: {
+        executable_path: localMachOTarget,
+        arch: "arm64",
+        max_functions: 5,
+        merge_session: true,
+      },
+    }));
+    assert(found.functions === 5, `find_functions did not honor max_functions=5; got ${found.functions}.`);
+    assert(found.merged.afterFunctions > beforeFunctions, "find_functions merge_session did not add discovered functions.");
+    const first = found.sample[0];
+    assert(first?.addr, "find_functions did not return a sample function.");
+    const endAddr = `0x${(parseInt(first.addr, 16) + 0x40).toString(16)}`;
+    const disassembly = toolPayload(await rpc("tools/call", {
+      name: "disassemble_range",
+      arguments: {
+        executable_path: localMachOTarget,
+        arch: "arm64",
+        start_addr: first.addr,
+        end_addr: endAddr,
+        max_lines: 10,
+      },
+    }));
+    assert(disassembly.lineCount > 0, "disassemble_range returned no instructions.");
+    const xrefs = toolPayload(await rpc("tools/call", {
+      name: "find_xrefs",
+      arguments: {
+        executable_path: localMachOTarget,
+        arch: "arm64",
+        target_addr: "0x10055de54",
+        max_results: 10,
+      },
+    }));
+    assert(Array.isArray(xrefs), "find_xrefs did not return an array.");
+    if (localMachOTarget.endsWith("Hopper Disassembler")) {
+      assert(xrefs.some((xref) => xref.type === "branch"), "find_xrefs should classify direct b instructions as branch, not call.");
+    }
   });
 
   let sessionId;

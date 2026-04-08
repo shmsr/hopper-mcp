@@ -13,8 +13,9 @@ export class HopperAdapter {
       privateApi: false,
       dynamicDebugger: false,
       liveIngest: true,
+      currentDocumentIngest: false,
       transactionApply: false,
-      reason: "Live ingest uses Hopper's official launcher + Python scripting. Transaction commits are still local-only until a persistent in-process bridge is added.",
+      reason: "Live ingest uses Hopper's official launcher + Python scripting. Current-document ingest and transaction commits need a persistent in-process Hopper bridge.",
     };
   }
 
@@ -23,6 +24,10 @@ export class HopperAdapter {
       ...options,
       hopperLauncher: options.hopperLauncher ?? this.hopperLauncher ?? undefined,
     });
+  }
+
+  async ingestCurrentDocument(options) {
+    throw new Error("Current-document ingest is not supported by Hopper's AppleScript interface. Use ingest_live_hopper or import_macho until the in-process bridge is available.");
   }
 
   async applyTransaction(_session, transaction) {

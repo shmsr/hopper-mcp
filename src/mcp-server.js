@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { KnowledgeStore } from "./knowledge-store.js";
 import { TransactionManager } from "./transaction-manager.js";
 import { HopperAdapter } from "./hopper-adapter.js";
-import { importMachO, searchMachOStrings } from "./macho-importer.js";
+import { importMachO, searchMachOStrings, disassembleRange, findXrefs, discoverFunctionsFromDisassembly, mergeFunctionSets } from "./macho-importer.js";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const store = new KnowledgeStore(process.env.HOPPER_MCP_STORE ?? join(ROOT, "data", "knowledge-store.json"));
@@ -44,11 +44,37 @@ const tools = [
     parse_swift: { type: "boolean" },
     wait_for_analysis: { type: "boolean" },
   }, ["executable_path"]),
-  tool("import_macho", "Import Mach-O symbols, imports, libraries, and strings using local macOS command-line tools.", {
+  tool("import_macho", "Import Mach-O metadata using local macOS tools. With deep=true, also discovers functions from disassembly, builds call graphs, and resolves string cross-references via ADRP+ADD patterns.", {
     executable_path: { type: "string" },
     arch: { type: "string" },
     max_strings: { type: "number" },
+    deep: { type: "boolean" },
+    max_functions: { type: "number" },
   }, ["executable_path"]),
+  tool("disassemble_range", "Disassemble a specific address range from a Mach-O binary using otool. Returns ARM64 assembly with symbolic names.", {
+    executable_path: { type: "string" },
+    start_addr: { type: "string" },
+    end_addr: { type: "string" },
+    arch: { type: "string" },
+    max_lines: { type: "number" },
+    session_id: { type: "string" },
+  }, ["start_addr", "end_addr"]),
+  tool("find_xrefs", "Find all code locations that reference a given address. Detects ADRP+ADD, ADRP+LDR, and bl/b patterns in ARM64.", {
+    executable_path: { type: "string" },
+    target_addr: { type: "string" },
+    arch: { type: "string" },
+    max_results: { type: "number" },
+    session_id: { type: "string" },
+  }, ["target_addr"]),
+  tool("find_functions", "Discover functions in a region by scanning for ARM64 stp x29,x30 prologues. Optionally merges into current session.", {
+    executable_path: { type: "string" },
+    start_addr: { type: "string" },
+    end_addr: { type: "string" },
+    arch: { type: "string" },
+    max_functions: { type: "number" },
+    merge_session: { type: "boolean" },
+    session_id: { type: "string" },
+  }),
   tool("resolve", "Resolve an address, name, string, import, or semantic query against the knowledge store.", {
     query: { type: "string" },
     session_id: { type: "string" },
@@ -240,15 +266,67 @@ async function callTool(name, args, meta = {}) {
     notifyProgress(progressToken, 2, 2, "Live Hopper session ingested.");
     result = { session: store.describeSession(session), launch: live.launch };
   } else if (name === "import_macho") {
-    notifyProgress(progressToken, 0, 1, "Importing Mach-O metadata.");
+    const isDeep = Boolean(args.deep);
+    notifyProgress(progressToken, 0, isDeep ? 3 : 1, isDeep ? "Deep Mach-O import: extracting metadata." : "Importing Mach-O metadata.");
     const imported = await importMachO(args.executable_path, {
       arch: args.arch ?? "arm64",
-      maxStrings: args.max_strings ?? 5000,
+      maxStrings: args.max_strings ?? 15000,
+      deep: isDeep,
+      maxFunctions: args.max_functions ?? 30000,
     });
+    if (isDeep) notifyProgress(progressToken, 2, 3, "Indexing discovered functions.");
     const session = await store.upsertSession(imported);
     notifyResourceListChanged();
-    notifyProgress(progressToken, 1, 1, "Mach-O metadata imported.");
-    result = { session: store.describeSession(session), source: "local-macho-importer" };
+    notifyProgress(progressToken, isDeep ? 3 : 1, isDeep ? 3 : 1, "Mach-O import complete.");
+    result = { session: store.describeSession(session), source: isDeep ? "local-macho-deep" : "local-macho-importer" };
+  } else if (name === "disassemble_range") {
+    const binaryPath = args.executable_path ?? store.getSession(sessionId)?.binary?.path;
+    if (!binaryPath) throw rpcError(-32602, "No executable_path and no session binary path available.");
+    result = await disassembleRange(binaryPath, {
+      arch: args.arch ?? "arm64",
+      startAddr: args.start_addr,
+      endAddr: args.end_addr,
+      maxLines: args.max_lines ?? 500,
+    });
+  } else if (name === "find_xrefs") {
+    const binaryPath = args.executable_path ?? store.getSession(sessionId)?.binary?.path;
+    if (!binaryPath) throw rpcError(-32602, "No executable_path and no session binary path available.");
+    notifyProgress(progressToken, 0, 1, "Scanning binary for cross-references (streaming otool).");
+    result = await findXrefs(binaryPath, {
+      arch: args.arch ?? "arm64",
+      targetAddr: args.target_addr,
+      maxResults: args.max_results ?? 50,
+    });
+    notifyProgress(progressToken, 1, 1, `Found ${result.length} xrefs.`);
+  } else if (name === "find_functions") {
+    const binaryPath = args.executable_path ?? store.getSession(sessionId)?.binary?.path;
+    if (!binaryPath) throw rpcError(-32602, "No executable_path and no session binary path available.");
+    notifyProgress(progressToken, 0, 1, "Scanning for function prologues.");
+    const discovery = await discoverFunctionsFromDisassembly(binaryPath, {
+      arch: args.arch ?? "arm64",
+      maxFunctions: args.max_functions ?? 30000,
+      startAddr: args.start_addr ? parseInt(args.start_addr, 16) : null,
+      endAddr: args.end_addr ? parseInt(args.end_addr, 16) : null,
+    });
+    notifyProgress(progressToken, 1, 1, `Discovered ${discovery.functions.length} functions, ${discovery.callEdges.length} call edges.`);
+    result = {
+      functions: discovery.functions.length,
+      callEdges: discovery.callEdges.length,
+      adrpRefs: discovery.adrpRefs.length,
+      sample: discovery.functions.slice(0, 20),
+    };
+    if (args.merge_session) {
+      const session = store.getSession(sessionId);
+      const existingFuncs = Object.values(session.functions ?? {});
+      const mergedFunctions = mergeFunctionSets(existingFuncs, discovery, session.strings ?? []);
+      const mergedSession = await store.upsertSession({ ...session, functions: mergedFunctions });
+      notifyResourceListChanged();
+      result.merged = {
+        session: store.describeSession(mergedSession),
+        beforeFunctions: existingFuncs.length,
+        afterFunctions: Object.keys(mergedSession.functions).length,
+      };
+    }
   } else if (name === "resolve") {
     result = store.resolve(args.query, sessionId);
     if (!result.length) {

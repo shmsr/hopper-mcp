@@ -1,8 +1,8 @@
 # Hopper MCP
 
-MCP server for Hopper. It opens binaries in Hopper, exports indexed state through Hopper's Python scripting API, and exposes that state through MCP resources and tools.
+MCP server for Hopper. It can import Mach-O data with local macOS tools, or open a binary in Hopper and export indexed state through Hopper's Python scripting API.
 
-Current write behavior is local-only: transaction commits update the JSON store and return `appliedToHopper: false`. Writing comments/renames back into an already-open Hopper window still needs the persistent Hopper-side adapter.
+Current write behavior is local-only: transaction commits update the JSON store and return `appliedToHopper: false`. Writing comments/renames back into Hopper still needs the persistent Hopper-side adapter.
 
 ## Requirements
 
@@ -31,10 +31,10 @@ Live Hopper check:
 LIVE_HOPPER_PARSE_OBJC=0 LIVE_HOPPER_PARSE_SWIFT=0 LIVE_HOPPER_TIMEOUT_MS=90000 LIVE_HOPPER_MAX_FUNCTIONS=20 LIVE_HOPPER_MAX_STRINGS=50 npm run test:live
 ```
 
-Full tool check against a live Hopper-ingested binary:
+Full tool check:
 
 ```bash
-LIVE_HOPPER_PARSE_OBJC=0 LIVE_HOPPER_PARSE_SWIFT=0 LIVE_HOPPER_TIMEOUT_MS=120000 LIVE_HOPPER_MAX_FUNCTIONS=80 LIVE_HOPPER_MAX_STRINGS=200 npm run test:tools
+LIVE_HOPPER_PARSE_OBJC=0 LIVE_HOPPER_PARSE_SWIFT=0 LIVE_HOPPER_ANALYSIS=0 LIVE_HOPPER_TIMEOUT_MS=90000 LIVE_HOPPER_MAX_FUNCTIONS=20 LIVE_HOPPER_MAX_STRINGS=50 npm run test:tools
 ```
 
 If macOS blocks Automation, allow the launcher app to control Hopper in `System Settings > Privacy & Security > Automation`.
@@ -49,7 +49,27 @@ For large binaries, start with the faster local importer:
 }
 ```
 
-Call that as `import_macho`. Use `ingest_live_hopper` when you need Hopper's current document state.
+Call that as `import_macho`. Use `ingest_live_hopper` when you need a Hopper Python export for a specific executable path. Exporting the frontmost Hopper document is not exposed yet; that needs the future in-process Hopper adapter.
+
+Deep local import:
+
+```json
+{
+  "executable_path": "/path/to/binary",
+  "arch": "arm64",
+  "deep": true,
+  "max_functions": 5000,
+  "max_strings": 50000
+}
+```
+
+With `deep: true`, `import_macho` also scans ARM64 disassembly with `otool`, discovers frame-prologue functions, builds call edges from `bl` instructions, and links ADRP+ADD/LDR string references where they can be resolved.
+
+Local helper tools:
+
+- `disassemble_range`: disassemble a VM address range with `otool`.
+- `find_xrefs`: scan for direct branches/calls and ADRP+ADD/LDR references to an address.
+- `find_functions`: discover ARM64 frame-prologue functions, optionally with `merge_session: true`.
 
 ## Add To Clients
 
@@ -157,6 +177,9 @@ Tools:
 - `ingest_sample`
 - `ingest_live_hopper`
 - `import_macho`
+- `disassemble_range`
+- `find_xrefs`
+- `find_functions`
 - `resolve`
 - `analyze_function_deep`
 - `get_graph_slice`

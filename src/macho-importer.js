@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { promisify } from "node:util";
@@ -44,6 +44,52 @@ export async function importMachO(path, { arch = "arm64", maxStrings = 2000 } = 
     swiftSymbols: imports.filter((name) => name.startsWith("_$s")).slice(0, 500),
     functions: buildFunctions({ exportedFunctions, imports, strings, dylibs }),
   };
+}
+
+export async function searchMachOStrings(path, pattern, { maxMatches = 50, minLength = 8 } = {}) {
+  const regex = new RegExp(pattern, "i");
+  const child = spawn("strings", ["-a", "-n", String(minLength), path], { stdio: ["ignore", "pipe", "pipe"] });
+  const matches = [];
+  let buffer = "";
+  let stderr = "";
+  let lineNumber = 0;
+
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      lineNumber += 1;
+      const value = line.trim();
+      if (value.length < minLength || looksLikeInstructionNoise(value)) continue;
+      if (!regex.test(value)) continue;
+      matches.push({ addr: `strscan:${lineNumber.toString(16)}`, value, source: "local-strings-scan" });
+      if (matches.length >= maxMatches) child.kill();
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString("utf8");
+  });
+
+  await new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      if (buffer && matches.length < maxMatches) {
+        lineNumber += 1;
+        const value = buffer.trim();
+        if (value.length >= minLength && !looksLikeInstructionNoise(value) && regex.test(value)) {
+          matches.push({ addr: `strscan:${lineNumber.toString(16)}`, value, source: "local-strings-scan" });
+        }
+      }
+      if (code && signal !== "SIGTERM") {
+        reject(new Error(`strings exited with code ${code}: ${stderr.slice(-1000)}`));
+        return;
+      }
+      resolve();
+    });
+  });
+
+  return matches;
 }
 
 function buildFunctions({ exportedFunctions, imports, strings, dylibs }) {

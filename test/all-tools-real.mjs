@@ -56,6 +56,7 @@ async function rpc(method, params = {}, { timeoutMs = 180000 } = {}) {
 }
 
 function toolPayload(result) {
+  if (result.isError) throw new Error(result.content?.[0]?.text ?? "MCP tool call failed.");
   return JSON.parse(result.content[0].text);
 }
 

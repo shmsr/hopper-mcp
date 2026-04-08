@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { KnowledgeStore } from "./knowledge-store.js";
 import { TransactionManager } from "./transaction-manager.js";
 import { HopperAdapter } from "./hopper-adapter.js";
-import { importMachO } from "./macho-importer.js";
+import { importMachO, searchMachOStrings } from "./macho-importer.js";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const store = new KnowledgeStore(process.env.HOPPER_MCP_STORE ?? join(ROOT, "data", "knowledge-store.json"));
@@ -51,6 +51,7 @@ const tools = [
   tool("resolve", "Resolve an address, name, string, import, or semantic query against the knowledge store.", {
     query: { type: "string" },
     session_id: { type: "string" },
+    max_results: { type: "number" },
   }, ["query"]),
   tool("analyze_function_deep", "Return purpose, pseudocode, graph context, evidence anchors, and provenance for a function.", {
     addr: { type: "string" },
@@ -67,6 +68,7 @@ const tools = [
     regex: { type: "string" },
     semantic: { type: "boolean" },
     session_id: { type: "string" },
+    max_results: { type: "number" },
   }, ["regex"]),
   tool("begin_transaction", "Start a reviewed annotation transaction.", {
     name: { type: "string" },
@@ -247,12 +249,18 @@ async function callTool(name, args, meta = {}) {
     result = { session: store.describeSession(session), source: "local-macho-importer" };
   } else if (name === "resolve") {
     result = store.resolve(args.query, sessionId);
+    if (!result.length) {
+      result = await resolveFromBinaryStrings(args.query, { sessionId, maxResults: args.max_results });
+    }
   } else if (name === "analyze_function_deep") {
     result = store.analyzeFunctionDeep(args.addr, { detailLevel: args.detail_level, sessionId });
   } else if (name === "get_graph_slice") {
     result = store.getGraphSlice(args.seed, { radius: args.radius ?? 1, kind: args.kind ?? "calls", sessionId });
   } else if (name === "search_strings") {
     result = store.searchStrings(args.regex, { semantic: Boolean(args.semantic), sessionId });
+    if (!result.length) {
+      result = await searchSessionBinaryStrings(args.regex, { semantic: Boolean(args.semantic), sessionId, maxResults: args.max_results });
+    }
   } else if (name === "begin_transaction") {
     result = await transactions.begin({ sessionId, name: args.name, rationale: args.rationale });
   } else if (name === "queue_rename") {
@@ -273,6 +281,24 @@ async function callTool(name, args, meta = {}) {
   }
 
   return toolResult(result);
+}
+
+async function resolveFromBinaryStrings(query, { sessionId, maxResults }) {
+  const strings = await searchSessionBinaryStrings(query, { semantic: false, sessionId, maxResults });
+  return strings.map((item) => ({ kind: "string", score: 0.45, item }));
+}
+
+async function searchSessionBinaryStrings(pattern, { semantic, sessionId, maxResults }) {
+  let session;
+  try {
+    session = store.getSession(sessionId);
+  } catch {
+    return [];
+  }
+  if (!session.binary?.path) return [];
+  const strings = await searchMachOStrings(session.binary.path, pattern, { maxMatches: maxResults ?? 50 });
+  if (!semantic) return strings;
+  return strings.map((item) => ({ ...item, referencedBy: [] }));
 }
 
 function toolResult(result) {

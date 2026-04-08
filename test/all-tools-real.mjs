@@ -9,6 +9,8 @@ const target = process.env.LIVE_HOPPER_BINARY ?? "/bin/ls";
 const localMachOTarget = process.env.LOCAL_MACHO_BINARY ?? "/Applications/Hopper Disassembler.app/Contents/MacOS/Hopper Disassembler";
 const expectedTools = [
   "capabilities",
+  "official_hopper_call",
+  "official_hopper_tools",
   "open_session",
   "ingest_sample",
   "ingest_live_hopper",

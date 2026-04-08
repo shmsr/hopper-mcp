@@ -13,6 +13,7 @@
     "test:protocol": "node ./test/protocol-compat.mjs",
     "test:real": "node ./test/real-app.mjs",
     "test:live": "node ./test/live-hopper.mjs",
+    "test:official": "node ./test/official-backend.mjs",
     "test:tools": "node ./test/all-tools-real.mjs"
   },
   "engines": {

@@ -37,6 +37,12 @@ Full tool check:
 LIVE_HOPPER_PARSE_OBJC=0 LIVE_HOPPER_PARSE_SWIFT=0 LIVE_HOPPER_ANALYSIS=0 LIVE_HOPPER_TIMEOUT_MS=90000 LIVE_HOPPER_MAX_FUNCTIONS=20 LIVE_HOPPER_MAX_STRINGS=50 npm run test:tools
 ```
 
+Official Hopper MCP backend check:
+
+```bash
+npm run test:official
+```
+
 If macOS blocks Automation, allow the launcher app to control Hopper in `System Settings > Privacy & Security > Automation`.
 
 For large binaries, start with the faster local importer:
@@ -108,6 +114,18 @@ Official-style Hopper snapshot tools:
 
 These tools mirror Hopper concepts using the last ingested snapshot. They do not query the frontmost Hopper UI live after export; that still needs the future persistent Hopper-side adapter.
 The mirror follows the official server's observed shapes where possible: procedure/string/name lists are address-keyed objects, search tools accept `pattern` and optional `case_sensitive`, and procedure assembly/pseudocode/current address/name calls return strings. The extended `search_strings` path still accepts `regex` plus `semantic: true` for richer local-store results.
+
+To query Hopper's installed official MCP server through this server, pass:
+
+```json
+{
+  "backend": "official"
+}
+```
+
+on supported mirror tools such as `list_documents`, `procedure_info`, `procedure_assembly`, `xrefs`, and `list_names`. This gives live active-document behavior while keeping the rest of this server available for resources, caching, local Mach-O import, and transaction preview.
+
+For official tools that are not mirrored, use `official_hopper_call`. Write/navigation official tools are blocked by default; enabling them requires both `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` in the server environment and `confirm_live_write: true` on the call.
 
 ## Add To Clients
 
@@ -216,6 +234,8 @@ Resource templates:
 Tools:
 
 - `capabilities`
+- `official_hopper_call`
+- `official_hopper_tools`
 - `open_session`
 - `ingest_sample`
 - `ingest_live_hopper`

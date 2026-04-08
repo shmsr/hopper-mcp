@@ -5,6 +5,7 @@ import { KnowledgeStore, formatAddress, parseAddress } from "./knowledge-store.j
 import { TransactionManager } from "./transaction-manager.js";
 import { HopperAdapter } from "./hopper-adapter.js";
 import { importMachO, searchMachOStrings, disassembleRange, findXrefs, discoverFunctionsFromDisassembly, mergeFunctionSets } from "./macho-importer.js";
+import { OfficialHopperBackend, officialToolPayload } from "./official-hopper-backend.js";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const store = new KnowledgeStore(process.env.HOPPER_MCP_STORE ?? join(ROOT, "data", "knowledge-store.json"));
@@ -13,8 +14,13 @@ const adapter = new HopperAdapter({
   socketPath: process.env.HOPPER_MCP_SOCKET ?? null,
   hopperLauncher: process.env.HOPPER_LAUNCHER ?? null,
 });
+const officialBackend = new OfficialHopperBackend();
 
 await store.load();
+
+process.on("exit", () => {
+  officialBackend.close();
+});
 
 const serverInfo = {
   name: "hopper-mcp",
@@ -30,6 +36,12 @@ let logLevel = "info";
 
 const tools = [
   tool("capabilities", "Report static/dynamic adapter capabilities.", {}),
+  tool("official_hopper_call", "Call Hopper's installed official MCP server. Write/navigation tools require HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1 and confirm_live_write=true.", {
+    name: { type: "string" },
+    arguments: { type: "object" },
+    confirm_live_write: { type: "boolean" },
+  }, ["name"]),
+  tool("official_hopper_tools", "List tools exposed by Hopper's installed official MCP server.", {}),
   tool("open_session", "Create or replace a session from an already-indexed JSON payload.", {
     session: { type: "object", description: "Normalized session document with functions, strings, imports, exports, and metadata." },
   }, ["session"]),
@@ -100,31 +112,39 @@ const tools = [
     case_sensitive: { type: "boolean" },
     regex: { type: "string" },
     semantic: { type: "boolean" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_results: { type: "number" },
   }),
   tool("list_documents", "List loaded snapshot sessions.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("current_document", "Return the active snapshot session.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("list_segments", "List segments from the active snapshot.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("list_procedures", "List procedure addresses and names from the active snapshot.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_results: { type: "number" },
   }),
   tool("list_procedure_size", "List procedure sizes and basic-block counts from the active snapshot.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_results: { type: "number" },
   }),
   tool("list_procedure_info", "List compact procedure metadata from the active snapshot.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_results: { type: "number" },
   }),
   tool("list_strings", "List indexed strings from the active snapshot.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_results: { type: "number" },
   }),
@@ -132,45 +152,56 @@ const tools = [
     pattern: { type: "string" },
     case_sensitive: { type: "boolean" },
     regex: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_results: { type: "number" },
   }),
   tool("procedure_info", "Return full procedure metadata for an address or name.", {
     procedure: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("procedure_address", "Resolve a procedure name or contained address to its entry address.", {
     procedure: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }, ["procedure"]),
   tool("procedure_assembly", "Return assembly captured from Hopper's public Python API.", {
     procedure: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_lines: { type: "number" },
   }),
   tool("procedure_pseudo_code", "Return pseudocode captured during live export, if include_pseudocode was enabled.", {
     procedure: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("procedure_callers", "Return procedure callers from the active snapshot.", {
     procedure: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("procedure_callees", "Return procedure callees from the active snapshot.", {
     procedure: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("xrefs", "Return cross-references to and from an address from the active snapshot.", {
     address: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("current_address", "Return the cursor address captured at export time.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("current_procedure", "Return the cursor procedure captured at export time.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("list_names", "List named addresses captured from Hopper.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_results: { type: "number" },
   }),
@@ -178,14 +209,17 @@ const tools = [
     pattern: { type: "string" },
     case_sensitive: { type: "boolean" },
     regex: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_results: { type: "number" },
   }),
   tool("address_name", "Return the name for an address, if captured.", {
     address: { type: "string" },
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
   }),
   tool("list_bookmarks", "List Hopper bookmarks captured in the snapshot.", {
+    backend: { type: "string", enum: ["snapshot", "official"] },
     session_id: { type: "string" },
     max_results: { type: "number" },
   }),
@@ -235,6 +269,31 @@ const tools = [
     session_id: { type: "string" },
   }),
 ];
+
+const officialMirrorTools = new Set([
+  "list_documents",
+  "current_document",
+  "list_segments",
+  "list_procedures",
+  "list_procedure_size",
+  "list_procedure_info",
+  "list_strings",
+  "search_strings",
+  "search_procedures",
+  "procedure_info",
+  "procedure_address",
+  "current_address",
+  "current_procedure",
+  "procedure_assembly",
+  "procedure_pseudo_code",
+  "procedure_callers",
+  "procedure_callees",
+  "xrefs",
+  "list_names",
+  "search_name",
+  "address_name",
+  "list_bookmarks",
+]);
 
 const prompts = [
   {
@@ -329,7 +388,12 @@ async function callTool(name, args, meta = {}) {
   let result;
 
   if (name === "capabilities") {
-    result = { server: serverInfo, adapter: adapter.capabilities(), sessions: store.listSessions() };
+    result = { server: serverInfo, adapter: adapter.capabilities(), officialBackend: officialBackend.capabilities(), sessions: store.listSessions() };
+  } else if (name === "official_hopper_call") {
+    const officialResult = await officialBackend.callTool(args.name, args.arguments ?? {}, { confirmLiveWrite: Boolean(args.confirm_live_write) });
+    result = officialToolPayload(officialResult);
+  } else if (name === "official_hopper_tools") {
+    result = await officialBackend.listTools();
   } else if (name === "open_session") {
     notifyProgress(progressToken, 0, 1, "Opening indexed session.");
     result = store.describeSession(await store.upsertSession(args.session));
@@ -433,6 +497,10 @@ async function callTool(name, args, meta = {}) {
   } else if (name === "get_graph_slice") {
     result = store.getGraphSlice(args.seed, { radius: args.radius ?? 1, kind: args.kind ?? "calls", sessionId });
   } else if (name === "search_strings") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const pattern = args.pattern ?? args.regex;
     if (!pattern) throw rpcError(-32602, "search_strings requires pattern or regex.");
     if (args.pattern !== undefined) {
@@ -444,25 +512,57 @@ async function callTool(name, args, meta = {}) {
       }
     }
   } else if (name === "list_documents") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = store.listSessions().map((session) => session.name);
   } else if (name === "current_document") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = store.getSession(sessionId).binary?.name ?? "unknown";
   } else if (name === "list_segments") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = getSessionSegments(sessionId).map(officialSegment);
   } else if (name === "list_procedures") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = objectFromFunctions(listProcedures(sessionId, { maxResults: args.max_results }), (fn) => fn.name ?? fn.addr);
   } else if (name === "list_procedure_size") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = objectFromFunctions(listProcedures(sessionId, { maxResults: args.max_results }), (fn) => ({
       name: fn.name ?? null,
       basicblock_count: fn.basicBlockCount ?? fn.basicBlocks?.length ?? 0,
       size: fn.size ?? null,
     }));
   } else if (name === "list_procedure_info") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = objectFromFunctions(listProcedures(sessionId, { maxResults: args.max_results }), officialProcedureInfo);
   } else if (name === "list_strings") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const session = store.getSession(sessionId);
     result = objectFromAddressItems(limitResults(session.strings ?? [], args.max_results), "value");
   } else if (name === "search_procedures") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const pattern = args.pattern ?? args.regex;
     if (!pattern) throw rpcError(-32602, "search_procedures requires pattern or regex.");
     const regex = new RegExp(pattern, args.case_sensitive ? "" : "i");
@@ -471,45 +571,97 @@ async function callTool(name, args, meta = {}) {
       (fn) => fn.name ?? fn.addr,
     );
   } else if (name === "procedure_info") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = officialProcedureInfo(resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId));
   } else if (name === "procedure_address") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId).addr;
   } else if (name === "procedure_assembly") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const fn = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId);
     const lines = assemblyLines(fn);
     result = args.max_lines ? lines.slice(0, args.max_lines).join("\n") : lines.join("\n");
   } else if (name === "procedure_pseudo_code") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const fn = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId);
     result = fn.pseudocode ?? "Pseudocode was not captured. Re-run ingest_live_hopper with include_pseudocode=true for selected functions.";
   } else if (name === "procedure_callers") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const session = store.getSession(sessionId);
     const fn = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId);
     result = (fn.callers ?? []).map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr);
   } else if (name === "procedure_callees") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const session = store.getSession(sessionId);
     const fn = resolveProcedure(defaultProcedureQuery(args.procedure, sessionId), sessionId);
     result = (fn.callees ?? []).map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr);
   } else if (name === "xrefs") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = snapshotXrefs(defaultAddressQuery(args.address, sessionId), sessionId);
   } else if (name === "current_address") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const session = store.getSession(sessionId);
     result = session.cursor?.address ?? null;
   } else if (name === "current_procedure") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const session = store.getSession(sessionId);
     const addr = session.cursor?.procedure;
     result = addr ? store.getFunctionIfKnown(session, addr).name ?? addr : null;
   } else if (name === "list_names") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const session = store.getSession(sessionId);
     result = objectFromAddressItems(limitResults(session.names ?? [], args.max_results), "name");
   } else if (name === "search_name") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const session = store.getSession(sessionId);
     const pattern = args.pattern ?? args.regex;
     if (!pattern) throw rpcError(-32602, "search_name requires pattern or regex.");
     const regex = new RegExp(pattern, args.case_sensitive ? "" : "i");
     result = objectFromAddressItems(limitResults((session.names ?? []).filter((item) => regex.test([item.addr, item.name, item.demangled].filter(Boolean).join(" "))), args.max_results), "name");
   } else if (name === "address_name") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     result = lookupName(defaultAddressQuery(args.address, sessionId), sessionId).name ?? "There is no name at this address";
   } else if (name === "list_bookmarks") {
+    if (shouldUseOfficial(name, args)) {
+      result = await callOfficialMirrorTool(name, args);
+      return toolResult(result);
+    }
     const session = store.getSession(sessionId);
     result = limitResults(session.bookmarks ?? [], args.max_results);
   } else if (name === "begin_transaction") {
@@ -537,6 +689,30 @@ async function callTool(name, args, meta = {}) {
 function getSessionSegments(sessionId) {
   const session = store.getSession(sessionId);
   return session.binary?.segments ?? [];
+}
+
+function shouldUseOfficial(name, args) {
+  return officialMirrorTools.has(name) && args.backend === "official";
+}
+
+async function callOfficialMirrorTool(name, args) {
+  const officialArgs = toOfficialArgs(name, args);
+  const result = await officialBackend.callTool(name, officialArgs);
+  return officialToolPayload(result);
+}
+
+function toOfficialArgs(name, args) {
+  const officialArgs = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (value === undefined) continue;
+    if (["backend", "session_id", "max_results", "semantic", "max_lines"].includes(key)) continue;
+    if (key === "regex" && args.pattern === undefined && ["search_strings", "search_procedures", "search_name"].includes(name)) {
+      officialArgs.pattern = value;
+      continue;
+    }
+    officialArgs[key] = value;
+  }
+  return officialArgs;
 }
 
 function officialSegment(segment) {

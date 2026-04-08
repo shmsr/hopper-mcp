@@ -63,6 +63,13 @@ try {
     name: "resolve",
     arguments: { query: "license" },
   });
+  const truncatedString = await rpc(8, "tools/call", {
+    name: "debug_echo",
+    arguments: {
+      value: "abcdefghijklmnopqrstuvwxyz",
+      max_result_chars: 12,
+    },
+  });
 
   if (initialized.protocolVersion !== "2025-11-25") {
     throw new Error(`Expected protocolVersion 2025-11-25, got ${initialized.protocolVersion}`);
@@ -94,6 +101,14 @@ try {
   }
   if (!Array.isArray(matches.structuredContent?.result)) {
     throw new Error("Resolve tool result was not wrapped in structuredContent.result.");
+  }
+  if (!truncatedString.isError) {
+    if (truncatedString.structuredContent?.truncated !== true) {
+      throw new Error("Large official string result was not marked truncated.");
+    }
+    if ("result" in truncatedString.structuredContent) {
+      throw new Error("Truncated official string result included the full result by default.");
+    }
   }
   if (!notifications.some((message) => message.method === "notifications/progress")) {
     throw new Error("Progress notification was not emitted for a progress-tokened tool call.");

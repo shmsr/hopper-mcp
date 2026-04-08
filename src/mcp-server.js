@@ -33,6 +33,7 @@ const serverInfo = {
 const latestProtocolVersion = "2025-11-25";
 const supportedProtocolVersions = new Set([latestProtocolVersion, "2025-06-18", "2025-03-26"]);
 const logLevels = new Set(["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"]);
+const defaultMaxToolTextChars = 120000;
 let logLevel = "info";
 
 const tools = [
@@ -41,8 +42,15 @@ const tools = [
     name: { type: "string" },
     arguments: { type: "object" },
     confirm_live_write: { type: "boolean" },
+    max_result_chars: { type: "number" },
+    include_full_result: { type: "boolean" },
   }, ["name"]),
   tool("official_hopper_tools", "List tools exposed by Hopper's installed official MCP server.", {}),
+  tool("debug_echo", "Internal test helper that echoes a payload through the MCP result formatter.", {
+    value: { type: "string" },
+    max_result_chars: { type: "number" },
+    include_full_result: { type: "boolean" },
+  }, ["value"]),
   tool("ingest_official_hopper", "Refresh the local snapshot store from Hopper's installed official MCP server.", {
     max_procedures: { type: "number" },
     include_procedure_info: { type: "boolean" },
@@ -411,8 +419,17 @@ async function callTool(name, args, meta = {}) {
   } else if (name === "official_hopper_call") {
     const officialResult = await officialBackend.callTool(args.name, args.arguments ?? {}, { confirmLiveWrite: Boolean(args.confirm_live_write) });
     result = officialToolPayload(officialResult);
+    return toolResult(result, {
+      maxTextChars: Number(args.max_result_chars ?? defaultMaxToolTextChars),
+      includeFullResult: Boolean(args.include_full_result),
+    });
   } else if (name === "official_hopper_tools") {
     result = await officialBackend.listTools();
+  } else if (name === "debug_echo") {
+    return toolResult(args.value, {
+      maxTextChars: Number(args.max_result_chars ?? defaultMaxToolTextChars),
+      includeFullResult: Boolean(args.include_full_result),
+    });
   } else if (name === "ingest_official_hopper" || name === "refresh_snapshot") {
     notifyProgress(progressToken, 0, 2, "Reading live Hopper document through the official MCP backend.");
     const snapshot = await buildOfficialSnapshot(officialBackend, {
@@ -919,16 +936,42 @@ async function searchSessionBinaryStrings(pattern, { semantic, sessionId, maxRes
   return strings.map((item) => ({ ...item, referencedBy: [] }));
 }
 
-function toolResult(result) {
+function toolResult(result, { maxTextChars = defaultMaxToolTextChars, includeFullResult = true } = {}) {
+  const contentText = formatToolText(result, { maxTextChars });
   return {
-    content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-    structuredContent: structuredToolContent(result),
+    content: [{ type: "text", text: contentText }],
+    structuredContent: structuredToolContent(result, { maxTextChars, includeFullResult }),
   };
 }
 
-function structuredToolContent(result) {
+function formatToolText(result, { maxTextChars }) {
+  const text = JSON.stringify(result, null, 2);
+  if (!maxTextChars || maxTextChars < 0 || text.length <= maxTextChars) return text;
+  return JSON.stringify({
+    truncated: true,
+    originalChars: text.length,
+    returnedChars: maxTextChars,
+    preview: text.slice(0, maxTextChars),
+  }, null, 2);
+}
+
+function structuredToolContent(result, { maxTextChars = defaultMaxToolTextChars, includeFullResult = true } = {}) {
+  if (typeof result === "string") {
+    if (!maxTextChars || maxTextChars < 0 || result.length <= maxTextChars) return { result };
+    return removeUndefined({
+      result: includeFullResult ? result : undefined,
+      resultPreview: result.slice(0, maxTextChars),
+      truncated: true,
+      originalChars: result.length,
+      returnedChars: maxTextChars,
+    });
+  }
   if (result && typeof result === "object" && !Array.isArray(result)) return result;
   return { result };
+}
+
+function removeUndefined(object) {
+  return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
 }
 
 function toolError(error) {

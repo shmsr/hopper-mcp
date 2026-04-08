@@ -127,6 +127,8 @@ on supported mirror tools such as `list_documents`, `procedure_info`, `procedure
 
 For official tools that are not mirrored, use `official_hopper_call`. Write/navigation official tools are blocked by default; enabling them requires both `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` in the server environment and `confirm_live_write: true` on the call.
 
+Direct official calls cap large text results by default so a single decompile does not overwhelm the client. Pass `max_result_chars` to tune the preview size, or `include_full_result: true` if the client can safely handle the full result in `structuredContent`.
+
 To refresh this server's local snapshot from Hopper's official live backend, call:
 
 ```json
@@ -304,6 +306,7 @@ Tools:
 - `preview_transaction`
 - `commit_transaction`
 - `rollback_transaction`
+- `debug_echo` (internal formatter test helper)
 
 Prompts:
 

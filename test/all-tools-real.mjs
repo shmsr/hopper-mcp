@@ -11,6 +11,8 @@ const expectedTools = [
   "capabilities",
   "official_hopper_call",
   "official_hopper_tools",
+  "ingest_official_hopper",
+  "refresh_snapshot",
   "open_session",
   "ingest_sample",
   "ingest_live_hopper",
@@ -321,6 +323,31 @@ try {
     assert(Array.isArray(bookmarks), "list_bookmarks did not return an array.");
   });
 
+  let officialSnapshotSessionId;
+  await check("official Hopper snapshot refresh", async () => {
+    const refreshed = toolPayload(await rpc("tools/call", {
+      name: "ingest_official_hopper",
+      arguments: {
+        max_procedures: 5,
+        include_procedure_info: true,
+      },
+    }, { timeoutMs: 90000 }));
+    officialSnapshotSessionId = refreshed.session.sessionId;
+    assert(refreshed.source === "official-hopper-mcp", "ingest_official_hopper returned wrong source.");
+    assert(refreshed.session.capabilities.officialSnapshot.exported.procedures <= 5, "ingest_official_hopper ignored max_procedures.");
+    assert(refreshed.session.capabilities.officialSnapshot.totals.procedures >= refreshed.session.counts.functions, "official snapshot totals are inconsistent.");
+    const procedures = toolPayload(await rpc("tools/call", { name: "list_procedures", arguments: { session_id: officialSnapshotSessionId, max_results: 5 } }));
+    assert(procedures && typeof procedures === "object" && !Array.isArray(procedures), "refreshed official snapshot did not list procedures.");
+    const alias = toolPayload(await rpc("tools/call", {
+      name: "refresh_snapshot",
+      arguments: {
+        max_procedures: 3,
+        include_procedure_info: false,
+      },
+    }, { timeoutMs: 90000 }));
+    assert(alias.session.counts.functions <= 3, "refresh_snapshot alias did not honor max_procedures.");
+  });
+
   await check("transaction rollback", async () => {
     const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "real rollback test", rationale: "Exercise queue_comment and rollback.", session_id: sessionId } }));
     const queued = toolPayload(await rpc("tools/call", {
@@ -387,6 +414,32 @@ try {
     assert(committed.adapterResult.appliedToHopper === false, "commit_transaction should not claim Hopper write-back yet.");
     const analysis = toolPayload(await rpc("tools/call", { name: "analyze_function_deep", arguments: { addr: targetFunction.addr, session_id: sessionId } }));
     assert(analysis.function.name === newName, "committed rename was not reflected in knowledge store.");
+  });
+
+  await check("official transaction commit guard", async () => {
+    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "official guard test", rationale: "Verify official writes are gated.", session_id: officialSnapshotSessionId ?? sessionId } }));
+    await rpc("tools/call", {
+      name: "queue_comment",
+      arguments: {
+        transaction_id: begun.transactionId,
+        addr: Object.keys(toolPayload(await rpc("tools/call", { name: "list_procedures", arguments: { session_id: officialSnapshotSessionId ?? sessionId, max_results: 1 } })))[0] ?? targetFunction.addr,
+        comment: "Should be blocked unless official writes are enabled.",
+        rationale: "Testing official write guard.",
+        session_id: officialSnapshotSessionId ?? sessionId,
+      },
+    });
+    const blocked = await rpc("tools/call", {
+      name: "commit_transaction",
+      arguments: {
+        transaction_id: begun.transactionId,
+        session_id: officialSnapshotSessionId ?? sessionId,
+        backend: "official",
+      },
+    });
+    assert(blocked.isError === true, "official commit without confirmation/env should be blocked.");
+    assert(String(blocked.content?.[0]?.text ?? "").includes("requires HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1"), "official commit guard returned the wrong error.");
+    const rollback = toolPayload(await rpc("tools/call", { name: "rollback_transaction", arguments: { transaction_id: begun.transactionId, session_id: officialSnapshotSessionId ?? sessionId } }));
+    assert(rollback.status === "rolled_back", "official guard transaction did not remain rollback-able.");
   });
 
   await check("open_session", async () => {

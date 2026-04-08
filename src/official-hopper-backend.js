@@ -63,6 +63,34 @@ export class OfficialHopperBackend {
     return this.request("tools/call", { name, arguments: args });
   }
 
+  async applyTransaction(_session, transaction, { confirmLiveWrite = false } = {}) {
+    const mappedOperations = transaction.operations.map((operation) => {
+      const mapped = officialOperation(operation);
+      if (!mapped) {
+        throw new Error(`Official Hopper backend does not support transaction operation '${operation.kind}'.`);
+      }
+      return { operation, mapped };
+    });
+    const operations = [];
+
+    for (const { operation, mapped } of mappedOperations) {
+      const response = await this.callTool(mapped.name, mapped.arguments, { confirmLiveWrite });
+      operations.push({
+        operationId: operation.operationId,
+        kind: operation.kind,
+        tool: mapped.name,
+        result: officialToolPayload(response),
+      });
+    }
+
+    return {
+      appliedToHopper: true,
+      backend: "official-hopper-mcp",
+      transactionId: transaction.id,
+      operations,
+    };
+  }
+
   async start() {
     if (this.initialized) return;
     if (this.startPromise) return this.startPromise;
@@ -142,4 +170,26 @@ export function officialToolPayload(result) {
   } catch {
     return text;
   }
+}
+
+function officialOperation(operation) {
+  if (operation.kind === "rename") {
+    return {
+      name: "set_address_name",
+      arguments: { address: operation.addr, name: operation.newValue },
+    };
+  }
+  if (operation.kind === "comment") {
+    return {
+      name: "set_comment",
+      arguments: { address: operation.addr, comment: operation.newValue },
+    };
+  }
+  if (operation.kind === "inline_comment") {
+    return {
+      name: "set_inline_comment",
+      arguments: { address: operation.addr, comment: operation.newValue },
+    };
+  }
+  return null;
 }

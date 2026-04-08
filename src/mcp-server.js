@@ -6,6 +6,7 @@ import { TransactionManager } from "./transaction-manager.js";
 import { HopperAdapter } from "./hopper-adapter.js";
 import { importMachO, searchMachOStrings, disassembleRange, findXrefs, discoverFunctionsFromDisassembly, mergeFunctionSets } from "./macho-importer.js";
 import { OfficialHopperBackend, officialToolPayload } from "./official-hopper-backend.js";
+import { buildOfficialSnapshot } from "./official-snapshot.js";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const store = new KnowledgeStore(process.env.HOPPER_MCP_STORE ?? join(ROOT, "data", "knowledge-store.json"));
@@ -42,6 +43,22 @@ const tools = [
     confirm_live_write: { type: "boolean" },
   }, ["name"]),
   tool("official_hopper_tools", "List tools exposed by Hopper's installed official MCP server.", {}),
+  tool("ingest_official_hopper", "Refresh the local snapshot store from Hopper's installed official MCP server.", {
+    max_procedures: { type: "number" },
+    include_procedure_info: { type: "boolean" },
+    include_assembly: { type: "boolean" },
+    include_pseudocode: { type: "boolean" },
+    include_call_graph: { type: "boolean" },
+    fail_on_truncation: { type: "boolean" },
+  }),
+  tool("refresh_snapshot", "Alias for ingest_official_hopper: refresh the local snapshot from the live official Hopper backend.", {
+    max_procedures: { type: "number" },
+    include_procedure_info: { type: "boolean" },
+    include_assembly: { type: "boolean" },
+    include_pseudocode: { type: "boolean" },
+    include_call_graph: { type: "boolean" },
+    fail_on_truncation: { type: "boolean" },
+  }),
   tool("open_session", "Create or replace a session from an already-indexed JSON payload.", {
     session: { type: "object", description: "Normalized session document with functions, strings, imports, exports, and metadata." },
   }, ["session"]),
@@ -263,6 +280,8 @@ const tools = [
   tool("commit_transaction", "Commit queued writes to the knowledge store and, when connected, Hopper.", {
     transaction_id: { type: "string" },
     session_id: { type: "string" },
+    backend: { type: "string", enum: ["local", "official"] },
+    confirm_live_write: { type: "boolean" },
   }),
   tool("rollback_transaction", "Roll back an open transaction without applying writes.", {
     transaction_id: { type: "string" },
@@ -394,6 +413,21 @@ async function callTool(name, args, meta = {}) {
     result = officialToolPayload(officialResult);
   } else if (name === "official_hopper_tools") {
     result = await officialBackend.listTools();
+  } else if (name === "ingest_official_hopper" || name === "refresh_snapshot") {
+    notifyProgress(progressToken, 0, 2, "Reading live Hopper document through the official MCP backend.");
+    const snapshot = await buildOfficialSnapshot(officialBackend, {
+      maxProcedures: args.max_procedures,
+      includeProcedureInfo: args.include_procedure_info !== false,
+      includeAssembly: Boolean(args.include_assembly),
+      includePseudocode: Boolean(args.include_pseudocode),
+      includeCallGraph: Boolean(args.include_call_graph),
+      failOnTruncation: Boolean(args.fail_on_truncation),
+    });
+    notifyProgress(progressToken, 1, 2, "Updating local snapshot store.");
+    const session = await store.upsertSession(snapshot);
+    notifyResourceListChanged();
+    notifyProgress(progressToken, 2, 2, "Official Hopper snapshot refreshed.");
+    result = { session: store.describeSession(session), source: "official-hopper-mcp" };
   } else if (name === "open_session") {
     notifyProgress(progressToken, 0, 1, "Opening indexed session.");
     result = store.describeSession(await store.upsertSession(args.session));
@@ -677,7 +711,12 @@ async function callTool(name, args, meta = {}) {
   } else if (name === "preview_transaction") {
     result = transactions.preview({ transactionId: args.transaction_id, sessionId });
   } else if (name === "commit_transaction") {
-    result = await transactions.commit({ transactionId: args.transaction_id, sessionId, adapter });
+    const commitAdapter = args.backend === "official"
+      ? {
+        applyTransaction: (session, transaction) => officialBackend.applyTransaction(session, transaction, { confirmLiveWrite: Boolean(args.confirm_live_write) }),
+      }
+      : adapter;
+    result = await transactions.commit({ transactionId: args.transaction_id, sessionId, adapter: commitAdapter });
     notifyResourceListChanged();
   } else if (name === "rollback_transaction") {
     result = await transactions.rollback({ transactionId: args.transaction_id, sessionId });

@@ -2,7 +2,7 @@
 
 MCP server for Hopper. It can import Mach-O data with local macOS tools, or open a binary in Hopper and export indexed state through Hopper's Python scripting API.
 
-Current write behavior is local-only: transaction commits update the JSON store and return `appliedToHopper: false`. Writing comments/renames back into Hopper still needs the persistent Hopper-side adapter.
+Default write behavior is local-only: transaction commits update the JSON store and return `appliedToHopper: false`. Comment/rename write-back can be routed through Hopper's installed official MCP server, but only when `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` is set and the commit passes `confirm_live_write: true`.
 
 ## Requirements
 
@@ -127,6 +127,32 @@ on supported mirror tools such as `list_documents`, `procedure_info`, `procedure
 
 For official tools that are not mirrored, use `official_hopper_call`. Write/navigation official tools are blocked by default; enabling them requires both `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` in the server environment and `confirm_live_write: true` on the call.
 
+To refresh this server's local snapshot from Hopper's official live backend, call:
+
+```json
+{
+  "max_procedures": 500,
+  "include_procedure_info": true,
+  "include_assembly": false,
+  "include_pseudocode": false,
+  "include_call_graph": false
+}
+```
+
+as `ingest_official_hopper` or `refresh_snapshot`. This gives our resource/cache layer a current official-Hopper snapshot without relying on private Hopper APIs. Keep `include_assembly`, `include_pseudocode`, and `include_call_graph` off unless needed; they require per-procedure official backend calls and can be slow on large documents.
+
+To commit a reviewed local transaction through the official backend:
+
+```json
+{
+  "transaction_id": "txn-id",
+  "backend": "official",
+  "confirm_live_write": true
+}
+```
+
+The server must also be started with `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1`. Unsupported operations, such as `queue_type_patch`, are rejected rather than silently applied only to the local cache.
+
 ## Add To Clients
 
 Replace `/path/to/hopper-mcp` with the absolute path to this repo.
@@ -236,6 +262,8 @@ Tools:
 - `capabilities`
 - `official_hopper_call`
 - `official_hopper_tools`
+- `ingest_official_hopper`
+- `refresh_snapshot`
 - `open_session`
 - `ingest_sample`
 - `ingest_live_hopper`

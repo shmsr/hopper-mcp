@@ -81,3 +81,13 @@ snapshot. The `official_hopper_call` tool can call non-mirrored official tools d
 
 Official write/navigation tools are blocked unless `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` is present in the
 server environment and the call passes `confirm_live_write: true`.
+
+The `ingest_official_hopper` and `refresh_snapshot` tools use the official backend to read the current live
+Hopper document into this project's local snapshot store. This keeps the official server as the authority
+for live document state while letting this server expose resources, caching, local Mach-O helpers, and safer
+transaction previews.
+
+`commit_transaction` can route reviewed rename/comment/inline-comment operations to the official backend with
+`backend: "official"` and `confirm_live_write: true`, but the server still requires
+`HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1`. Unsupported operations, including type patches, fail before the local
+snapshot is mutated.

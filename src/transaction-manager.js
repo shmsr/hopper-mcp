@@ -52,6 +52,9 @@ export class TransactionManager {
     const session = this.store.getSession(sessionId);
     const txn = this.currentTransaction(session, transactionId);
     const committedAt = new Date().toISOString();
+    const adapterResult = adapter
+      ? await adapter.applyTransaction(session, txn)
+      : { appliedToHopper: false, reason: "No in-process Hopper adapter is connected yet." };
 
     for (const operation of txn.operations) {
       applyToKnowledgeStore(session, operation);
@@ -59,9 +62,7 @@ export class TransactionManager {
 
     txn.status = "committed";
     txn.committedAt = committedAt;
-    txn.adapterResult = adapter
-      ? await adapter.applyTransaction(session, txn)
-      : { appliedToHopper: false, reason: "No in-process Hopper adapter is connected yet." };
+    txn.adapterResult = adapterResult;
 
     await this.store.save();
     return {

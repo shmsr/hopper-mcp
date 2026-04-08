@@ -43,6 +43,8 @@ const tools = [
     parse_objective_c: { type: "boolean" },
     parse_swift: { type: "boolean" },
     wait_for_analysis: { type: "boolean" },
+    full_export: { type: "boolean" },
+    fail_on_truncation: { type: "boolean" },
   }, ["executable_path"]),
   tool("import_macho", "Import Mach-O metadata using local macOS tools. With deep=true, also discovers functions from disassembly, builds call graphs, and resolves string cross-references via ADRP+ADD patterns.", {
     executable_path: { type: "string" },
@@ -259,6 +261,8 @@ async function callTool(name, args, meta = {}) {
       parseObjectiveC: args.parse_objective_c,
       parseSwift: args.parse_swift,
       waitForAnalysis: args.wait_for_analysis,
+      fullExport: args.full_export,
+      failOnTruncation: args.fail_on_truncation,
     });
     notifyProgress(progressToken, 1, 2, "Ingesting Hopper export.");
     const session = await store.upsertSession(live.session);

@@ -51,6 +51,18 @@ For large binaries, start with the faster local importer:
 
 Call that as `import_macho`. Use `ingest_live_hopper` when you need a Hopper Python export for a specific executable path. Exporting the frontmost Hopper document is not exposed yet; that needs the future in-process Hopper adapter.
 
+Live Hopper export modes:
+
+```json
+{
+  "executable_path": "/path/to/binary",
+  "wait_for_analysis": true,
+  "full_export": true
+}
+```
+
+`full_export: true` forces `wait_for_analysis: true`, removes the function/string/basic-block/instruction caps unless you pass explicit caps, and adds `capabilities.liveExport` metadata with totals, exported counts, and truncation flags. If a cap is passed with `full_export: true`, truncation fails the export by default. Set `fail_on_truncation: false` only when a partial export is acceptable.
+
 Deep local import:
 
 ```json

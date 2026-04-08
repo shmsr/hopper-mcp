@@ -174,6 +174,8 @@ try {
     sessionId = ingest.session.sessionId;
     assert(ingest.session.counts.functions > 0, "live ingest did not return functions.");
     assert(ingest.session.counts.strings > 0, "live ingest did not return strings.");
+    assert(ingest.session.capabilities?.liveExport?.waitForAnalysis === false, "default live ingest should report waitForAnalysis=false.");
+    assert(typeof ingest.session.capabilities?.liveExport?.truncated?.functions === "boolean", "live ingest did not report truncation metadata.");
   });
 
   await check("import_macho", async () => {

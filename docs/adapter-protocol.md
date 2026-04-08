@@ -16,6 +16,12 @@ The current bridge is read-first:
 5. The exporter writes a normalized session JSON file.
 6. The Node server ingests that session into the local knowledge store.
 
+By default, this returns a capped snapshot. Callers that need a completed analysis pass should set
+`wait_for_analysis: true`; callers that need a strict export should set `full_export: true`. Full export
+forces `wait_for_analysis`, removes export caps unless explicit caps are supplied, and reports
+`capabilities.liveExport` metadata with totals, exported counts, and truncation flags. If explicit caps
+truncate a full export, the exporter fails unless `fail_on_truncation: false` is set.
+
 This avoids private interfaces and SIP-disabling injection. It does require macOS Automation permission for
 the terminal host, which may appear as `Ghostty` in System Settings.
 

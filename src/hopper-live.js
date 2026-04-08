@@ -13,22 +13,32 @@ export async function ingestWithLiveHopper({
   parseObjectiveC = true,
   parseSwift = true,
   timeoutMs = 600000,
-  maxFunctions = 5000,
-  maxStrings = 10000,
-  maxBlocksPerFunction = 64,
-  maxInstructionsPerBlock = 24,
+  maxFunctions,
+  maxStrings,
+  maxBlocksPerFunction,
+  maxInstructionsPerBlock,
   waitForAnalysis = false,
+  fullExport = false,
+  failOnTruncation = fullExport,
 } = {}) {
   if (!executablePath) throw new Error("ingest_live_hopper requires executable_path.");
+
+  const effectiveWaitForAnalysis = fullExport ? true : waitForAnalysis;
+  const effectiveMaxFunctions = fullExport ? (maxFunctions ?? null) : (maxFunctions ?? 5000);
+  const effectiveMaxStrings = fullExport ? (maxStrings ?? null) : (maxStrings ?? 10000);
+  const effectiveMaxBlocksPerFunction = fullExport ? (maxBlocksPerFunction ?? null) : (maxBlocksPerFunction ?? 64);
+  const effectiveMaxInstructionsPerBlock = fullExport ? (maxInstructionsPerBlock ?? null) : (maxInstructionsPerBlock ?? 24);
 
   return runHopperExporter({
     hopperLauncher,
     timeoutMs,
-    maxFunctions,
-    maxStrings,
-    maxBlocksPerFunction,
-    maxInstructionsPerBlock,
-    waitForAnalysis,
+    maxFunctions: effectiveMaxFunctions,
+    maxStrings: effectiveMaxStrings,
+    maxBlocksPerFunction: effectiveMaxBlocksPerFunction,
+    maxInstructionsPerBlock: effectiveMaxInstructionsPerBlock,
+    waitForAnalysis: effectiveWaitForAnalysis,
+    fullExport,
+    failOnTruncation,
     buildAppleScript: (scriptPath) => buildOpenExecutableAppleScript({
       executablePath,
       scriptPath,
@@ -42,6 +52,8 @@ export async function ingestWithLiveHopper({
       parseSwift,
       analysis,
       executablePath,
+      fullExport,
+      waitForAnalysis: effectiveWaitForAnalysis,
     },
   });
 }
@@ -54,13 +66,15 @@ async function runHopperExporter({
   maxBlocksPerFunction,
   maxInstructionsPerBlock,
   waitForAnalysis,
+  fullExport,
+  failOnTruncation,
   buildAppleScript,
   diagnostics,
 }) {
   const workdir = await mkdtemp(join(tmpdir(), "hopper-live-"));
   const outputPath = join(workdir, "session.json");
   const scriptPath = join(workdir, "export_live_session.py");
-  await writeFile(scriptPath, buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, waitForAnalysis }), "utf8");
+  await writeFile(scriptPath, buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, waitForAnalysis, fullExport, failOnTruncation }), "utf8");
 
   const appleScript = buildAppleScript(scriptPath);
   const args = ["-e", appleScript];
@@ -117,7 +131,14 @@ async function waitForJson(path, timeoutMs, diagnostics) {
         return parsed;
       }
     } catch (error) {
-      if (error.code !== "ENOENT") lastError = error;
+      if (error.code === "ENOENT") {
+        // Hopper has not created the export file yet.
+      } else if (error instanceof SyntaxError) {
+        // The exporter may still be writing JSON. Keep polling until the file is complete.
+        lastError = error;
+      } else {
+        throw error;
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
@@ -143,18 +164,20 @@ function timeoutHint(details) {
   return "Hopper may still be analyzing the target or waiting for UI input.";
 }
 
-function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, waitForAnalysis }) {
+function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, waitForAnalysis, fullExport, failOnTruncation }) {
   return String.raw`
 import hashlib
 import json
 import traceback
 
 OUTPUT_PATH = ${JSON.stringify(outputPath)}
-MAX_FUNCTIONS = ${JSON.stringify(maxFunctions)}
-MAX_STRINGS = ${JSON.stringify(maxStrings)}
-MAX_BLOCKS_PER_FUNCTION = ${JSON.stringify(maxBlocksPerFunction)}
-MAX_INSTRUCTIONS_PER_BLOCK = ${JSON.stringify(maxInstructionsPerBlock)}
+MAX_FUNCTIONS = ${pythonLiteral(maxFunctions)}
+MAX_STRINGS = ${pythonLiteral(maxStrings)}
+MAX_BLOCKS_PER_FUNCTION = ${pythonLiteral(maxBlocksPerFunction)}
+MAX_INSTRUCTIONS_PER_BLOCK = ${pythonLiteral(maxInstructionsPerBlock)}
 WAIT_FOR_ANALYSIS = ${pythonBool(waitForAnalysis)}
+FULL_EXPORT = ${pythonBool(fullExport)}
+FAIL_ON_TRUNCATION = ${pythonBool(failOnTruncation)}
 
 def hx(value):
     try:
@@ -188,6 +211,29 @@ def stable_id(prefix, *parts):
         h.update(b"\x00")
     return "%s-%s" % (prefix, h.hexdigest()[:16])
 
+def limit_count(total, limit):
+    if limit is None:
+        return total
+    try:
+        if limit < 0:
+            return total
+    except Exception:
+        return total
+    return min(total, limit)
+
+def is_truncated(total, limit):
+    if limit is None:
+        return False
+    try:
+        if limit < 0:
+            return False
+    except Exception:
+        return False
+    return total > limit
+
+def export_limit(limit):
+    return None if limit is None or limit < 0 else limit
+
 def procedure_addr(proc):
     return safe_call(None, proc.getEntryPoint)
 
@@ -211,7 +257,8 @@ def procedure_refs(procs):
 def collect_basic_blocks(seg, proc):
     blocks = []
     block_count = safe_call(0, proc.getBasicBlockCount)
-    for block_index in range(min(block_count, MAX_BLOCKS_PER_FUNCTION)):
+    block_limit = limit_count(block_count, MAX_BLOCKS_PER_FUNCTION)
+    for block_index in range(block_limit):
         block = safe_call(None, proc.getBasicBlock, block_index)
         if block is None:
             continue
@@ -220,7 +267,8 @@ def collect_basic_blocks(seg, proc):
         instructions = []
         cursor = start
         count = 0
-        while cursor is not None and end is not None and cursor <= end and count < MAX_INSTRUCTIONS_PER_BLOCK:
+        instruction_limit = export_limit(MAX_INSTRUCTIONS_PER_BLOCK)
+        while cursor is not None and end is not None and cursor <= end and (instruction_limit is None or count < instruction_limit):
             instr = safe_call(None, seg.getInstructionAtAddress, cursor)
             if instr is None:
                 break
@@ -248,12 +296,17 @@ def collect_basic_blocks(seg, proc):
 
 def collect_strings(doc):
     strings = []
+    total = 0
     for seg in safe_call([], doc.getSegmentsList):
         for value, addr in safe_call([], seg.getStringsList):
-            strings.append({"addr": hx(addr), "value": safe_string(value)})
-            if len(strings) >= MAX_STRINGS:
-                return strings
-    return strings
+            total = total + 1
+            if MAX_STRINGS is None or MAX_STRINGS < 0 or len(strings) < MAX_STRINGS:
+                strings.append({"addr": hx(addr), "value": safe_string(value)})
+    return {
+        "items": strings,
+        "total": total,
+        "truncated": is_truncated(total, MAX_STRINGS)
+    }
 
 def collect_segments(doc):
     segments = []
@@ -277,11 +330,13 @@ def collect_segments(doc):
 
 def collect_functions(doc):
     functions = []
+    total = 0
     for seg in safe_call([], doc.getSegmentsList):
         count = safe_call(0, seg.getProcedureCount)
+        total = total + count
         for index in range(count):
-            if len(functions) >= MAX_FUNCTIONS:
-                return functions
+            if MAX_FUNCTIONS is not None and MAX_FUNCTIONS >= 0 and len(functions) >= MAX_FUNCTIONS:
+                continue
             proc = safe_call(None, seg.getProcedureAtIndex, index)
             if proc is None:
                 continue
@@ -317,7 +372,11 @@ def collect_functions(doc):
                     "stringBag": []
                 }
             })
-    return functions
+    return {
+        "items": functions,
+        "total": total,
+        "truncated": is_truncated(total, MAX_FUNCTIONS)
+    }
 
 try:
     doc = Document.getCurrentDocument()
@@ -326,6 +385,14 @@ try:
     executable_path = safe_call(None, doc.getExecutableFilePath)
     database_path = safe_call(None, doc.getDatabaseFilePath)
     document_name = safe_call("Hopper Document", doc.getDocumentName)
+    function_export = collect_functions(doc)
+    string_export = collect_strings(doc)
+    truncated = {
+        "functions": function_export["truncated"],
+        "strings": string_export["truncated"],
+    }
+    if FAIL_ON_TRUNCATION and (truncated["functions"] or truncated["strings"]):
+        raise Exception("Hopper live export was truncated: %s" % json.dumps(truncated, sort_keys=True))
     session = {
         "sessionId": stable_id("hopper-live", document_name, executable_path, database_path),
         "binaryId": stable_id("hopper-live", executable_path, document_name),
@@ -343,10 +410,30 @@ try:
             "privateApi": False,
             "dynamicDebugger": False,
             "source": "hopper-python-live",
-            "writesRequirePreview": True
+            "writesRequirePreview": True,
+            "liveExport": {
+                "fullExport": FULL_EXPORT,
+                "waitForAnalysis": WAIT_FOR_ANALYSIS,
+                "failOnTruncation": FAIL_ON_TRUNCATION,
+                "limits": {
+                    "functions": MAX_FUNCTIONS,
+                    "strings": MAX_STRINGS,
+                    "blocksPerFunction": MAX_BLOCKS_PER_FUNCTION,
+                    "instructionsPerBlock": MAX_INSTRUCTIONS_PER_BLOCK
+                },
+                "totals": {
+                    "functions": function_export["total"],
+                    "strings": string_export["total"]
+                },
+                "exported": {
+                    "functions": len(function_export["items"]),
+                    "strings": len(string_export["items"])
+                },
+                "truncated": truncated
+            }
         },
-        "functions": collect_functions(doc),
-        "strings": collect_strings(doc),
+        "functions": function_export["items"],
+        "strings": string_export["items"],
         "imports": [],
         "exports": [],
         "objcClasses": [],
@@ -378,6 +465,11 @@ function buildOpenExecutableAppleScript({ executablePath, scriptPath, analysis, 
 
 function pythonBool(value) {
   return value ? "True" : "False";
+}
+
+function pythonLiteral(value) {
+  if (value === null || value === undefined) return "None";
+  return JSON.stringify(value);
 }
 
 function quoteAppleScriptString(value) {

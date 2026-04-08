@@ -37,17 +37,32 @@ async function rpc(method, params = {}) {
 
 try {
   await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "live-hopper-test", version: "0.1.0" } });
+  const fullExportRequested = process.env.LIVE_HOPPER_FULL_EXPORT === "1";
+  const ingestArgs = {
+    executable_path: target,
+    timeout_ms: timeoutMs,
+    analysis: process.env.LIVE_HOPPER_ANALYSIS !== "0",
+    parse_objective_c: process.env.LIVE_HOPPER_PARSE_OBJC !== "0",
+    parse_swift: process.env.LIVE_HOPPER_PARSE_SWIFT !== "0",
+  };
+  if (!fullExportRequested || process.env.LIVE_HOPPER_MAX_FUNCTIONS !== undefined) {
+    ingestArgs.max_functions = Number(process.env.LIVE_HOPPER_MAX_FUNCTIONS ?? 200);
+  }
+  if (!fullExportRequested || process.env.LIVE_HOPPER_MAX_STRINGS !== undefined) {
+    ingestArgs.max_strings = Number(process.env.LIVE_HOPPER_MAX_STRINGS ?? 500);
+  }
+  if (process.env.LIVE_HOPPER_WAIT_FOR_ANALYSIS !== undefined) {
+    ingestArgs.wait_for_analysis = process.env.LIVE_HOPPER_WAIT_FOR_ANALYSIS === "1";
+  }
+  if (process.env.LIVE_HOPPER_FULL_EXPORT !== undefined) {
+    ingestArgs.full_export = process.env.LIVE_HOPPER_FULL_EXPORT === "1";
+  }
+  if (process.env.LIVE_HOPPER_FAIL_ON_TRUNCATION !== undefined) {
+    ingestArgs.fail_on_truncation = process.env.LIVE_HOPPER_FAIL_ON_TRUNCATION === "1";
+  }
   const ingest = await rpc("tools/call", {
     name: "ingest_live_hopper",
-    arguments: {
-      executable_path: target,
-      timeout_ms: timeoutMs,
-      max_functions: Number(process.env.LIVE_HOPPER_MAX_FUNCTIONS ?? 200),
-      max_strings: Number(process.env.LIVE_HOPPER_MAX_STRINGS ?? 500),
-      analysis: process.env.LIVE_HOPPER_ANALYSIS !== "0",
-      parse_objective_c: process.env.LIVE_HOPPER_PARSE_OBJC !== "0",
-      parse_swift: process.env.LIVE_HOPPER_PARSE_SWIFT !== "0",
-    },
+    arguments: ingestArgs,
   });
   const metadata = await rpc("resources/read", { uri: "hopper://binary/metadata" });
   const binaryStrings = await rpc("resources/read", { uri: "hopper://binary/strings" });
@@ -66,6 +81,9 @@ try {
   if (!Array.isArray(stringResult) || stringResult.length === 0) {
     throw new Error("Live Hopper string resource did not return indexed strings.");
   }
+  if (!metadataResult.segments || !ingestResult.session.capabilities?.liveExport) {
+    throw new Error("Live Hopper ingest did not include live export metadata.");
+  }
 
   console.log(JSON.stringify({
     status: "live hopper MCP ingest ok",
@@ -79,6 +97,7 @@ try {
       entryPoint: metadataResult.entryPoint,
       segments: metadataResult.segments.length,
     },
+    liveExport: ingestResult.session.capabilities.liveExport,
   }, null, 2));
 } catch (error) {
   const message = String(error.message ?? error);

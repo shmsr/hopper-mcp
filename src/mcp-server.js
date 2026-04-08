@@ -463,7 +463,7 @@ async function callTool(name, args, meta = {}) {
     const isDeep = Boolean(args.deep);
     notifyProgress(progressToken, 0, isDeep ? 3 : 1, isDeep ? "Deep Mach-O import: extracting metadata." : "Importing Mach-O metadata.");
     const imported = await importMachO(args.executable_path, {
-      arch: args.arch ?? "arm64",
+      arch: args.arch ?? "auto",
       maxStrings: args.max_strings ?? 15000,
       deep: isDeep,
       maxFunctions: args.max_functions ?? 30000,
@@ -477,7 +477,7 @@ async function callTool(name, args, meta = {}) {
     const binaryPath = args.executable_path ?? store.getSession(sessionId)?.binary?.path;
     if (!binaryPath) throw rpcError(-32602, "No executable_path and no session binary path available.");
     result = await disassembleRange(binaryPath, {
-      arch: args.arch ?? "arm64",
+      arch: args.arch ?? "auto",
       startAddr: args.start_addr,
       endAddr: args.end_addr,
       maxLines: args.max_lines ?? 500,
@@ -487,7 +487,7 @@ async function callTool(name, args, meta = {}) {
     if (!binaryPath) throw rpcError(-32602, "No executable_path and no session binary path available.");
     notifyProgress(progressToken, 0, 1, "Scanning binary for cross-references (streaming otool).");
     result = await findXrefs(binaryPath, {
-      arch: args.arch ?? "arm64",
+      arch: args.arch ?? "auto",
       targetAddr: args.target_addr,
       maxResults: args.max_results ?? 50,
     });
@@ -497,7 +497,7 @@ async function callTool(name, args, meta = {}) {
     if (!binaryPath) throw rpcError(-32602, "No executable_path and no session binary path available.");
     notifyProgress(progressToken, 0, 1, "Scanning for function prologues.");
     const discovery = await discoverFunctionsFromDisassembly(binaryPath, {
-      arch: args.arch ?? "arm64",
+      arch: args.arch ?? "auto",
       maxFunctions: args.max_functions ?? 30000,
       startAddr: args.start_addr ? parseInt(args.start_addr, 16) : null,
       endAddr: args.end_addr ? parseInt(args.end_addr, 16) : null,

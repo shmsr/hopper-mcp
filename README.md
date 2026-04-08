@@ -50,12 +50,13 @@ For large binaries, start with the faster local importer:
 ```json
 {
   "executable_path": "/path/to/binary",
-  "arch": "arm64",
   "max_strings": 10000
 }
 ```
 
-Call that as `import_macho`. Use `ingest_live_hopper` when you need a Hopper Python export for a specific executable path. Exporting the frontmost Hopper document is not exposed yet; that needs the future in-process Hopper adapter.
+Call that as `import_macho`. The local Mach-O tools auto-select an architecture by default, preferring `arm64e`, then `arm64`, then `x86_64`. Pass `arch` only when you need a specific slice. If `arch: "arm64"` is requested for an `arm64e`-only system binary, the importer selects `arm64e` and records both `requestedArch` and the selected `arch` in the session metadata.
+
+Use `ingest_live_hopper` when you need a Hopper Python export for a specific executable path. Exporting the frontmost Hopper document is not exposed yet; that needs the future in-process Hopper adapter.
 
 Live Hopper export modes:
 
@@ -87,7 +88,6 @@ Deep local import:
 ```json
 {
   "executable_path": "/path/to/binary",
-  "arch": "arm64",
   "deep": true,
   "max_functions": 5000,
   "max_strings": 50000

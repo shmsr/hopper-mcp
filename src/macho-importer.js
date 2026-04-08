@@ -4,14 +4,17 @@ import { basename } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const PREFERRED_ARCHS = ["arm64e", "arm64", "x86_64"];
 
-export async function importMachO(path, { arch = "arm64", maxStrings = 5000, deep = false, maxFunctions = 30000 } = {}) {
+export async function importMachO(path, { arch = "auto", maxStrings = 5000, deep = false, maxFunctions = 30000 } = {}) {
+  const archSelection = await resolveMachOArch(path, arch);
+  const selectedArch = archSelection.arch;
   const [fileInfo, libraries, symbols, stringRows, loadCommands] = await Promise.all([
     run("file", [path]),
-    run("otool", ["-arch", arch, "-L", path]),
-    run("nm", ["-arch", arch, "-m", path], { maxBuffer: 64 * 1024 * 1024 }),
+    run("otool", ["-arch", selectedArch, "-L", path]),
+    run("nm", ["-arch", selectedArch, "-m", path], { maxBuffer: 64 * 1024 * 1024 }),
     run("strings", ["-a", "-t", "x", "-n", "8", path], { maxBuffer: 128 * 1024 * 1024 }),
-    run("otool", ["-arch", arch, "-l", path], { maxBuffer: 64 * 1024 * 1024 }),
+    run("otool", ["-arch", selectedArch, "-l", path], { maxBuffer: 64 * 1024 * 1024 }),
   ]);
 
   const parsedSymbols = parseNm(symbols.stdout);
@@ -19,12 +22,12 @@ export async function importMachO(path, { arch = "arm64", maxStrings = 5000, dee
   const exportedFunctions = parsedSymbols.defined.slice(0, 1000);
   const strings = parseStringsWithOffsets(stringRows.stdout, maxStrings, parseOffsetMaps(loadCommands.stdout));
   const dylibs = parseDylibs(libraries.stdout);
-  const binaryId = createHash("sha256").update(`${path}:${arch}:${fileInfo.stdout}`).digest("hex").slice(0, 16);
+  const binaryId = createHash("sha256").update(`${path}:${selectedArch}:${fileInfo.stdout}`).digest("hex").slice(0, 16);
 
   let functions = buildFunctions({ exportedFunctions, imports, strings, dylibs });
 
   if (deep) {
-    const discovery = await discoverFunctionsFromDisassembly(path, { arch, maxFunctions });
+    const discovery = await discoverFunctionsFromDisassembly(path, { arch: selectedArch, maxFunctions });
     functions = mergeFunctionSets(functions, discovery, strings);
   }
 
@@ -35,7 +38,9 @@ export async function importMachO(path, { arch = "arm64", maxStrings = 5000, dee
       name: basename(path),
       path,
       format: "Mach-O",
-      arch,
+      arch: selectedArch,
+      requestedArch: archSelection.requestedArch,
+      availableArchs: archSelection.availableArchs,
       fileInfo: fileInfo.stdout.trim(),
       libraries: dylibs,
     },
@@ -102,8 +107,10 @@ export async function searchMachOStrings(path, pattern, { maxMatches = 50, minLe
 
 // ─── otool-based function discovery (streaming) ───────────────────────────
 
-export async function discoverFunctionsFromDisassembly(path, { arch = "arm64", maxFunctions = 30000, startAddr = null, endAddr = null } = {}) {
+export async function discoverFunctionsFromDisassembly(path, { arch = "auto", maxFunctions = 30000, startAddr = null, endAddr = null } = {}) {
   if (maxFunctions <= 0) return { functions: [], callEdges: [], adrpRefs: [] };
+  const archSelection = await resolveMachOArch(path, arch);
+  const selectedArch = archSelection.arch;
 
   const functions = [];          // { addr, size }
   const callEdges = [];          // { from, to }
@@ -113,7 +120,7 @@ export async function discoverFunctionsFromDisassembly(path, { arch = "arm64", m
   let prevAddr = null;
   let stopped = false;
 
-  const child = spawn("otool", ["-arch", arch, "-tv", path], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn("otool", ["-arch", selectedArch, "-tv", path], { stdio: ["ignore", "pipe", "pipe"] });
   let buffer = "";
   let stderr = "";
 
@@ -289,15 +296,17 @@ export function mergeFunctionSets(existing, discovery, strings) {
 
 // ─── Targeted disassembly ─────────────────────────────────────────────────
 
-export async function disassembleRange(path, { arch = "arm64", startAddr, endAddr, maxLines = 500 } = {}) {
+export async function disassembleRange(path, { arch = "auto", startAddr, endAddr, maxLines = 500 } = {}) {
   const start = typeof startAddr === "string" ? parseInt(startAddr, 16) : startAddr;
   const end = typeof endAddr === "string" ? parseInt(endAddr, 16) : endAddr;
   if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
     throw new Error("disassemble_range requires valid start_addr and end_addr.");
   }
+  const archSelection = await resolveMachOArch(path, arch);
+  const selectedArch = archSelection.arch;
   const lines = [];
 
-  const child = spawn("otool", ["-arch", arch, "-tV", path], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn("otool", ["-arch", selectedArch, "-tV", path], { stdio: ["ignore", "pipe", "pipe"] });
   let buffer = "";
   let collecting = false;
   let stopped = false;
@@ -345,19 +354,21 @@ export async function disassembleRange(path, { arch = "arm64", startAddr, endAdd
     });
   });
 
-  return { lines, startAddr: fmtAddr(start), endAddr: fmtAddr(end), lineCount: lines.length };
+  return { lines, startAddr: fmtAddr(start), endAddr: fmtAddr(end), lineCount: lines.length, arch: selectedArch, requestedArch: archSelection.requestedArch };
 }
 
 // ─── Cross-reference finder ───────────────────────────────────────────────
 
-export async function findXrefs(path, { arch = "arm64", targetAddr, maxResults = 50 } = {}) {
+export async function findXrefs(path, { arch = "auto", targetAddr, maxResults = 50 } = {}) {
   const target = typeof targetAddr === "string" ? parseInt(targetAddr, 16) : targetAddr;
   if (!Number.isFinite(target)) throw new Error("find_xrefs requires a valid target_addr.");
+  const archSelection = await resolveMachOArch(path, arch);
+  const selectedArch = archSelection.arch;
   const results = [];
   const adrpState = {};
   let currentFunc = null;
 
-  const child = spawn("otool", ["-arch", arch, "-tv", path], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn("otool", ["-arch", selectedArch, "-tv", path], { stdio: ["ignore", "pipe", "pipe"] });
   let buffer = "";
   let stopped = false;
   let stderr = "";
@@ -450,6 +461,42 @@ function fmtAddr(n) {
 
 function isFramePrologue(instr) {
   return /stp\s+x29,\s*x30/.test(instr) || /stp\tx29, x30/.test(instr);
+}
+
+async function resolveMachOArch(path, requestedArch = "auto") {
+  const requested = requestedArch ?? "auto";
+  const availableArchs = await listMachOArchitectures(path);
+  if (!availableArchs.length) {
+    if (requested === "auto") throw new Error(`Could not determine Mach-O architecture for ${path}.`);
+    return { arch: requested, requestedArch: requested, availableArchs };
+  }
+
+  if (requested !== "auto") {
+    if (availableArchs.includes(requested)) return { arch: requested, requestedArch: requested, availableArchs };
+    if (requested === "arm64" && availableArchs.includes("arm64e")) {
+      return { arch: "arm64e", requestedArch: requested, availableArchs };
+    }
+    throw new Error(`Mach-O file ${path} does not contain architecture '${requested}'. Available architectures: ${availableArchs.join(", ")}.`);
+  }
+
+  const preferred = PREFERRED_ARCHS.find((candidate) => availableArchs.includes(candidate));
+  return {
+    arch: preferred ?? availableArchs[0],
+    requestedArch: requested,
+    availableArchs,
+  };
+}
+
+async function listMachOArchitectures(path) {
+  try {
+    const result = await execFileAsync("lipo", ["-archs", path], { maxBuffer: 1024 * 1024 });
+    return result.stdout.trim().split(/\s+/).filter(Boolean);
+  } catch (error) {
+    const output = `${error.stdout ?? ""}\n${error.stderr ?? ""}`;
+    const match = output.match(/Non-fat file: .+ is architecture: (\S+)/);
+    if (match) return [match[1]];
+    throw error;
+  }
 }
 
 // ─── Original functions ───────────────────────────────────────────────────

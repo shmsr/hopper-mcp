@@ -138,16 +138,15 @@ try {
       name: "import_macho",
       arguments: {
         executable_path: localMachOTarget,
-        arch: "arm64",
         max_strings: 100,
       },
     }));
+    assert(imported.session.binary.arch, "import_macho did not report selected architecture.");
     const beforeFunctions = imported.session.counts.functions;
     const found = toolPayload(await rpc("tools/call", {
       name: "find_functions",
       arguments: {
         executable_path: localMachOTarget,
-        arch: "arm64",
         max_functions: 5,
         merge_session: true,
       },
@@ -161,7 +160,6 @@ try {
       name: "disassemble_range",
       arguments: {
         executable_path: localMachOTarget,
-        arch: "arm64",
         start_addr: first.addr,
         end_addr: endAddr,
         max_lines: 10,
@@ -172,7 +170,6 @@ try {
       name: "find_xrefs",
       arguments: {
         executable_path: localMachOTarget,
-        arch: "arm64",
         target_addr: "0x10055de54",
         max_results: 10,
       },
@@ -208,11 +205,11 @@ try {
       name: "import_macho",
       arguments: {
         executable_path: target,
-        arch: "arm64",
         max_strings: 200,
       },
     }));
     assert(imported.session.counts.strings > 0, "import_macho did not return strings.");
+    assert(imported.session.binary.arch === "arm64e" || imported.session.binary.arch === "arm64" || imported.session.binary.arch === "x86_64", "import_macho did not auto-select a valid architecture.");
     assert(imported.source === "local-macho-importer", "import_macho returned unexpected source.");
   });
 

@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node ./src/mcp-server.js",
     "smoke": "node ./test/smoke.mjs",
+    "test:protocol": "node ./test/protocol-compat.mjs",
     "test:real": "node ./test/real-app.mjs",
     "test:live": "node ./test/live-hopper.mjs",
     "test:tools": "node ./test/all-tools-real.mjs"

@@ -6,10 +6,13 @@ exposes resources first, provides compound analysis tools, and makes annotation 
 
 ## What Works Now
 
-- MCP over stdio with `initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, and `prompts/get`.
+- MCP over stdio using newline-delimited JSON-RPC, compatible with the `2025-11-25` protocol version while still accepting older `Content-Length` frames for local compatibility checks.
+- Core MCP methods: `initialize`, `ping`, `logging/setLevel`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`, and `prompts/get`.
 - Resource-first browsing for binary metadata, functions, strings, imports, exports, ObjC classes, Swift symbols, and function evidence.
 - Compound read tools: `resolve`, `analyze_function_deep`, `get_graph_slice`, and `search_strings`.
 - Transactional writes: `begin_transaction`, `queue_rename`, `queue_comment`, `queue_inline_comment`, `queue_type_patch`, `preview_transaction`, `commit_transaction`, and `rollback_transaction`.
+- Structured tool output via both `structuredContent` and a JSON text block for broad client compatibility.
+- Progress notifications for long-running ingest calls when the client supplies a progress token, plus resource-list change notifications after ingest/session changes.
 - A local JSON knowledge store under `data/knowledge-store.json`.
 - Live Hopper ingest via AppleScript and Hopper's official Python scripting with `ingest_live_hopper`.
 - A Hopper adapter boundary ready for a persistent in-process plugin bridge.
@@ -28,6 +31,13 @@ npm run smoke
 
 The smoke test starts the MCP server, ingests a sample Mach-O session, lists resources, and verifies
 that deep function analysis includes evidence anchors.
+
+To check low-level MCP compatibility with newline stdio, protocol version `2025-11-25`, JSON-RPC `id: 0`,
+`ping`, `logging/setLevel`, progress notifications, resource templates, and structured tool output:
+
+```bash
+npm run test:protocol
+```
 
 To test the MCP layer with a real installed application:
 
@@ -149,6 +159,14 @@ Resources:
 - `hopper://objc/classes`
 - `hopper://swift/symbols`
 - `hopper://transactions/pending`
+
+Resource templates:
+
+- `hopper://function/{addr}`
+- `hopper://function/{addr}/summary`
+- `hopper://function/{addr}/evidence`
+- `hopper://graph/callers/{addr}?radius={radius}`
+- `hopper://graph/callees/{addr}?radius={radius}`
 
 Read tools:
 

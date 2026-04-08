@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { KnowledgeStore } from "./knowledge-store.js";
@@ -18,8 +17,15 @@ await store.load();
 
 const serverInfo = {
   name: "hopper-mcp-knowledge-engine",
+  title: "Hopper MCP Knowledge Engine",
   version: "0.1.0",
+  description: "Stateful reverse-engineering knowledge engine for Hopper with resources, compound tools, prompts, and transactional annotations.",
 };
+
+const latestProtocolVersion = "2025-11-25";
+const supportedProtocolVersions = new Set([latestProtocolVersion, "2025-06-18", "2025-03-26"]);
+const logLevels = new Set(["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"]);
+let logLevel = "info";
 
 const tools = [
   tool("capabilities", "Report static/dynamic adapter capabilities.", {}),
@@ -106,19 +112,21 @@ const tools = [
 const prompts = [
   {
     name: "function_triage",
+    title: "Function Triage",
     description: "Guide an agent through provenance-first function analysis.",
     arguments: [{ name: "addr", description: "Function address", required: true }],
   },
   {
     name: "hypothesis_workspace",
+    title: "Hypothesis Workspace",
     description: "Create a cautious reverse-engineering hypothesis with evidence gates.",
     arguments: [{ name: "topic", description: "Hypothesis topic, e.g. license check path", required: true }],
   },
 ];
 
 const handlers = {
-  initialize: async () => ({
-    protocolVersion: "2025-06-18",
+  initialize: async (params) => ({
+    protocolVersion: negotiateProtocolVersion(params.protocolVersion),
     capabilities: {
       tools: { listChanged: false },
       resources: { subscribe: false, listChanged: true },
@@ -127,10 +135,21 @@ const handlers = {
     },
     serverInfo,
   }),
+  ping: async () => ({}),
   "notifications/initialized": async () => undefined,
   "tools/list": async () => ({ tools }),
-  "tools/call": async (params) => callTool(params.name, params.arguments ?? {}),
+  "tools/call": async (params) => {
+    if (!tools.some((candidate) => candidate.name === params.name)) {
+      throw rpcError(-32602, `Unknown tool: ${params.name}`);
+    }
+    try {
+      return await callTool(params.name, params.arguments ?? {}, params._meta ?? {});
+    } catch (error) {
+      return toolError(error);
+    }
+  },
   "resources/list": async () => ({ resources: store.listResources() }),
+  "resources/templates/list": async () => ({ resourceTemplates: resourceTemplates() }),
   "resources/read": async (params) => ({
     contents: [
       {
@@ -142,21 +161,34 @@ const handlers = {
   }),
   "prompts/list": async () => ({ prompts }),
   "prompts/get": async (params) => getPrompt(params.name, params.arguments ?? {}),
+  "logging/setLevel": async (params) => {
+    if (!logLevels.has(params.level)) throw rpcError(-32602, `Unsupported log level: ${params.level}`);
+    logLevel = params.level;
+    return {};
+  },
 };
 
-const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-for await (const line of rl) {
-  if (!line.trim()) continue;
-  let message = null;
-  try {
-    message = JSON.parse(line);
-    if (!message.id && message.method?.startsWith("notifications/")) continue;
-    const result = await dispatch(message);
-    if (message.id) write({ jsonrpc: "2.0", id: message.id, result });
-  } catch (error) {
-    write({ jsonrpc: "2.0", id: message?.id ?? null, error: { code: error.code ?? -32603, message: error.message } });
-  }
+function negotiateProtocolVersion(requestedVersion) {
+  if (supportedProtocolVersions.has(requestedVersion)) return requestedVersion;
+  return latestProtocolVersion;
 }
+
+let inputBuffer = Buffer.alloc(0);
+let outputMode = "line";
+let processing = Promise.resolve();
+
+function scheduleDrain() {
+  processing = processing.then(() => drainInputBuffer());
+  return processing;
+}
+
+process.stdin.on("data", (chunk) => {
+  inputBuffer = Buffer.concat([inputBuffer, chunk]);
+  scheduleDrain();
+});
+
+await new Promise((resolve) => process.stdin.on("end", resolve));
+await scheduleDrain();
 
 async function dispatch(message) {
   const handler = handlers[message.method];
@@ -164,17 +196,25 @@ async function dispatch(message) {
   return handler(message.params ?? {});
 }
 
-async function callTool(name, args) {
+async function callTool(name, args, meta = {}) {
   const sessionId = args.session_id ?? "current";
+  const progressToken = meta.progressToken;
   let result;
 
   if (name === "capabilities") {
     result = { server: serverInfo, adapter: adapter.capabilities(), sessions: store.listSessions() };
   } else if (name === "open_session") {
-    result = await store.upsertSession(args.session);
+    notifyProgress(progressToken, 0, 1, "Opening indexed session.");
+    result = store.describeSession(await store.upsertSession(args.session));
+    notifyResourceListChanged();
+    notifyProgress(progressToken, 1, 1, "Indexed session opened.");
   } else if (name === "ingest_sample") {
-    result = await store.upsertSession(sampleSession());
+    notifyProgress(progressToken, 0, 1, "Loading sample session.");
+    result = store.describeSession(await store.upsertSession(sampleSession()));
+    notifyResourceListChanged();
+    notifyProgress(progressToken, 1, 1, "Sample session loaded.");
   } else if (name === "ingest_live_hopper") {
+    notifyProgress(progressToken, 0, 2, "Opening executable in Hopper.");
     const live = await adapter.ingestExecutable({
       executablePath: args.executable_path,
       timeoutMs: args.timeout_ms,
@@ -184,7 +224,10 @@ async function callTool(name, args) {
       parseObjectiveC: args.parse_objective_c,
       parseSwift: args.parse_swift,
     });
+    notifyProgress(progressToken, 1, 2, "Ingesting Hopper export.");
     const session = await store.upsertSession(live.session);
+    notifyResourceListChanged();
+    notifyProgress(progressToken, 2, 2, "Live Hopper session ingested.");
     result = { session: store.describeSession(session), launch: live.launch };
   } else if (name === "resolve") {
     result = store.resolve(args.query, sessionId);
@@ -208,15 +251,47 @@ async function callTool(name, args) {
     result = transactions.preview({ transactionId: args.transaction_id, sessionId });
   } else if (name === "commit_transaction") {
     result = await transactions.commit({ transactionId: args.transaction_id, sessionId, adapter });
+    notifyResourceListChanged();
   } else if (name === "rollback_transaction") {
     result = await transactions.rollback({ transactionId: args.transaction_id, sessionId });
-  } else {
-    throw rpcError(-32602, `Unknown tool: ${name}`);
   }
 
+  return toolResult(result);
+}
+
+function toolResult(result) {
   return {
     content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    structuredContent: result,
   };
+}
+
+function toolError(error) {
+  const message = error?.message ?? String(error);
+  return {
+    content: [{ type: "text", text: message }],
+    isError: true,
+  };
+}
+
+function notifyResourceListChanged() {
+  writeNotification("notifications/resources/list_changed");
+}
+
+function notifyProgress(progressToken, progress, total, message) {
+  if (progressToken === undefined || progressToken === null) return;
+  writeNotification("notifications/progress", {
+    progressToken,
+    progress,
+    total,
+    message,
+  });
+}
+
+function writeNotification(method, params) {
+  const notification = { jsonrpc: "2.0", method };
+  if (params !== undefined) notification.params = params;
+  write(notification);
 }
 
 function getPrompt(name, args) {
@@ -254,6 +329,7 @@ function getPrompt(name, args) {
 function tool(name, description, properties, required = []) {
   return {
     name,
+    title: titleize(name),
     description,
     inputSchema: {
       type: "object",
@@ -264,8 +340,120 @@ function tool(name, description, properties, required = []) {
   };
 }
 
-function write(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+function titleize(name) {
+  return name
+    .split(/[_\-.]+/u)
+    .filter(Boolean)
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
+function resourceTemplates() {
+  return [
+    {
+      uriTemplate: "hopper://function/{addr}",
+      name: "function",
+      title: "Function",
+      description: "Full indexed function record for an address.",
+      mimeType: "application/json",
+    },
+    {
+      uriTemplate: "hopper://function/{addr}/summary",
+      name: "function_summary",
+      title: "Function Summary",
+      description: "Compact function summary with confidence.",
+      mimeType: "application/json",
+    },
+    {
+      uriTemplate: "hopper://function/{addr}/evidence",
+      name: "function_evidence",
+      title: "Function Evidence",
+      description: "Evidence anchors used for provenance-first analysis.",
+      mimeType: "application/json",
+    },
+    {
+      uriTemplate: "hopper://graph/callers/{addr}?radius={radius}",
+      name: "graph_callers",
+      title: "Caller Graph",
+      description: "Caller graph slice rooted at a function address.",
+      mimeType: "application/json",
+    },
+    {
+      uriTemplate: "hopper://graph/callees/{addr}?radius={radius}",
+      name: "graph_callees",
+      title: "Callee Graph",
+      description: "Callee graph slice rooted at a function address.",
+      mimeType: "application/json",
+    },
+  ];
+}
+
+async function handleMessage(message, mode) {
+  outputMode = mode;
+  const hasId = Object.hasOwn(message, "id") && message.id !== null;
+  try {
+    if (!hasId && message.method?.startsWith("notifications/")) return;
+    const result = await dispatch(message);
+    if (hasId) write({ jsonrpc: "2.0", id: message.id, result }, mode);
+  } catch (error) {
+    if (hasId) write({ jsonrpc: "2.0", id: message.id, error: { code: error.code ?? -32603, message: error.message } }, mode);
+  }
+}
+
+async function drainInputBuffer() {
+  for (;;) {
+    const parsed = parseNextMessage(inputBuffer);
+    if (!parsed) return;
+    inputBuffer = parsed.rest;
+    if (!parsed.message) continue;
+    await handleMessage(parsed.message, parsed.mode);
+  }
+}
+
+function parseNextMessage(buffer) {
+  if (!buffer.length) return null;
+  const text = buffer.toString("utf8");
+
+  if (text.startsWith("Content-Length:")) {
+    const crlfHeaderEnd = text.indexOf("\r\n\r\n");
+    const lfHeaderEnd = text.indexOf("\n\n");
+    const headerEnd = crlfHeaderEnd === -1 ? lfHeaderEnd : lfHeaderEnd === -1 ? crlfHeaderEnd : Math.min(crlfHeaderEnd, lfHeaderEnd);
+    if (headerEnd === -1) return null;
+    const header = text.slice(0, headerEnd);
+    const match = header.match(/Content-Length:\s*(\d+)/i);
+    if (!match) throw new Error("Invalid MCP frame: missing Content-Length.");
+    const contentLength = Number(match[1]);
+    const separatorLength = text.slice(headerEnd, headerEnd + 4).startsWith("\r\n\r\n") ? 4 : 2;
+    const bodyStart = Buffer.byteLength(text.slice(0, headerEnd + separatorLength), "utf8");
+    const bodyEnd = bodyStart + contentLength;
+    if (buffer.length < bodyEnd) return null;
+    const body = buffer.subarray(bodyStart, bodyEnd).toString("utf8");
+    return {
+      mode: "framed",
+      message: JSON.parse(body),
+      rest: buffer.subarray(bodyEnd),
+    };
+  }
+
+  const newline = text.indexOf("\n");
+  if (newline === -1) return null;
+  const line = text.slice(0, newline).trim();
+  const rest = buffer.subarray(Buffer.byteLength(text.slice(0, newline + 1), "utf8"));
+  if (!line) return { mode: outputMode, message: null, rest };
+  return {
+    mode: "line",
+    message: JSON.parse(line),
+    rest,
+  };
+}
+
+function write(message, mode = outputMode) {
+  const payload = JSON.stringify(message);
+  if (mode === "framed") {
+    process.stdout.write(`Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n${payload}`);
+  } else {
+    process.stdout.write(`${payload}\n`);
+  }
 }
 
 function rpcError(code, message) {

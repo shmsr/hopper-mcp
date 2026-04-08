@@ -172,6 +172,11 @@ export class KnowledgeStore {
     if (parsed.path === "/binary/imports") return session.imports;
     if (parsed.path === "/binary/exports") return session.exports;
     if (parsed.path === "/binary/strings" || parsed.path === "/strings/index") return session.strings;
+    if (parsed.path === "/names") return session.names ?? [];
+    if (parsed.path === "/bookmarks") return session.bookmarks ?? [];
+    if (parsed.path === "/comments") return session.comments ?? [];
+    if (parsed.path === "/inline-comments") return session.inlineComments ?? [];
+    if (parsed.path === "/cursor") return session.cursor ?? {};
     if (parsed.path === "/functions") return Object.values(session.functions).map(publicFunction);
     if (parsed.path === "/objc/classes") return session.objcClasses;
     if (parsed.path === "/swift/symbols") return session.swiftSymbols;
@@ -198,6 +203,11 @@ export class KnowledgeStore {
       ["hopper://binary/imports", "Imported symbols"],
       ["hopper://binary/exports", "Exported symbols"],
       ["hopper://binary/strings", "String index"],
+      ["hopper://names", "Named addresses"],
+      ["hopper://bookmarks", "Bookmarks"],
+      ["hopper://comments", "Prefix comments"],
+      ["hopper://inline-comments", "Inline comments"],
+      ["hopper://cursor", "Captured cursor"],
       ["hopper://functions", "Function index"],
       ["hopper://objc/classes", "Objective-C classes"],
       ["hopper://swift/symbols", "Swift symbols"],
@@ -227,6 +237,10 @@ export class KnowledgeStore {
         strings: session.strings.length,
         imports: session.imports.length,
         exports: session.exports.length,
+        names: (session.names ?? []).length,
+        bookmarks: (session.bookmarks ?? []).length,
+        comments: (session.comments ?? []).length,
+        inlineComments: (session.inlineComments ?? []).length,
         objcClasses: session.objcClasses.length,
         swiftSymbols: session.swiftSymbols.length,
       },
@@ -292,12 +306,35 @@ export function normalizeSession(session) {
     capabilities: session.capabilities ?? { officialApi: true, privateApi: false, dynamicDebugger: false },
     functions,
     strings: session.strings ?? [],
+    names: normalizeAddressItems(session.names ?? []),
+    bookmarks: normalizeAddressItems(session.bookmarks ?? []),
+    comments: normalizeCommentItems(session.comments ?? []),
+    inlineComments: normalizeCommentItems(session.inlineComments ?? []),
+    cursor: {
+      ...(session.cursor ?? {}),
+      address: session.cursor?.address ? formatAddress(session.cursor.address) : null,
+      procedure: session.cursor?.procedure ? formatAddress(session.cursor.procedure) : null,
+    },
     imports: session.imports ?? [],
     exports: session.exports ?? [],
     objcClasses: session.objcClasses ?? [],
     swiftSymbols: session.swiftSymbols ?? [],
     transactions: session.transactions ?? { pending: [] },
   };
+}
+
+function normalizeAddressItems(items) {
+  return items.map((item) => ({
+    ...item,
+    addr: item.addr ? formatAddress(item.addr) : item.addr,
+  }));
+}
+
+function normalizeCommentItems(items) {
+  return items.map((item) => ({
+    ...item,
+    addr: item.addr ? formatAddress(item.addr) : item.addr,
+  }));
 }
 
 export function parseAddress(value) {

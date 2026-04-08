@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { KnowledgeStore } from "./knowledge-store.js";
+import { KnowledgeStore, formatAddress, parseAddress } from "./knowledge-store.js";
 import { TransactionManager } from "./transaction-manager.js";
 import { HopperAdapter } from "./hopper-adapter.js";
 import { importMachO, searchMachOStrings, disassembleRange, findXrefs, discoverFunctionsFromDisassembly, mergeFunctionSets } from "./macho-importer.js";
@@ -45,6 +45,8 @@ const tools = [
     wait_for_analysis: { type: "boolean" },
     full_export: { type: "boolean" },
     fail_on_truncation: { type: "boolean" },
+    include_pseudocode: { type: "boolean" },
+    max_pseudocode_functions: { type: "number" },
   }, ["executable_path"]),
   tool("import_macho", "Import Mach-O metadata using local macOS tools. With deep=true, also discovers functions from disassembly, builds call graphs, and resolves string cross-references via ADRP+ADD patterns.", {
     executable_path: { type: "string" },
@@ -99,6 +101,88 @@ const tools = [
     session_id: { type: "string" },
     max_results: { type: "number" },
   }, ["regex"]),
+  tool("list_documents", "List loaded snapshot sessions.", {
+    session_id: { type: "string" },
+  }),
+  tool("current_document", "Return the active snapshot session.", {
+    session_id: { type: "string" },
+  }),
+  tool("list_segments", "List segments from the active snapshot.", {
+    session_id: { type: "string" },
+  }),
+  tool("list_procedures", "List procedure addresses and names from the active snapshot.", {
+    session_id: { type: "string" },
+    max_results: { type: "number" },
+  }),
+  tool("list_procedure_size", "List procedure sizes and basic-block counts from the active snapshot.", {
+    session_id: { type: "string" },
+    max_results: { type: "number" },
+  }),
+  tool("list_procedure_info", "List compact procedure metadata from the active snapshot.", {
+    session_id: { type: "string" },
+    max_results: { type: "number" },
+  }),
+  tool("list_strings", "List indexed strings from the active snapshot.", {
+    session_id: { type: "string" },
+    max_results: { type: "number" },
+  }),
+  tool("search_procedures", "Search procedure names and metadata in the active snapshot.", {
+    regex: { type: "string" },
+    session_id: { type: "string" },
+    max_results: { type: "number" },
+  }, ["regex"]),
+  tool("procedure_info", "Return full procedure metadata for an address or name.", {
+    procedure: { type: "string" },
+    session_id: { type: "string" },
+  }, ["procedure"]),
+  tool("procedure_address", "Resolve a procedure name or contained address to its entry address.", {
+    procedure: { type: "string" },
+    session_id: { type: "string" },
+  }, ["procedure"]),
+  tool("procedure_assembly", "Return assembly captured from Hopper's public Python API.", {
+    procedure: { type: "string" },
+    session_id: { type: "string" },
+    max_lines: { type: "number" },
+  }, ["procedure"]),
+  tool("procedure_pseudo_code", "Return pseudocode captured during live export, if include_pseudocode was enabled.", {
+    procedure: { type: "string" },
+    session_id: { type: "string" },
+  }, ["procedure"]),
+  tool("procedure_callers", "Return procedure callers from the active snapshot.", {
+    procedure: { type: "string" },
+    session_id: { type: "string" },
+  }, ["procedure"]),
+  tool("procedure_callees", "Return procedure callees from the active snapshot.", {
+    procedure: { type: "string" },
+    session_id: { type: "string" },
+  }, ["procedure"]),
+  tool("xrefs", "Return cross-references to and from an address from the active snapshot.", {
+    address: { type: "string" },
+    session_id: { type: "string" },
+  }, ["address"]),
+  tool("current_address", "Return the cursor address captured at export time.", {
+    session_id: { type: "string" },
+  }),
+  tool("current_procedure", "Return the cursor procedure captured at export time.", {
+    session_id: { type: "string" },
+  }),
+  tool("list_names", "List named addresses captured from Hopper.", {
+    session_id: { type: "string" },
+    max_results: { type: "number" },
+  }),
+  tool("search_name", "Search Hopper names captured in the snapshot.", {
+    regex: { type: "string" },
+    session_id: { type: "string" },
+    max_results: { type: "number" },
+  }, ["regex"]),
+  tool("address_name", "Return the name for an address, if captured.", {
+    address: { type: "string" },
+    session_id: { type: "string" },
+  }, ["address"]),
+  tool("list_bookmarks", "List Hopper bookmarks captured in the snapshot.", {
+    session_id: { type: "string" },
+    max_results: { type: "number" },
+  }),
   tool("begin_transaction", "Start a reviewed annotation transaction.", {
     name: { type: "string" },
     rationale: { type: "string" },
@@ -263,6 +347,8 @@ async function callTool(name, args, meta = {}) {
       waitForAnalysis: args.wait_for_analysis,
       fullExport: args.full_export,
       failOnTruncation: args.fail_on_truncation,
+      includePseudocode: args.include_pseudocode,
+      maxPseudocodeFunctions: args.max_pseudocode_functions,
     });
     notifyProgress(progressToken, 1, 2, "Ingesting Hopper export.");
     const session = await store.upsertSession(live.session);
@@ -345,6 +431,82 @@ async function callTool(name, args, meta = {}) {
     if (!result.length) {
       result = await searchSessionBinaryStrings(args.regex, { semantic: Boolean(args.semantic), sessionId, maxResults: args.max_results });
     }
+  } else if (name === "list_documents") {
+    result = store.listSessions();
+  } else if (name === "current_document") {
+    result = store.describeSession(store.getSession(sessionId));
+  } else if (name === "list_segments") {
+    result = getSessionSegments(sessionId);
+  } else if (name === "list_procedures") {
+    result = listProcedures(sessionId, { maxResults: args.max_results });
+  } else if (name === "list_procedure_size") {
+    result = listProcedures(sessionId, { maxResults: args.max_results }).map((fn) => ({
+      addr: fn.addr,
+      name: fn.name,
+      size: fn.size ?? null,
+      basicBlockCount: fn.basicBlockCount ?? fn.basicBlocks?.length ?? null,
+    }));
+  } else if (name === "list_procedure_info") {
+    result = listProcedures(sessionId, { maxResults: args.max_results }).map(procedureSummary);
+  } else if (name === "list_strings") {
+    const session = store.getSession(sessionId);
+    result = limitResults(session.strings ?? [], args.max_results);
+  } else if (name === "search_procedures") {
+    const regex = new RegExp(args.regex, "i");
+    result = limitResults(listProcedures(sessionId).filter((fn) => regex.test([fn.addr, fn.name, fn.signature, fn.summary].filter(Boolean).join(" "))), args.max_results).map(procedureSummary);
+  } else if (name === "procedure_info") {
+    result = resolveProcedure(args.procedure, sessionId);
+  } else if (name === "procedure_address") {
+    const fn = resolveProcedure(args.procedure, sessionId);
+    result = { addr: fn.addr, name: fn.name ?? null };
+  } else if (name === "procedure_assembly") {
+    const fn = resolveProcedure(args.procedure, sessionId);
+    const lines = assemblyLines(fn);
+    result = {
+      addr: fn.addr,
+      name: fn.name ?? null,
+      lineCount: args.max_lines ? Math.min(lines.length, args.max_lines) : lines.length,
+      truncated: Boolean(args.max_lines && lines.length > args.max_lines),
+      assembly: args.max_lines ? lines.slice(0, args.max_lines).join("\n") : lines.join("\n"),
+    };
+  } else if (name === "procedure_pseudo_code") {
+    const fn = resolveProcedure(args.procedure, sessionId);
+    result = {
+      addr: fn.addr,
+      name: fn.name ?? null,
+      pseudocode: fn.pseudocode ?? null,
+      available: Boolean(fn.pseudocode),
+      note: fn.pseudocode ? null : "Pseudocode was not captured. Re-run ingest_live_hopper with include_pseudocode=true for selected functions.",
+    };
+  } else if (name === "procedure_callers") {
+    const session = store.getSession(sessionId);
+    const fn = resolveProcedure(args.procedure, sessionId);
+    result = (fn.callers ?? []).map((addr) => procedureSummary(store.getFunctionIfKnown(session, addr)));
+  } else if (name === "procedure_callees") {
+    const session = store.getSession(sessionId);
+    const fn = resolveProcedure(args.procedure, sessionId);
+    result = (fn.callees ?? []).map((addr) => procedureSummary(store.getFunctionIfKnown(session, addr)));
+  } else if (name === "xrefs") {
+    result = snapshotXrefs(args.address, sessionId);
+  } else if (name === "current_address") {
+    const session = store.getSession(sessionId);
+    result = { address: session.cursor?.address ?? null, selection: session.cursor?.selection ?? [] };
+  } else if (name === "current_procedure") {
+    const session = store.getSession(sessionId);
+    const addr = session.cursor?.procedure;
+    result = addr ? procedureSummary(store.getFunctionIfKnown(session, addr)) : { addr: null, name: null };
+  } else if (name === "list_names") {
+    const session = store.getSession(sessionId);
+    result = limitResults(session.names ?? [], args.max_results);
+  } else if (name === "search_name") {
+    const session = store.getSession(sessionId);
+    const regex = new RegExp(args.regex, "i");
+    result = limitResults((session.names ?? []).filter((item) => regex.test([item.addr, item.name, item.demangled].filter(Boolean).join(" "))), args.max_results);
+  } else if (name === "address_name") {
+    result = lookupName(args.address, sessionId);
+  } else if (name === "list_bookmarks") {
+    const session = store.getSession(sessionId);
+    result = limitResults(session.bookmarks ?? [], args.max_results);
   } else if (name === "begin_transaction") {
     result = await transactions.begin({ sessionId, name: args.name, rationale: args.rationale });
   } else if (name === "queue_rename") {
@@ -365,6 +527,121 @@ async function callTool(name, args, meta = {}) {
   }
 
   return toolResult(result);
+}
+
+function getSessionSegments(sessionId) {
+  const session = store.getSession(sessionId);
+  return session.binary?.segments ?? [];
+}
+
+function listProcedures(sessionId, { maxResults } = {}) {
+  const session = store.getSession(sessionId);
+  return limitResults(Object.values(session.functions ?? {}).sort((a, b) => (parseAddress(a.addr) ?? 0) - (parseAddress(b.addr) ?? 0)), maxResults);
+}
+
+function resolveProcedure(query, sessionId) {
+  const session = store.getSession(sessionId);
+  const address = parseAddress(query);
+  if (address !== null && !Number.isNaN(address)) {
+    const exact = session.functions[formatAddress(address)];
+    if (exact) return exact;
+    const containing = Object.values(session.functions ?? {}).find((fn) => {
+      const start = parseAddress(fn.addr);
+      const size = Number(fn.size ?? 0);
+      return start !== null && size > 0 && address >= start && address < start + size;
+    });
+    if (containing) return containing;
+  }
+
+  const lower = String(query).toLowerCase();
+  const matches = Object.values(session.functions ?? {}).filter((fn) => {
+    const fields = [fn.name, fn.signature, fn.addr].filter(Boolean).map((value) => String(value).toLowerCase());
+    return fields.some((field) => field === lower || field.includes(lower));
+  });
+  if (!matches.length) throw rpcError(-32602, `Unknown procedure: ${query}`);
+  return matches.sort((a, b) => scoreProcedureNameMatch(b, lower) - scoreProcedureNameMatch(a, lower))[0];
+}
+
+function scoreProcedureNameMatch(fn, lower) {
+  const name = String(fn.name ?? "").toLowerCase();
+  if (name === lower) return 3;
+  if (name.startsWith(lower)) return 2;
+  if (name.includes(lower)) return 1;
+  return 0;
+}
+
+function procedureSummary(fn) {
+  return {
+    addr: fn.addr,
+    name: fn.name ?? null,
+    size: fn.size ?? null,
+    basicBlockCount: fn.basicBlockCount ?? fn.basicBlocks?.length ?? null,
+    signature: fn.signature ?? null,
+    callers: fn.callers ?? [],
+    callees: fn.callees ?? [],
+    source: fn.source ?? null,
+  };
+}
+
+function assemblyLines(fn) {
+  if (fn.assembly) return String(fn.assembly).split("\n").filter(Boolean);
+  return (fn.basicBlocks ?? []).flatMap((block) => (block.instructions ?? []).map((instruction) => `${instruction.addr}: ${instruction.text ?? ""}`.trim()));
+}
+
+function snapshotXrefs(address, sessionId) {
+  const session = store.getSession(sessionId);
+  const target = formatAddress(address);
+  const refsTo = [];
+  const refsFrom = [];
+
+  for (const fn of Object.values(session.functions ?? {})) {
+    for (const ref of fn.callerRefs ?? []) {
+      if (formatAddress(ref.to) === target || formatAddress(ref.from) === target) refsTo.push({ ...ref, procedure: procedureSummary(fn) });
+    }
+    for (const ref of fn.calleeRefs ?? []) {
+      if (formatAddress(ref.to) === target || formatAddress(ref.from) === target) refsFrom.push({ ...ref, procedure: procedureSummary(fn) });
+    }
+    if ((fn.callees ?? []).map(formatAddress).includes(target)) refsFrom.push({ from: fn.addr, to: target, type: "procedure_callee", procedure: procedureSummary(fn) });
+    if ((fn.callers ?? []).map(formatAddress).includes(target)) refsTo.push({ from: target, to: fn.addr, type: "procedure_caller", procedure: procedureSummary(fn) });
+    for (const block of fn.basicBlocks ?? []) {
+      for (const instruction of block.instructions ?? []) {
+        for (const ref of instruction.refsFrom ?? []) {
+          if (formatAddress(ref) === target) refsTo.push({ from: instruction.addr, to: target, type: "instruction_ref", procedure: procedureSummary(fn), instruction: instruction.text ?? null });
+        }
+      }
+    }
+  }
+
+  return {
+    address: target,
+    refsTo: dedupeRefs(refsTo),
+    refsFrom: dedupeRefs(refsFrom),
+  };
+}
+
+function dedupeRefs(refs) {
+  const seen = new Set();
+  return refs.filter((ref) => {
+    const key = JSON.stringify([ref.from, ref.to, ref.type, ref.procedure?.addr, ref.instruction]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function lookupName(address, sessionId) {
+  const session = store.getSession(sessionId);
+  const target = formatAddress(address);
+  const named = (session.names ?? []).find((item) => formatAddress(item.addr) === target);
+  if (named) return named;
+  const fn = session.functions?.[target];
+  return { addr: target, name: fn?.name ?? null, demangled: null };
+}
+
+function limitResults(items, maxResults) {
+  const limit = Number(maxResults ?? 0);
+  if (!limit || limit < 0) return items;
+  return items.slice(0, limit);
 }
 
 async function resolveFromBinaryStrings(query, { sessionId, maxResults }) {
@@ -612,6 +889,14 @@ function sampleSession() {
       { addr: "0x100008020", value: "debugger detected" },
       { addr: "0x100008050", value: "https://api.example.invalid/auth" },
     ],
+    names: [
+      { addr: "0x100003f50", name: "sub_100003f50", demangled: null },
+      { addr: "0x100004120", name: "_main", demangled: null },
+    ],
+    bookmarks: [{ addr: "0x100003f50", name: "license validation candidate" }],
+    comments: [{ addr: "0x100003f50", comment: "Sample prefix comment." }],
+    inlineComments: [{ addr: "0x100003fa8", comment: "Sample inline comment." }],
+    cursor: { address: "0x100003f50", procedure: "0x100003f50", selection: [] },
     objcClasses: [{ name: "AuthController", methods: ["-[AuthController validateLicense:]"] }],
     swiftSymbols: [],
     functions: [

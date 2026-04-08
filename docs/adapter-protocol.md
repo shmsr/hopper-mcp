@@ -22,6 +22,16 @@ forces `wait_for_analysis`, removes export caps unless explicit caps are supplie
 `capabilities.liveExport` metadata with totals, exported counts, and truncation flags. If explicit caps
 truncate a full export, the exporter fails unless `fail_on_truncation: false` is set.
 
+The exporter now mirrors more of Hopper's public Python API into the snapshot:
+
+- procedure metadata, signatures, locals, callers, callees, call refs, basic blocks, successors, and sampled assembly
+- optional pseudocode with `include_pseudocode: true`
+- segments, strings, names, bookmarks, prefix comments, inline comments, and captured cursor state
+
+Official-style MCP tools such as `procedure_info`, `procedure_assembly`, `procedure_callers`, `xrefs`,
+`list_names`, and `list_bookmarks` read from this snapshot. They do not query the frontmost Hopper UI after
+the snapshot is taken.
+
 This avoids private interfaces and SIP-disabling injection. It does require macOS Automation permission for
 the terminal host, which may appear as `Ghostty` in System Settings.
 
@@ -59,12 +69,22 @@ The daemon should receive normalized session documents:
       "strings": ["license_key"],
       "imports": ["_SecItemCopyMatching"],
       "pseudocode": "optional",
+      "assembly": "optional sampled assembly",
+      "signature": "int sub_100003f50(void)",
+      "locals": [],
+      "callerRefs": [],
+      "calleeRefs": [],
       "basicBlocks": [
-        { "addr": "0x100003f50", "summary": "optional block note" }
+        { "addr": "0x100003f50", "end": "0x100003f90", "successors": [], "instructions": [] }
       ]
     }
   ],
   "strings": [{ "addr": "0x100008000", "value": "license_key" }],
+  "names": [{ "addr": "0x100003f50", "name": "sub_100003f50" }],
+  "bookmarks": [],
+  "comments": [],
+  "inlineComments": [],
+  "cursor": { "address": "0x100003f50", "procedure": "0x100003f50", "selection": [] },
   "imports": ["_SecItemCopyMatching"],
   "exports": ["_main"],
   "objcClasses": [],

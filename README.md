@@ -63,6 +63,19 @@ Live Hopper export modes:
 
 `full_export: true` forces `wait_for_analysis: true`, removes the function/string/basic-block/instruction caps unless you pass explicit caps, and adds `capabilities.liveExport` metadata with totals, exported counts, and truncation flags. If a cap is passed with `full_export: true`, truncation fails the export by default. Set `fail_on_truncation: false` only when a partial export is acceptable.
 
+To capture pseudocode in the snapshot, opt in explicitly:
+
+```json
+{
+  "executable_path": "/path/to/binary",
+  "wait_for_analysis": true,
+  "include_pseudocode": true,
+  "max_pseudocode_functions": 25
+}
+```
+
+Pseudocode export can be slow, so it is off by default. Without it, `procedure_pseudo_code` returns a clear “not captured” result.
+
 Deep local import:
 
 ```json
@@ -82,6 +95,18 @@ Local helper tools:
 - `disassemble_range`: disassemble a VM address range with `otool`.
 - `find_xrefs`: scan for direct branches/calls and ADRP+ADD/LDR references to an address.
 - `find_functions`: discover ARM64 frame-prologue functions, optionally with `merge_session: true`.
+
+Official-style Hopper snapshot tools:
+
+- `list_documents`, `current_document`
+- `list_segments`
+- `list_procedures`, `list_procedure_size`, `list_procedure_info`, `search_procedures`
+- `procedure_info`, `procedure_address`, `procedure_assembly`, `procedure_pseudo_code`
+- `procedure_callers`, `procedure_callees`, `xrefs`
+- `current_address`, `current_procedure`
+- `list_strings`, `list_names`, `search_name`, `address_name`, `list_bookmarks`
+
+These tools mirror Hopper concepts using the last ingested snapshot. They do not query the frontmost Hopper UI live after export; that still needs the future persistent Hopper-side adapter.
 
 ## Add To Clients
 
@@ -164,6 +189,11 @@ Resources:
 - `hopper://binary/imports`
 - `hopper://binary/exports`
 - `hopper://binary/strings`
+- `hopper://names`
+- `hopper://bookmarks`
+- `hopper://comments`
+- `hopper://inline-comments`
+- `hopper://cursor`
 - `hopper://functions`
 - `hopper://function/{addr}`
 - `hopper://function/{addr}/summary`
@@ -196,6 +226,27 @@ Tools:
 - `analyze_function_deep`
 - `get_graph_slice`
 - `search_strings`
+- `list_documents`
+- `current_document`
+- `list_segments`
+- `list_procedures`
+- `list_procedure_size`
+- `list_procedure_info`
+- `list_strings`
+- `search_procedures`
+- `procedure_info`
+- `procedure_address`
+- `procedure_assembly`
+- `procedure_pseudo_code`
+- `procedure_callers`
+- `procedure_callees`
+- `xrefs`
+- `current_address`
+- `current_procedure`
+- `list_names`
+- `search_name`
+- `address_name`
+- `list_bookmarks`
 - `begin_transaction`
 - `queue_rename`
 - `queue_comment`

@@ -20,6 +20,27 @@ const expectedTools = [
   "analyze_function_deep",
   "get_graph_slice",
   "search_strings",
+  "list_documents",
+  "current_document",
+  "list_segments",
+  "list_procedures",
+  "list_procedure_size",
+  "list_procedure_info",
+  "list_strings",
+  "search_procedures",
+  "procedure_info",
+  "procedure_address",
+  "procedure_assembly",
+  "procedure_pseudo_code",
+  "procedure_callers",
+  "procedure_callees",
+  "xrefs",
+  "current_address",
+  "current_procedure",
+  "list_names",
+  "search_name",
+  "address_name",
+  "list_bookmarks",
   "begin_transaction",
   "queue_rename",
   "queue_comment",
@@ -197,29 +218,29 @@ try {
   await check("resources/list and resources/read", async () => {
     const resources = await rpc("resources/list");
     assert(resources.resources.some((resource) => resource.uri === "hopper://binary/metadata"), "binary metadata resource missing.");
-    const metadata = resourcePayload(await rpc("resources/read", { uri: "hopper://binary/metadata" }));
+    const metadata = resourcePayload(await rpc("resources/read", { uri: `hopper://binary/metadata?session_id=${sessionId}` }));
     assert(metadata.path === target, "metadata path does not match target.");
-    functions = resourcePayload(await rpc("resources/read", { uri: "hopper://functions" }));
-    strings = resourcePayload(await rpc("resources/read", { uri: "hopper://binary/strings" }));
+    functions = resourcePayload(await rpc("resources/read", { uri: `hopper://functions?session_id=${sessionId}` }));
+    strings = resourcePayload(await rpc("resources/read", { uri: `hopper://binary/strings?session_id=${sessionId}` }));
     assert(functions.length > 0, "function resource is empty.");
     assert(strings.length > 0, "string resource is empty.");
     targetFunction = functions.find((fn) => fn.name && !fn.name.startsWith("sub_")) ?? functions[0];
-    const evidence = resourcePayload(await rpc("resources/read", { uri: `hopper://function/${targetFunction.addr}/evidence` }));
+    const evidence = resourcePayload(await rpc("resources/read", { uri: `hopper://function/${targetFunction.addr}/evidence?session_id=${sessionId}` }));
     assert(evidence.function.addr === targetFunction.addr, "function evidence resource returned wrong function.");
   });
 
   await check("resolve", async () => {
-    const byAddress = toolPayload(await rpc("tools/call", { name: "resolve", arguments: { query: targetFunction.addr } }));
+    const byAddress = toolPayload(await rpc("tools/call", { name: "resolve", arguments: { query: targetFunction.addr, session_id: sessionId } }));
     assert(byAddress.some((result) => result.kind === "function"), "resolve by address did not find function.");
     const stringValue = strings.find((item) => item.value?.length)?.value;
-    const byString = toolPayload(await rpc("tools/call", { name: "resolve", arguments: { query: stringValue } }));
+    const byString = toolPayload(await rpc("tools/call", { name: "resolve", arguments: { query: stringValue, session_id: sessionId } }));
     assert(byString.some((result) => result.kind === "string"), "resolve by string did not find string.");
   });
 
   await check("analyze_function_deep", async () => {
     const analysis = toolPayload(await rpc("tools/call", {
       name: "analyze_function_deep",
-      arguments: { addr: targetFunction.addr, detail_level: "full" },
+      arguments: { addr: targetFunction.addr, detail_level: "full", session_id: sessionId },
     }));
     assert(analysis.function.addr === targetFunction.addr, "analyze_function_deep returned wrong function.");
     assert(Array.isArray(analysis.evidenceAnchors), "analyze_function_deep missing evidence anchors.");
@@ -229,7 +250,7 @@ try {
   await check("get_graph_slice", async () => {
     const graph = toolPayload(await rpc("tools/call", {
       name: "get_graph_slice",
-      arguments: { seed: targetFunction.addr, radius: 1, kind: "calls" },
+      arguments: { seed: targetFunction.addr, radius: 1, kind: "calls", session_id: sessionId },
     }));
     assert(graph.root.addr === targetFunction.addr, "get_graph_slice returned wrong root.");
     assert(Array.isArray(graph.nodes) && Array.isArray(graph.edges), "get_graph_slice missing nodes/edges.");
@@ -239,14 +260,60 @@ try {
     const stringValue = strings.find((item) => item.value?.length)?.value;
     const results = toolPayload(await rpc("tools/call", {
       name: "search_strings",
-      arguments: { regex: escapeRegex(stringValue), semantic: true },
+      arguments: { regex: escapeRegex(stringValue), semantic: true, session_id: sessionId },
     }));
     assert(results.some((result) => result.value === stringValue), "search_strings did not find selected real string.");
     assert("referencedBy" in results[0], "semantic search_strings did not include referencedBy.");
   });
 
+  await check("Hopper API snapshot mirror tools", async () => {
+    const documents = toolPayload(await rpc("tools/call", { name: "list_documents", arguments: {} }));
+    assert(documents.some((document) => document.sessionId), "list_documents did not return loaded sessions.");
+    const currentDocument = toolPayload(await rpc("tools/call", { name: "current_document", arguments: { session_id: sessionId } }));
+    assert(currentDocument.binary?.path === target, "current_document did not return the live Hopper snapshot.");
+    const segments = toolPayload(await rpc("tools/call", { name: "list_segments", arguments: { session_id: sessionId } }));
+    assert(Array.isArray(segments) && segments.length > 0, "list_segments returned no segments.");
+    const procedures = toolPayload(await rpc("tools/call", { name: "list_procedures", arguments: { session_id: sessionId, max_results: 10 } }));
+    assert(procedures.some((procedure) => procedure.addr === targetFunction.addr), "list_procedures did not include the selected function.");
+    const sizes = toolPayload(await rpc("tools/call", { name: "list_procedure_size", arguments: { session_id: sessionId, max_results: 10 } }));
+    assert(sizes.some((procedure) => procedure.addr === targetFunction.addr), "list_procedure_size did not include the selected function.");
+    const infos = toolPayload(await rpc("tools/call", { name: "list_procedure_info", arguments: { session_id: sessionId, max_results: 10 } }));
+    assert(infos.some((procedure) => procedure.addr === targetFunction.addr), "list_procedure_info did not include the selected function.");
+    const listedStrings = toolPayload(await rpc("tools/call", { name: "list_strings", arguments: { session_id: sessionId, max_results: 10 } }));
+    assert(listedStrings.length > 0, "list_strings returned no strings.");
+    const procedureSearch = toolPayload(await rpc("tools/call", { name: "search_procedures", arguments: { regex: escapeRegex(targetFunction.name ?? targetFunction.addr), session_id: sessionId, max_results: 10 } }));
+    assert(procedureSearch.some((procedure) => procedure.addr === targetFunction.addr), "search_procedures did not find selected function.");
+    const info = toolPayload(await rpc("tools/call", { name: "procedure_info", arguments: { procedure: targetFunction.addr, session_id: sessionId } }));
+    assert(info.addr === targetFunction.addr, "procedure_info returned wrong procedure.");
+    const address = toolPayload(await rpc("tools/call", { name: "procedure_address", arguments: { procedure: targetFunction.name ?? targetFunction.addr, session_id: sessionId } }));
+    assert(address.addr === targetFunction.addr, "procedure_address returned wrong address.");
+    const assembly = toolPayload(await rpc("tools/call", { name: "procedure_assembly", arguments: { procedure: targetFunction.addr, session_id: sessionId, max_lines: 20 } }));
+    assert(typeof assembly.assembly === "string", "procedure_assembly did not return assembly text.");
+    const pseudocode = toolPayload(await rpc("tools/call", { name: "procedure_pseudo_code", arguments: { procedure: targetFunction.addr, session_id: sessionId } }));
+    assert("available" in pseudocode, "procedure_pseudo_code did not report availability.");
+    const callers = toolPayload(await rpc("tools/call", { name: "procedure_callers", arguments: { procedure: targetFunction.addr, session_id: sessionId } }));
+    const callees = toolPayload(await rpc("tools/call", { name: "procedure_callees", arguments: { procedure: targetFunction.addr, session_id: sessionId } }));
+    assert(Array.isArray(callers) && Array.isArray(callees), "procedure_callers/callees did not return arrays.");
+    const refs = toolPayload(await rpc("tools/call", { name: "xrefs", arguments: { address: targetFunction.addr, session_id: sessionId } }));
+    assert(refs.address === targetFunction.addr && Array.isArray(refs.refsTo) && Array.isArray(refs.refsFrom), "xrefs returned malformed result.");
+    const currentAddress = toolPayload(await rpc("tools/call", { name: "current_address", arguments: { session_id: sessionId } }));
+    assert("address" in currentAddress, "current_address did not return captured cursor shape.");
+    const currentProcedure = toolPayload(await rpc("tools/call", { name: "current_procedure", arguments: { session_id: sessionId } }));
+    assert("addr" in currentProcedure, "current_procedure did not return captured cursor shape.");
+    const names = toolPayload(await rpc("tools/call", { name: "list_names", arguments: { session_id: sessionId, max_results: 20 } }));
+    assert(Array.isArray(names), "list_names did not return an array.");
+    if (names.length) {
+      const nameSearch = toolPayload(await rpc("tools/call", { name: "search_name", arguments: { regex: escapeRegex(names[0].name ?? names[0].addr), session_id: sessionId, max_results: 20 } }));
+      assert(nameSearch.length > 0, "search_name did not find a listed name.");
+      const addressName = toolPayload(await rpc("tools/call", { name: "address_name", arguments: { address: names[0].addr, session_id: sessionId } }));
+      assert(addressName.addr === names[0].addr, "address_name returned wrong address.");
+    }
+    const bookmarks = toolPayload(await rpc("tools/call", { name: "list_bookmarks", arguments: { session_id: sessionId, max_results: 20 } }));
+    assert(Array.isArray(bookmarks), "list_bookmarks did not return an array.");
+  });
+
   await check("transaction rollback", async () => {
-    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "real rollback test", rationale: "Exercise queue_comment and rollback." } }));
+    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "real rollback test", rationale: "Exercise queue_comment and rollback.", session_id: sessionId } }));
     const queued = toolPayload(await rpc("tools/call", {
       name: "queue_comment",
       arguments: {
@@ -254,17 +321,18 @@ try {
         addr: targetFunction.addr,
         comment: "Temporary all-tools test comment.",
         rationale: "Testing rollback path.",
+        session_id: sessionId,
       },
     }));
     assert(queued.operations.length === 1, "queue_comment did not queue operation.");
-    const preview = toolPayload(await rpc("tools/call", { name: "preview_transaction", arguments: { transaction_id: begun.transactionId } }));
+    const preview = toolPayload(await rpc("tools/call", { name: "preview_transaction", arguments: { transaction_id: begun.transactionId, session_id: sessionId } }));
     assert(preview.operations[0].newValue.includes("Temporary"), "preview_transaction did not show queued comment.");
-    const rollback = toolPayload(await rpc("tools/call", { name: "rollback_transaction", arguments: { transaction_id: begun.transactionId } }));
+    const rollback = toolPayload(await rpc("tools/call", { name: "rollback_transaction", arguments: { transaction_id: begun.transactionId, session_id: sessionId } }));
     assert(rollback.status === "rolled_back", "rollback_transaction did not roll back.");
   });
 
   await check("inline comment and type patch rollback", async () => {
-    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "inline/type rollback test", rationale: "Exercise queue_inline_comment and queue_type_patch." } }));
+    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "inline/type rollback test", rationale: "Exercise queue_inline_comment and queue_type_patch.", session_id: sessionId } }));
     const inlineQueued = toolPayload(await rpc("tools/call", {
       name: "queue_inline_comment",
       arguments: {
@@ -272,6 +340,7 @@ try {
         addr: targetFunction.addr,
         comment: "Temporary inline all-tools test comment.",
         rationale: "Testing inline comment queue path.",
+        session_id: sessionId,
       },
     }));
     assert(inlineQueued.operations.some((op) => op.kind === "inline_comment"), "queue_inline_comment did not queue operation.");
@@ -282,15 +351,16 @@ try {
         addr: targetFunction.addr,
         type: "int test_signature(void)",
         rationale: "Testing type patch queue path.",
+        session_id: sessionId,
       },
     }));
     assert(typeQueued.operations.some((op) => op.kind === "type_patch"), "queue_type_patch did not queue operation.");
-    const rollback = toolPayload(await rpc("tools/call", { name: "rollback_transaction", arguments: { transaction_id: begun.transactionId } }));
+    const rollback = toolPayload(await rpc("tools/call", { name: "rollback_transaction", arguments: { transaction_id: begun.transactionId, session_id: sessionId } }));
     assert(rollback.status === "rolled_back", "inline/type rollback did not roll back.");
   });
 
   await check("transaction commit", async () => {
-    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "real commit test", rationale: "Exercise queue_rename and local commit." } }));
+    const begun = toolPayload(await rpc("tools/call", { name: "begin_transaction", arguments: { name: "real commit test", rationale: "Exercise queue_rename and local commit.", session_id: sessionId } }));
     const newName = `mcp_test_${targetFunction.addr.replace(/[^0-9a-f]/gi, "_")}`;
     const queued = toolPayload(await rpc("tools/call", {
       name: "queue_rename",
@@ -299,13 +369,14 @@ try {
         addr: targetFunction.addr,
         new_name: newName,
         rationale: "Testing local commit path.",
+        session_id: sessionId,
       },
     }));
     assert(queued.operations[0].oldValue === targetFunction.name, "queue_rename did not capture old name.");
-    const committed = toolPayload(await rpc("tools/call", { name: "commit_transaction", arguments: { transaction_id: begun.transactionId } }));
+    const committed = toolPayload(await rpc("tools/call", { name: "commit_transaction", arguments: { transaction_id: begun.transactionId, session_id: sessionId } }));
     assert(committed.status === "committed", "commit_transaction did not commit.");
     assert(committed.adapterResult.appliedToHopper === false, "commit_transaction should not claim Hopper write-back yet.");
-    const analysis = toolPayload(await rpc("tools/call", { name: "analyze_function_deep", arguments: { addr: targetFunction.addr } }));
+    const analysis = toolPayload(await rpc("tools/call", { name: "analyze_function_deep", arguments: { addr: targetFunction.addr, session_id: sessionId } }));
     assert(analysis.function.name === newName, "committed rename was not reflected in knowledge store.");
   });
 

@@ -17,6 +17,8 @@ export async function ingestWithLiveHopper({
   maxStrings,
   maxBlocksPerFunction,
   maxInstructionsPerBlock,
+  includePseudocode = false,
+  maxPseudocodeFunctions,
   waitForAnalysis = false,
   fullExport = false,
   failOnTruncation = fullExport,
@@ -28,6 +30,7 @@ export async function ingestWithLiveHopper({
   const effectiveMaxStrings = fullExport ? (maxStrings ?? null) : (maxStrings ?? 10000);
   const effectiveMaxBlocksPerFunction = fullExport ? (maxBlocksPerFunction ?? null) : (maxBlocksPerFunction ?? 64);
   const effectiveMaxInstructionsPerBlock = fullExport ? (maxInstructionsPerBlock ?? null) : (maxInstructionsPerBlock ?? 24);
+  const effectiveMaxPseudocodeFunctions = includePseudocode ? (maxPseudocodeFunctions ?? 25) : 0;
 
   return runHopperExporter({
     hopperLauncher,
@@ -36,6 +39,8 @@ export async function ingestWithLiveHopper({
     maxStrings: effectiveMaxStrings,
     maxBlocksPerFunction: effectiveMaxBlocksPerFunction,
     maxInstructionsPerBlock: effectiveMaxInstructionsPerBlock,
+    includePseudocode,
+    maxPseudocodeFunctions: effectiveMaxPseudocodeFunctions,
     waitForAnalysis: effectiveWaitForAnalysis,
     fullExport,
     failOnTruncation,
@@ -65,6 +70,8 @@ async function runHopperExporter({
   maxStrings,
   maxBlocksPerFunction,
   maxInstructionsPerBlock,
+  includePseudocode,
+  maxPseudocodeFunctions,
   waitForAnalysis,
   fullExport,
   failOnTruncation,
@@ -74,7 +81,7 @@ async function runHopperExporter({
   const workdir = await mkdtemp(join(tmpdir(), "hopper-live-"));
   const outputPath = join(workdir, "session.json");
   const scriptPath = join(workdir, "export_live_session.py");
-  await writeFile(scriptPath, buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, waitForAnalysis, fullExport, failOnTruncation }), "utf8");
+  await writeFile(scriptPath, buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, includePseudocode, maxPseudocodeFunctions, waitForAnalysis, fullExport, failOnTruncation }), "utf8");
 
   const appleScript = buildAppleScript(scriptPath);
   const args = ["-e", appleScript];
@@ -164,7 +171,7 @@ function timeoutHint(details) {
   return "Hopper may still be analyzing the target or waiting for UI input.";
 }
 
-function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, waitForAnalysis, fullExport, failOnTruncation }) {
+function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, includePseudocode, maxPseudocodeFunctions, waitForAnalysis, fullExport, failOnTruncation }) {
   return String.raw`
 import hashlib
 import json
@@ -175,6 +182,8 @@ MAX_FUNCTIONS = ${pythonLiteral(maxFunctions)}
 MAX_STRINGS = ${pythonLiteral(maxStrings)}
 MAX_BLOCKS_PER_FUNCTION = ${pythonLiteral(maxBlocksPerFunction)}
 MAX_INSTRUCTIONS_PER_BLOCK = ${pythonLiteral(maxInstructionsPerBlock)}
+INCLUDE_PSEUDOCODE = ${pythonBool(includePseudocode)}
+MAX_PSEUDOCODE_FUNCTIONS = ${pythonLiteral(maxPseudocodeFunctions)}
 WAIT_FOR_ANALYSIS = ${pythonBool(waitForAnalysis)}
 FULL_EXPORT = ${pythonBool(fullExport)}
 FAIL_ON_TRUNCATION = ${pythonBool(failOnTruncation)}
@@ -254,8 +263,22 @@ def procedure_refs(procs):
             refs.append(hx(addr))
     return refs
 
+def call_ref(ref):
+    return {
+        "from": hx(safe_call(None, ref.fromAddress)),
+        "to": hx(safe_call(None, ref.toAddress)),
+        "type": safe_call(None, ref.type)
+    }
+
+def collect_call_refs(refs):
+    items = []
+    for ref in refs or []:
+        items.append(call_ref(ref))
+    return items
+
 def collect_basic_blocks(seg, proc):
     blocks = []
+    comment_addresses = set()
     block_count = safe_call(0, proc.getBasicBlockCount)
     block_limit = limit_count(block_count, MAX_BLOCKS_PER_FUNCTION)
     for block_index in range(block_limit):
@@ -264,6 +287,13 @@ def collect_basic_blocks(seg, proc):
             continue
         start = safe_call(None, block.getStartingAddress)
         end = safe_call(None, block.getEndingAddress)
+        if start is not None:
+            comment_addresses.add(start)
+        if end is not None:
+            comment_addresses.add(end)
+        successors = []
+        for successor_index in range(safe_call(0, block.getSuccessorCount)):
+            successors.append(hx(safe_call(None, block.getSuccessorAddressAtIndex, successor_index)))
         instructions = []
         cursor = start
         count = 0
@@ -272,6 +302,7 @@ def collect_basic_blocks(seg, proc):
             instr = safe_call(None, seg.getInstructionAtAddress, cursor)
             if instr is None:
                 break
+            comment_addresses.add(cursor)
             text = safe_call("", instr.getInstructionString)
             args = []
             for arg_index in range(safe_call(0, instr.getArgumentCount)):
@@ -280,6 +311,7 @@ def collect_basic_blocks(seg, proc):
                 "addr": hx(cursor),
                 "text": safe_string(text),
                 "args": args,
+                "refsFrom": [hx(value) for value in safe_call([], seg.getReferencesFromAddress, cursor)],
             })
             length = safe_call(1, instr.getInstructionLength)
             if length <= 0:
@@ -288,11 +320,14 @@ def collect_basic_blocks(seg, proc):
             count = count + 1
         blocks.append({
             "addr": hx(start),
+            "from": hx(start),
             "end": hx(end),
+            "to": hx(end),
+            "successors": successors,
             "summary": "Live Hopper basic block with %d sampled instruction(s)." % len(instructions),
             "instructions": instructions,
         })
-    return blocks
+    return {"blocks": blocks, "commentAddresses": list(comment_addresses)}
 
 def collect_strings(doc):
     strings = []
@@ -328,8 +363,59 @@ def collect_segments(doc):
         })
     return segments
 
+def collect_names(doc):
+    names = []
+    for seg in safe_call([], doc.getSegmentsList):
+        labels = safe_call([], seg.getLabelsList)
+        addresses = safe_call([], seg.getNamedAddresses)
+        for index, addr in enumerate(addresses):
+            label = labels[index] if index < len(labels) else safe_call(None, seg.getNameAtAddress, addr)
+            names.append({
+                "addr": hx(addr),
+                "name": safe_string(label),
+                "demangled": safe_string(safe_call(None, seg.getDemangledNameAtAddress, addr)),
+                "segment": safe_string(safe_call("", seg.getName)),
+            })
+    return names
+
+def collect_bookmarks(doc):
+    bookmarks = []
+    for addr in safe_call([], doc.getBookmarks):
+        bookmarks.append({
+            "addr": hx(addr),
+            "name": safe_string(safe_call(None, doc.getBookmarkName, addr)),
+        })
+    return bookmarks
+
+def collect_comments(doc, addresses):
+    comments = []
+    inline_comments = []
+    for addr in sorted(addresses):
+        seg = safe_call(None, doc.getSegmentAtAddress, addr)
+        if seg is None:
+            continue
+        comment = safe_string(safe_call(None, seg.getCommentAtAddress, addr))
+        inline = safe_string(safe_call(None, seg.getInlineCommentAtAddress, addr))
+        if comment:
+            comments.append({"addr": hx(addr), "comment": comment})
+        if inline:
+            inline_comments.append({"addr": hx(addr), "comment": inline})
+    return {"comments": comments, "inlineComments": inline_comments}
+
+def collect_current(doc):
+    current_addr = safe_call(None, doc.getCurrentAddress)
+    current_proc = safe_call(None, doc.getCurrentProcedure)
+    selection = safe_call([], doc.getSelectionAddressRange)
+    return {
+        "address": hx(current_addr),
+        "procedure": hx(procedure_addr(current_proc)) if current_proc is not None else None,
+        "selection": [hx(value) for value in selection] if selection else []
+    }
+
 def collect_functions(doc):
     functions = []
+    comment_addresses = set()
+    pseudocode_count = 0
     total = 0
     for seg in safe_call([], doc.getSegmentsList):
         count = safe_call(0, seg.getProcedureCount)
@@ -343,9 +429,19 @@ def collect_functions(doc):
             addr = procedure_addr(proc)
             if addr is None:
                 continue
+            comment_addresses.add(addr)
             callers = procedure_refs(safe_call([], proc.getAllCallerProcedures))
             callees = procedure_refs(safe_call([], proc.getAllCalleeProcedures))
+            caller_refs = collect_call_refs(safe_call([], proc.getAllCallers))
+            callee_refs = collect_call_refs(safe_call([], proc.getAllCallees))
             signature = safe_call(None, proc.signatureString)
+            block_export = collect_basic_blocks(seg, proc)
+            for comment_addr in block_export["commentAddresses"]:
+                comment_addresses.add(comment_addr)
+            pseudocode = None
+            if INCLUDE_PSEUDOCODE and (MAX_PSEUDOCODE_FUNCTIONS is None or pseudocode_count < MAX_PSEUDOCODE_FUNCTIONS):
+                pseudocode = safe_string(safe_call(None, proc.decompile))
+                pseudocode_count = pseudocode_count + 1
             local_vars = []
             for local in safe_call([], proc.getLocalVariableList):
                 local_vars.append({
@@ -356,16 +452,27 @@ def collect_functions(doc):
                 "addr": hx(addr),
                 "name": procedure_name(doc, proc),
                 "size": safe_call(None, proc.getHeapSize),
+                "basicBlockCount": safe_call(0, proc.getBasicBlockCount),
                 "summary": "Live Hopper procedure exported via official Python API.",
                 "confidence": 0.8,
                 "callers": callers,
                 "callees": callees,
+                "callerRefs": caller_refs,
+                "calleeRefs": callee_refs,
+                "xrefsFrom": callee_refs,
+                "xrefsTo": caller_refs,
                 "strings": [],
                 "imports": [],
                 "signature": safe_string(signature),
                 "locals": local_vars,
+                "pseudocode": pseudocode,
                 "source": "hopper-python-live",
-                "basicBlocks": collect_basic_blocks(seg, proc),
+                "basicBlocks": block_export["blocks"],
+                "assembly": "\n".join([
+                    "%s: %s" % (instr.get("addr"), instr.get("text"))
+                    for block in block_export["blocks"]
+                    for instr in block.get("instructions", [])
+                ]),
                 "fingerprint": {
                     "cfgShape": "blocks:%d" % safe_call(0, proc.getBasicBlockCount),
                     "importSignature": [],
@@ -375,7 +482,9 @@ def collect_functions(doc):
     return {
         "items": functions,
         "total": total,
-        "truncated": is_truncated(total, MAX_FUNCTIONS)
+        "truncated": is_truncated(total, MAX_FUNCTIONS),
+        "commentAddresses": list(comment_addresses),
+        "pseudocodeExported": pseudocode_count
     }
 
 try:
@@ -387,6 +496,22 @@ try:
     document_name = safe_call("Hopper Document", doc.getDocumentName)
     function_export = collect_functions(doc)
     string_export = collect_strings(doc)
+    names = collect_names(doc)
+    bookmarks = collect_bookmarks(doc)
+    comment_addresses = set(function_export["commentAddresses"])
+    for item in string_export["items"]:
+        parsed = int(item["addr"], 16) if item.get("addr") else None
+        if parsed is not None:
+            comment_addresses.add(parsed)
+    for item in names:
+        parsed = int(item["addr"], 16) if item.get("addr") else None
+        if parsed is not None:
+            comment_addresses.add(parsed)
+    for item in bookmarks:
+        parsed = int(item["addr"], 16) if item.get("addr") else None
+        if parsed is not None:
+            comment_addresses.add(parsed)
+    comments = collect_comments(doc, comment_addresses)
     truncated = {
         "functions": function_export["truncated"],
         "strings": string_export["truncated"],
@@ -419,21 +544,29 @@ try:
                     "functions": MAX_FUNCTIONS,
                     "strings": MAX_STRINGS,
                     "blocksPerFunction": MAX_BLOCKS_PER_FUNCTION,
-                    "instructionsPerBlock": MAX_INSTRUCTIONS_PER_BLOCK
+                    "instructionsPerBlock": MAX_INSTRUCTIONS_PER_BLOCK,
+                    "pseudocodeFunctions": MAX_PSEUDOCODE_FUNCTIONS
                 },
                 "totals": {
                     "functions": function_export["total"],
-                    "strings": string_export["total"]
+                    "strings": string_export["total"],
+                    "pseudocode": function_export["pseudocodeExported"]
                 },
                 "exported": {
                     "functions": len(function_export["items"]),
-                    "strings": len(string_export["items"])
+                    "strings": len(string_export["items"]),
+                    "pseudocode": function_export["pseudocodeExported"]
                 },
                 "truncated": truncated
             }
         },
         "functions": function_export["items"],
         "strings": string_export["items"],
+        "names": names,
+        "bookmarks": bookmarks,
+        "comments": comments["comments"],
+        "inlineComments": comments["inlineComments"],
+        "cursor": collect_current(doc),
         "imports": [],
         "exports": [],
         "objcClasses": [],

@@ -3,6 +3,7 @@ import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { rm } from "node:fs/promises";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const target = process.env.LIVE_HOPPER_BINARY ?? "/bin/ls";
@@ -55,9 +56,11 @@ const expectedTools = [
   "rollback_transaction",
 ];
 
+const storePath = join(root, "data", "all-tools-real-store.json");
+await rm(storePath, { force: true });
 const child = spawn(process.execPath, [join(root, "src", "mcp-server.js")], {
   stdio: ["pipe", "pipe", "inherit"],
-  env: { ...process.env, HOPPER_MCP_STORE: join(root, "data", "all-tools-real-store.json") },
+  env: { ...process.env, HOPPER_MCP_STORE: storePath },
 });
 
 const rl = createInterface({ input: child.stdout });

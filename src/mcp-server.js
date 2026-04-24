@@ -7,6 +7,18 @@ import { HopperAdapter } from "./hopper-adapter.js";
 import { importMachO, searchMachOStrings, disassembleRange, findXrefs, discoverFunctionsFromDisassembly, mergeFunctionSets } from "./macho-importer.js";
 import { OfficialHopperBackend, officialToolPayload } from "./official-hopper-backend.js";
 import { buildOfficialSnapshot } from "./official-snapshot.js";
+import {
+  classifyImports,
+  detectAntiAnalysis,
+  computeSectionEntropy,
+  extractCodeSigning,
+  extractObjCRuntime,
+  buildFunctionFingerprint,
+  functionSimilarity,
+  diffSessions,
+  queryFunctions,
+  discoverX86Functions,
+} from "./research-tools.js";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const store = new KnowledgeStore(process.env.HOPPER_MCP_STORE ?? join(ROOT, "data", "knowledge-store.json"));
@@ -292,6 +304,105 @@ const tools = [
     transaction_id: { type: "string" },
     session_id: { type: "string" },
   }),
+  tool("classify_capabilities", "Bucket the active session imports into capability groups (network/crypto/file/ipc/proc/anti-analysis/...).", {
+    session_id: { type: "string" },
+    persist: { type: "boolean", description: "Persist the result onto session.binary.capabilities (default true)." },
+  }),
+  tool("detect_anti_analysis", "Surface anti-debug, anti-VM, and other anti-analysis patterns in the active session.", {
+    session_id: { type: "string" },
+    persist: { type: "boolean", description: "Persist findings onto session.antiAnalysisFindings (default true)." },
+  }),
+  tool("compute_section_entropy", "Compute Shannon entropy per Mach-O section. Flags entropy>=7.5 as suspicious (likely packed).", {
+    executable_path: { type: "string" },
+    arch: { type: "string" },
+    session_id: { type: "string" },
+    persist: { type: "boolean" },
+    max_bytes_per_section: { type: "number" },
+  }),
+  tool("extract_code_signing", "Extract code-signing metadata and entitlements via codesign.", {
+    executable_path: { type: "string" },
+    session_id: { type: "string" },
+    persist: { type: "boolean" },
+  }),
+  tool("extract_objc_runtime", "Recover Objective-C class hierarchy, methods, and IMP addresses from a Mach-O via otool -ov.", {
+    executable_path: { type: "string" },
+    arch: { type: "string" },
+    session_id: { type: "string" },
+    max_classes: { type: "number" },
+    persist: { type: "boolean" },
+  }),
+  tool("compute_fingerprints", "Recompute imphash/simhash/minhash fingerprints for the active session's functions.", {
+    session_id: { type: "string" },
+  }),
+  tool("find_similar_functions", "Find functions across loaded sessions that resemble a target by fingerprint.", {
+    addr: { type: "string", description: "Function address (defaults to current procedure)." },
+    session_id: { type: "string" },
+    target_session_id: { type: "string", description: "Restrict results to this session (default: all sessions)." },
+    min_similarity: { type: "number", description: "Lower bound on overall similarity (0-1, default 0.4)." },
+    max_results: { type: "number" },
+  }),
+  tool("diff_sessions", "Diff two sessions: added/removed/renamed/changed functions, strings, imports.", {
+    left_session_id: { type: "string" },
+    right_session_id: { type: "string" },
+  }, ["left_session_id", "right_session_id"]),
+  tool("query", "Run a structured query against the active session. Predicates: name, calls, callers, callees, imports, string, tag, capability, anti, addr, pseudocode, size. Connectors: AND, OR, NOT, parens.", {
+    expression: { type: "string" },
+    session_id: { type: "string" },
+    max_results: { type: "number" },
+  }, ["expression"]),
+  tool("queue_tag", "Queue a persistent tag (or list of tags) on an address in the current transaction.", {
+    transaction_id: { type: "string" },
+    addr: { type: "string" },
+    tag: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    rationale: { type: "string" },
+    session_id: { type: "string" },
+  }, ["addr"]),
+  tool("queue_untag", "Queue removal of one or more tags from an address.", {
+    transaction_id: { type: "string" },
+    addr: { type: "string" },
+    tag: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    rationale: { type: "string" },
+    session_id: { type: "string" },
+  }, ["addr"]),
+  tool("list_tags", "List address tags in the active session.", {
+    session_id: { type: "string" },
+  }),
+  tool("queue_rename_batch", "Queue a bulk rename mapping {addr: newName} in the active transaction.", {
+    transaction_id: { type: "string" },
+    mapping: { type: "object", description: "Object whose keys are addresses and values are new names." },
+    rationale: { type: "string" },
+    session_id: { type: "string" },
+  }, ["mapping"]),
+  tool("create_hypothesis", "Queue creation of a structured hypothesis record (topic, claim, status).", {
+    transaction_id: { type: "string" },
+    topic: { type: "string" },
+    claim: { type: "string" },
+    status: { type: "string", enum: ["open", "supported", "refuted", "abandoned"] },
+    rationale: { type: "string" },
+    session_id: { type: "string" },
+  }, ["topic"]),
+  tool("link_evidence", "Queue an evidence link onto a hypothesis (address, string, import, or note).", {
+    transaction_id: { type: "string" },
+    hypothesis_id: { type: "string" },
+    addr: { type: "string" },
+    evidence: { type: "string" },
+    evidence_kind: { type: "string", enum: ["address", "string", "import", "note", "selector"] },
+    rationale: { type: "string" },
+    session_id: { type: "string" },
+  }, ["hypothesis_id"]),
+  tool("set_hypothesis_status", "Queue a status change on a hypothesis (open/supported/refuted/abandoned).", {
+    transaction_id: { type: "string" },
+    hypothesis_id: { type: "string" },
+    status: { type: "string", enum: ["open", "supported", "refuted", "abandoned"] },
+    rationale: { type: "string" },
+    session_id: { type: "string" },
+  }, ["hypothesis_id", "status"]),
+  tool("list_hypotheses", "List hypotheses recorded for the active session.", {
+    session_id: { type: "string" },
+    status: { type: "string", enum: ["open", "supported", "refuted", "abandoned"] },
+  }),
 ];
 
 const officialMirrorTools = new Set([
@@ -554,7 +665,7 @@ async function callTool(name, args, meta = {}) {
     if (args.pattern !== undefined) {
       result = objectFromAddressItems(searchStringsOfficial(pattern, { caseSensitive: Boolean(args.case_sensitive), sessionId, maxResults: args.max_results }), "value");
     } else {
-      result = store.searchStrings(pattern, { semantic: Boolean(args.semantic), sessionId });
+      result = store.searchStrings(pattern, { semantic: Boolean(args.semantic), sessionId, maxResults: args.max_results });
       if (!result.length) {
         result = await searchSessionBinaryStrings(pattern, { semantic: Boolean(args.semantic), sessionId, maxResults: args.max_results });
       }
@@ -734,9 +845,179 @@ async function callTool(name, args, meta = {}) {
     notifyResourceListChanged();
   } else if (name === "rollback_transaction") {
     result = await transactions.rollback({ transactionId: args.transaction_id, sessionId });
+  } else if (name === "classify_capabilities") {
+    const session = store.getSession(sessionId);
+    const capabilities = classifyImports(session.imports ?? []);
+    if (args.persist !== false) {
+      session.binary ??= {};
+      session.binary.capabilities = capabilities;
+      await store.save();
+      notifyResourceListChanged();
+    }
+    result = capabilities;
+  } else if (name === "detect_anti_analysis") {
+    const session = store.getSession(sessionId);
+    const findings = detectAntiAnalysis(session);
+    if (args.persist !== false) {
+      session.antiAnalysisFindings = findings;
+      await store.save();
+      notifyResourceListChanged();
+    }
+    result = findings;
+  } else if (name === "compute_section_entropy") {
+    const session = sessionOrNull(sessionId);
+    const binaryPath = args.executable_path ?? session?.binary?.path;
+    if (!binaryPath) throw rpcError(-32602, "compute_section_entropy needs executable_path or a session binary path.");
+    const entropy = await computeSectionEntropy(binaryPath, args.arch ?? session?.binary?.arch ?? "auto", {
+      maxBytes: args.max_bytes_per_section ?? 4 * 1024 * 1024,
+    });
+    if (args.persist !== false && session) {
+      session.binary ??= {};
+      session.binary.sectionEntropy = entropy;
+      await store.save();
+      notifyResourceListChanged();
+    }
+    result = entropy;
+  } else if (name === "extract_code_signing") {
+    const session = sessionOrNull(sessionId);
+    const binaryPath = args.executable_path ?? session?.binary?.path;
+    if (!binaryPath) throw rpcError(-32602, "extract_code_signing needs executable_path or a session binary path.");
+    const signing = await extractCodeSigning(binaryPath);
+    if (args.persist !== false && session) {
+      session.binary ??= {};
+      session.binary.signing = signing;
+      await store.save();
+      notifyResourceListChanged();
+    }
+    result = signing;
+  } else if (name === "extract_objc_runtime") {
+    const session = sessionOrNull(sessionId);
+    const binaryPath = args.executable_path ?? session?.binary?.path;
+    if (!binaryPath) throw rpcError(-32602, "extract_objc_runtime needs executable_path or a session binary path.");
+    const classes = await extractObjCRuntime(binaryPath, args.arch ?? session?.binary?.arch ?? "auto", { maxClasses: args.max_classes ?? 1000 });
+    if (args.persist !== false && session) {
+      session.objcClasses = classes;
+      await store.save();
+      notifyResourceListChanged();
+    }
+    result = { count: classes.length, classes };
+  } else if (name === "compute_fingerprints") {
+    const session = store.getSession(sessionId);
+    let updated = 0;
+    for (const fn of Object.values(session.functions ?? {})) {
+      fn.fingerprint = buildFunctionFingerprint(fn, session.imports ?? []);
+      updated += 1;
+    }
+    await store.save();
+    notifyResourceListChanged();
+    result = { updated };
+  } else if (name === "find_similar_functions") {
+    result = findSimilarFunctions({
+      sessionId,
+      addr: args.addr,
+      targetSessionId: args.target_session_id,
+      minSimilarity: args.min_similarity ?? 0.4,
+      maxResults: args.max_results ?? 25,
+    });
+  } else if (name === "diff_sessions") {
+    const left = store.getSession(args.left_session_id);
+    const right = store.getSession(args.right_session_id);
+    result = diffSessions(left, right);
+  } else if (name === "query") {
+    const session = store.getSession(sessionId);
+    const matches = queryFunctions(session, args.expression, {
+      maxResults: args.max_results ?? 50,
+      capabilities: session.binary?.capabilities ?? null,
+      antiAnalysis: session.antiAnalysisFindings ?? [],
+    });
+    result = { count: matches.length, matches };
+  } else if (name === "queue_tag") {
+    const tags = args.tags ?? (args.tag ? [args.tag] : []);
+    result = await transactions.queue({ transactionId: args.transaction_id, kind: "tag", addr: args.addr, tags, rationale: args.rationale }, { sessionId });
+  } else if (name === "queue_untag") {
+    const tags = args.tags ?? (args.tag ? [args.tag] : []);
+    result = await transactions.queue({ transactionId: args.transaction_id, kind: "untag", addr: args.addr, tags, rationale: args.rationale }, { sessionId });
+  } else if (name === "list_tags") {
+    const session = store.getSession(sessionId);
+    result = session.tags ?? {};
+  } else if (name === "queue_rename_batch") {
+    result = await transactions.queue({ transactionId: args.transaction_id, kind: "rename_batch", mapping: args.mapping, rationale: args.rationale }, { sessionId });
+  } else if (name === "create_hypothesis") {
+    result = await transactions.queue({
+      transactionId: args.transaction_id,
+      kind: "hypothesis_create",
+      topic: args.topic,
+      claim: args.claim,
+      status: args.status ?? "open",
+      rationale: args.rationale,
+    }, { sessionId });
+  } else if (name === "link_evidence") {
+    result = await transactions.queue({
+      transactionId: args.transaction_id,
+      kind: "hypothesis_link",
+      hypothesisId: args.hypothesis_id,
+      addr: args.addr,
+      evidence: args.evidence,
+      evidenceKind: args.evidence_kind ?? (args.addr ? "address" : "note"),
+      rationale: args.rationale,
+    }, { sessionId });
+  } else if (name === "set_hypothesis_status") {
+    result = await transactions.queue({
+      transactionId: args.transaction_id,
+      kind: "hypothesis_status",
+      hypothesisId: args.hypothesis_id,
+      status: args.status,
+      rationale: args.rationale,
+    }, { sessionId });
+  } else if (name === "list_hypotheses") {
+    const session = store.getSession(sessionId);
+    const list = session.hypotheses ?? [];
+    result = args.status ? list.filter((h) => h.status === args.status) : list;
   }
 
   return toolResult(result);
+}
+
+function sessionOrNull(sessionId) {
+  try {
+    return store.getSession(sessionId);
+  } catch {
+    return null;
+  }
+}
+
+function findSimilarFunctions({ sessionId, addr, targetSessionId, minSimilarity, maxResults }) {
+  const session = store.getSession(sessionId);
+  const targetAddr = addr ?? session.cursor?.procedure ?? session.cursor?.address;
+  if (!targetAddr) throw rpcError(-32602, "find_similar_functions needs addr or a captured cursor.");
+  const target = store.getFunction(session, targetAddr);
+  if (!target.fingerprint) target.fingerprint = buildFunctionFingerprint(target, session.imports ?? []);
+
+  const sessionsToScan = targetSessionId ? [store.getSession(targetSessionId)] : Object.values(store.state.sessions);
+  const results = [];
+  for (const candidateSession of sessionsToScan) {
+    for (const candidate of Object.values(candidateSession.functions ?? {})) {
+      if (candidateSession.sessionId === session.sessionId && candidate.addr === target.addr) continue;
+      if (!candidate.fingerprint) candidate.fingerprint = buildFunctionFingerprint(candidate, candidateSession.imports ?? []);
+      const score = functionSimilarity(target.fingerprint, candidate.fingerprint);
+      if (score.similarity >= minSimilarity) {
+        results.push({
+          sessionId: candidateSession.sessionId,
+          binary: candidateSession.binary?.name ?? null,
+          addr: candidate.addr,
+          name: candidate.name ?? null,
+          summary: candidate.summary ?? null,
+          similarity: Number(score.similarity.toFixed(4)),
+          components: Object.fromEntries(Object.entries(score.components).map(([k, v]) => [k, Number(v.toFixed(4))])),
+        });
+      }
+    }
+  }
+  results.sort((a, b) => b.similarity - a.similarity);
+  return {
+    target: { sessionId: session.sessionId, addr: target.addr, name: target.name ?? null, fingerprint: target.fingerprint },
+    matches: results.slice(0, maxResults),
+  };
 }
 
 function getSessionSegments(sessionId) {

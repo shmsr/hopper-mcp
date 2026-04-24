@@ -94,21 +94,77 @@ export class TransactionManager {
   }
 }
 
+const ADDRESSLESS_KINDS = new Set(["rename_batch", "hypothesis_create", "hypothesis_link", "hypothesis_status"]);
+
 function normalizeOperation(operation) {
   const operationId = operation.operationId ?? `op-${crypto.randomUUID()}`;
   if (!operation.kind) throw new Error("Transaction operation requires a kind.");
-  if (!operation.addr) throw new Error("Transaction operation requires an addr.");
+  if (!ADDRESSLESS_KINDS.has(operation.kind) && !operation.addr) {
+    throw new Error("Transaction operation requires an addr.");
+  }
 
-  return {
+  const normalized = {
     operationId,
     kind: operation.kind,
-    addr: formatAddress(operation.addr),
-    newValue: operation.newValue ?? operation.value,
+    addr: operation.addr ? formatAddress(operation.addr) : null,
+    newValue: operation.newValue ?? operation.value ?? null,
     rationale: operation.rationale ?? null,
   };
+  if (operation.kind === "rename_batch") {
+    if (!operation.mapping || typeof operation.mapping !== "object") {
+      throw new Error("rename_batch requires a mapping of {addr: newName}.");
+    }
+    normalized.mapping = Object.fromEntries(
+      Object.entries(operation.mapping).map(([addr, name]) => [formatAddress(addr), name]),
+    );
+  }
+  if (operation.kind === "tag" || operation.kind === "untag") {
+    const tags = Array.isArray(operation.tags) ? operation.tags : operation.tag ? [operation.tag] : [];
+    if (!tags.length) throw new Error(`${operation.kind} requires tag or tags.`);
+    normalized.tags = tags.map(String);
+  }
+  if (operation.kind === "hypothesis_create") {
+    if (!operation.topic) throw new Error("hypothesis_create requires a topic.");
+    normalized.hypothesisId = operation.hypothesisId ?? `hyp-${crypto.randomUUID()}`;
+    normalized.topic = String(operation.topic);
+    normalized.claim = operation.claim ?? null;
+    normalized.status = operation.status ?? "open";
+  }
+  if (operation.kind === "hypothesis_link") {
+    if (!operation.hypothesisId) throw new Error("hypothesis_link requires hypothesisId.");
+    normalized.hypothesisId = String(operation.hypothesisId);
+    normalized.evidence = operation.evidence ?? operation.note ?? null;
+    normalized.evidenceKind = operation.evidenceKind ?? "address";
+  }
+  if (operation.kind === "hypothesis_status") {
+    if (!operation.hypothesisId) throw new Error("hypothesis_status requires hypothesisId.");
+    if (!operation.status) throw new Error("hypothesis_status requires status.");
+    normalized.hypothesisId = String(operation.hypothesisId);
+    normalized.status = String(operation.status);
+  }
+  return normalized;
 }
 
 function readCurrentValue(session, operation) {
+  if (operation.kind === "rename_batch") {
+    const out = {};
+    for (const [addr, _name] of Object.entries(operation.mapping ?? {})) {
+      out[addr] = session.functions[addr]?.name ?? null;
+    }
+    return out;
+  }
+  if (operation.kind === "tag" || operation.kind === "untag") {
+    return [...(session.tags?.[operation.addr] ?? [])];
+  }
+  if (operation.kind === "hypothesis_create") return null;
+  if (operation.kind === "hypothesis_link") {
+    const hyp = (session.hypotheses ?? []).find((h) => h.id === operation.hypothesisId);
+    return hyp ? [...(hyp.evidence ?? [])] : undefined;
+  }
+  if (operation.kind === "hypothesis_status") {
+    const hyp = (session.hypotheses ?? []).find((h) => h.id === operation.hypothesisId);
+    return hyp ? hyp.status : undefined;
+  }
   const fn = session.functions[operation.addr];
   if (!fn) return undefined;
   if (operation.kind === "rename") return fn.name;
@@ -119,6 +175,60 @@ function readCurrentValue(session, operation) {
 }
 
 function applyToKnowledgeStore(session, operation) {
+  if (operation.kind === "rename_batch") {
+    for (const [addr, name] of Object.entries(operation.mapping ?? {})) {
+      const fn = session.functions[addr];
+      if (fn) fn.name = name;
+    }
+    return;
+  }
+  if (operation.kind === "tag") {
+    session.tags ??= {};
+    const list = new Set(session.tags[operation.addr] ?? []);
+    for (const tag of operation.tags) list.add(tag);
+    session.tags[operation.addr] = [...list].sort();
+    return;
+  }
+  if (operation.kind === "untag") {
+    if (!session.tags?.[operation.addr]) return;
+    const remove = new Set(operation.tags);
+    session.tags[operation.addr] = session.tags[operation.addr].filter((tag) => !remove.has(tag));
+    if (!session.tags[operation.addr].length) delete session.tags[operation.addr];
+    return;
+  }
+  if (operation.kind === "hypothesis_create") {
+    session.hypotheses ??= [];
+    session.hypotheses.push({
+      id: operation.hypothesisId,
+      topic: operation.topic,
+      claim: operation.claim,
+      status: operation.status ?? "open",
+      evidence: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    return;
+  }
+  if (operation.kind === "hypothesis_link") {
+    const hyp = (session.hypotheses ??= []).find((h) => h.id === operation.hypothesisId);
+    if (!hyp) throw new Error(`Unknown hypothesis: ${operation.hypothesisId}`);
+    hyp.evidence ??= [];
+    hyp.evidence.push({
+      kind: operation.evidenceKind,
+      addr: operation.addr,
+      note: operation.evidence,
+      linkedAt: new Date().toISOString(),
+    });
+    hyp.updatedAt = new Date().toISOString();
+    return;
+  }
+  if (operation.kind === "hypothesis_status") {
+    const hyp = (session.hypotheses ??= []).find((h) => h.id === operation.hypothesisId);
+    if (!hyp) throw new Error(`Unknown hypothesis: ${operation.hypothesisId}`);
+    hyp.status = operation.status;
+    hyp.updatedAt = new Date().toISOString();
+    return;
+  }
   const fn = session.functions[operation.addr];
   if (!fn) return;
   if (operation.kind === "rename") fn.name = operation.newValue;

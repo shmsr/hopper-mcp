@@ -51,12 +51,14 @@ export class KnowledgeStore {
   async upsertSession(session) {
     const now = new Date().toISOString();
     const sessionId = session.sessionId ?? `session-${crypto.randomUUID()}`;
+    const existing = this.state.sessions[sessionId];
     const normalized = normalizeSession({
       ...session,
       sessionId,
-      createdAt: session.createdAt ?? now,
+      createdAt: session.createdAt ?? existing?.createdAt ?? now,
       updatedAt: now,
     });
+    if (existing) mergeUserAnnotations(normalized, existing);
     this.state.sessions[sessionId] = normalized;
     this.state.currentSessionId = sessionId;
     await this.save();
@@ -117,10 +119,12 @@ export class KnowledgeStore {
     };
   }
 
-  searchStrings(pattern, { semantic = false, sessionId = "current" } = {}) {
+  searchStrings(pattern, { semantic = false, sessionId = "current", maxResults } = {}) {
     const session = this.getSession(sessionId);
     const regex = new RegExp(pattern, "i");
-    const results = session.strings.filter((str) => regex.test(str.value));
+    const matched = session.strings.filter((str) => regex.test(str.value));
+    const limit = Number.isFinite(Number(maxResults)) ? Math.max(0, Number(maxResults)) : matched.length;
+    const results = matched.slice(0, limit);
 
     if (!semantic) return results;
 
@@ -172,6 +176,12 @@ export class KnowledgeStore {
     if (parsed.path === "/binary/imports") return session.imports;
     if (parsed.path === "/binary/exports") return session.exports;
     if (parsed.path === "/binary/strings" || parsed.path === "/strings/index") return session.strings;
+    if (parsed.path === "/binary/capabilities") return session.binary?.capabilities ?? {};
+    if (parsed.path === "/binary/signing") return session.binary?.signing ?? null;
+    if (parsed.path === "/binary/entropy") return session.binary?.sectionEntropy ?? [];
+    if (parsed.path === "/anti-analysis") return session.antiAnalysisFindings ?? [];
+    if (parsed.path === "/tags") return session.tags ?? {};
+    if (parsed.path === "/hypotheses") return session.hypotheses ?? [];
     if (parsed.path === "/names") return session.names ?? [];
     if (parsed.path === "/bookmarks") return session.bookmarks ?? [];
     if (parsed.path === "/comments") return session.comments ?? [];
@@ -203,6 +213,12 @@ export class KnowledgeStore {
       ["hopper://binary/imports", "Imported symbols"],
       ["hopper://binary/exports", "Exported symbols"],
       ["hopper://binary/strings", "String index"],
+      ["hopper://binary/capabilities", "Imports bucketed by capability"],
+      ["hopper://binary/signing", "Code signing + entitlements"],
+      ["hopper://binary/entropy", "Section entropy"],
+      ["hopper://anti-analysis", "Anti-analysis findings"],
+      ["hopper://tags", "Address tags"],
+      ["hopper://hypotheses", "Researcher hypotheses"],
       ["hopper://names", "Named addresses"],
       ["hopper://bookmarks", "Bookmarks"],
       ["hopper://comments", "Prefix comments"],
@@ -243,6 +259,10 @@ export class KnowledgeStore {
         inlineComments: (session.inlineComments ?? []).length,
         objcClasses: session.objcClasses.length,
         swiftSymbols: session.swiftSymbols.length,
+        tags: Object.keys(session.tags ?? {}).length,
+        hypotheses: (session.hypotheses ?? []).length,
+        antiAnalysisFindings: (session.antiAnalysisFindings ?? []).length,
+        objcMethods: (session.objcClasses ?? []).reduce((acc, cls) => acc + (cls.methods?.length ?? 0), 0),
       },
       capabilities: session.capabilities,
       updatedAt: session.updatedAt,
@@ -319,8 +339,75 @@ export function normalizeSession(session) {
     exports: session.exports ?? [],
     objcClasses: session.objcClasses ?? [],
     swiftSymbols: session.swiftSymbols ?? [],
+    tags: normalizeTags(session.tags ?? {}),
+    hypotheses: session.hypotheses ?? [],
+    antiAnalysisFindings: session.antiAnalysisFindings ?? [],
     transactions: session.transactions ?? { pending: [] },
   };
+}
+
+function mergeUserAnnotations(target, existing) {
+  if (Object.keys(existing.tags ?? {}).length) target.tags = existing.tags;
+  if ((existing.hypotheses ?? []).length) target.hypotheses = existing.hypotheses;
+  if ((existing.names ?? []).length) target.names = mergeAddressItems(target.names, existing.names);
+  if ((existing.bookmarks ?? []).length) target.bookmarks = mergeAddressItems(target.bookmarks, existing.bookmarks);
+  if ((existing.comments ?? []).length) target.comments = mergeAddressItems(target.comments, existing.comments);
+  if ((existing.inlineComments ?? []).length) target.inlineComments = mergeAddressItems(target.inlineComments, existing.inlineComments);
+  if (existing.transactions?.pending?.length) target.transactions = existing.transactions;
+  if ((existing.antiAnalysisFindings ?? []).length && !(target.antiAnalysisFindings ?? []).length) {
+    target.antiAnalysisFindings = existing.antiAnalysisFindings;
+  }
+  if (existing.cursor && Object.keys(existing.cursor).length && !Object.keys(target.cursor ?? {}).length) {
+    target.cursor = existing.cursor;
+  }
+
+  for (const [addr, existingFn] of Object.entries(existing.functions ?? {})) {
+    const newFn = target.functions[addr];
+    if (!newFn) continue;
+    if (existingFn.name && existingFn.name !== newFn.name && !isAutoName(existingFn.name)) {
+      newFn.name = existingFn.name;
+    }
+    if (existingFn.comment) newFn.comment = existingFn.comment;
+    if (existingFn.inlineComments && Object.keys(existingFn.inlineComments).length) {
+      newFn.inlineComments = { ...(newFn.inlineComments ?? {}), ...existingFn.inlineComments };
+    }
+    if (existingFn.type) newFn.type = existingFn.type;
+    if (existingFn.summary && !newFn.summary) newFn.summary = existingFn.summary;
+    if (existingFn.confidence != null && (newFn.confidence ?? 0) < existingFn.confidence) {
+      newFn.confidence = existingFn.confidence;
+    }
+  }
+}
+
+function mergeAddressItems(target, existing) {
+  const merged = new Map();
+  for (const item of target ?? []) {
+    if (item?.addr) merged.set(item.addr, item);
+  }
+  for (const item of existing ?? []) {
+    if (item?.addr && !merged.has(item.addr)) merged.set(item.addr, item);
+  }
+  return [...merged.values()];
+}
+
+function isAutoName(name) {
+  if (!name) return true;
+  if (/^sub_[0-9a-f]+$/i.test(name)) return true;
+  if (/^proc_[0-9a-f]+$/i.test(name)) return true;
+  if (/^fcn_[0-9a-f]+$/i.test(name)) return true;
+  if (/^loc_[0-9a-f]+$/i.test(name)) return true;
+  if (name === "__mh_execute_header") return true;
+  return false;
+}
+
+function normalizeTags(tags) {
+  const out = {};
+  for (const [addr, value] of Object.entries(tags ?? {})) {
+    const key = formatAddress(addr);
+    const list = Array.isArray(value) ? value : [value];
+    out[key] = [...new Set(list.map(String))].sort();
+  }
+  return out;
 }
 
 function normalizeAddressItems(items) {

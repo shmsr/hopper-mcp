@@ -2,11 +2,29 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { promisify } from "node:util";
+import {
+  classifyImports,
+  detectAntiAnalysis,
+  computeSectionEntropy,
+  extractCodeSigning,
+  extractObjCRuntime,
+  computeImphash,
+  buildFunctionFingerprint,
+  discoverX86Functions,
+} from "./research-tools.js";
 
 const execFileAsync = promisify(execFile);
 const PREFERRED_ARCHS = ["arm64e", "arm64", "x86_64"];
 
-export async function importMachO(path, { arch = "auto", maxStrings = 5000, deep = false, maxFunctions = 30000 } = {}) {
+export async function importMachO(path, {
+  arch = "auto",
+  maxStrings = 5000,
+  deep = false,
+  maxFunctions = 30000,
+  includeSigning = true,
+  includeEntropy = true,
+  includeObjC = true,
+} = {}) {
   const archSelection = await resolveMachOArch(path, arch);
   const selectedArch = archSelection.arch;
   const [fileInfo, libraries, symbols, stringRows, loadCommands] = await Promise.all([
@@ -20,16 +38,40 @@ export async function importMachO(path, { arch = "auto", maxStrings = 5000, deep
   const parsedSymbols = parseNm(symbols.stdout);
   const imports = parsedSymbols.imports;
   const exportedFunctions = parsedSymbols.defined.slice(0, 1000);
-  const strings = parseStringsWithOffsets(stringRows.stdout, maxStrings, parseOffsetMaps(loadCommands.stdout));
+  const loadCommandData = parseLoadCommands(loadCommands.stdout);
+  const strings = parseStringsWithOffsets(stringRows.stdout, maxStrings, loadCommandData.offsetMaps);
   const dylibs = parseDylibs(libraries.stdout);
   const binaryId = createHash("sha256").update(`${path}:${selectedArch}:${fileInfo.stdout}`).digest("hex").slice(0, 16);
 
   let functions = buildFunctions({ exportedFunctions, imports, strings, dylibs });
 
   if (deep) {
-    const discovery = await discoverFunctionsFromDisassembly(path, { arch: selectedArch, maxFunctions });
+    const isIntel = /^(?:x86_64|x86_64h|i386)$/.test(selectedArch);
+    const discovery = isIntel
+      ? await discoverX86Functions(path, { arch: selectedArch, maxFunctions })
+      : await discoverFunctionsFromDisassembly(path, { arch: selectedArch, maxFunctions });
     functions = mergeFunctionSets(functions, discovery, strings);
   }
+
+  const capabilities = classifyImports(imports);
+  const sessionImports = imports;
+  for (const fn of functions) {
+    fn.fingerprint = buildFunctionFingerprint(fn, sessionImports);
+    if (fn.imports?.length) {
+      fn.capabilityTags = capabilityTagsFor(fn.imports, capabilities);
+    }
+  }
+
+  const objcClasses = includeObjC
+    ? await safe(() => extractObjCRuntime(path, selectedArch, { maxClasses: 1000 }), inferObjCClasses(strings))
+    : inferObjCClasses(strings);
+
+  const signing = includeSigning ? await safe(() => extractCodeSigning(path), null) : null;
+  const sectionEntropy = includeEntropy ? await safe(() => computeSectionEntropy(path, selectedArch), []) : [];
+
+  const sessionStub = { imports, strings };
+  const antiAnalysisFindings = detectAntiAnalysis(sessionStub);
+  const imphash = computeImphash(imports);
 
   return {
     sessionId: `real-${binaryId}`,
@@ -43,6 +85,11 @@ export async function importMachO(path, { arch = "auto", maxStrings = 5000, deep
       availableArchs: archSelection.availableArchs,
       fileInfo: fileInfo.stdout.trim(),
       libraries: dylibs,
+      capabilities,
+      signing,
+      sectionEntropy,
+      imphash,
+      segments: loadCommandData.segments,
     },
     capabilities: {
       officialApi: false,
@@ -53,10 +100,29 @@ export async function importMachO(path, { arch = "auto", maxStrings = 5000, deep
     imports,
     exports: exportedFunctions.map((symbol) => symbol.name),
     strings,
-    objcClasses: inferObjCClasses(strings),
+    objcClasses,
     swiftSymbols: imports.filter((name) => name.startsWith("_$s")).slice(0, 500),
     functions,
+    antiAnalysisFindings,
   };
+}
+
+function capabilityTagsFor(funcImports, buckets) {
+  const tags = new Set();
+  for (const sym of funcImports) {
+    for (const [bucket, list] of Object.entries(buckets)) {
+      if (list.includes(sym)) tags.add(bucket);
+    }
+  }
+  return [...tags].sort();
+}
+
+async function safe(fn, fallback) {
+  try {
+    return await fn();
+  } catch {
+    return fallback;
+  }
 }
 
 export async function searchMachOStrings(path, pattern, { maxMatches = 50, minLength = 8 } = {}) {
@@ -688,29 +754,42 @@ function looksLikeInstructionNoise(value) {
   return /^(AWAV|[A-Z]\[A\\A|[a-z]{2,8}\.[a-z0-9]+$)/.test(value);
 }
 
-function parseOffsetMaps(output) {
-  const allSections = [];
-  const stringSections = [];
+function parseLoadCommands(output) {
   const segments = [];
+  const allSectionMaps = [];
+  const stringSectionMaps = [];
   let currentSegment = null;
   let currentSection = null;
 
   const finalizeSection = () => {
     if (
+      currentSegment &&
       currentSection &&
       Number.isFinite(currentSection.fileStart) &&
       Number.isFinite(currentSection.vmStart) &&
-      Number.isFinite(currentSection.size) &&
-      currentSection.size > 0
+      Number.isFinite(currentSection.size)
     ) {
-      const mapping = {
+      const sectionRecord = {
+        name: currentSection.sectname ?? null,
+        segname: currentSection.segname ?? currentSegment.segname ?? null,
+        start: fmtAddr(currentSection.vmStart),
+        end: fmtAddr(currentSection.vmStart + currentSection.size),
+        length: currentSection.size,
         fileStart: currentSection.fileStart,
         fileEnd: currentSection.fileStart + currentSection.size,
-        vmStart: currentSection.vmStart,
-        priority: stringSectionPriority(currentSection),
       };
-      allSections.push(mapping);
-      if (mapping.priority !== null) stringSections.push(mapping);
+      currentSegment.sections.push(sectionRecord);
+
+      if (currentSection.size > 0) {
+        const mapping = {
+          fileStart: currentSection.fileStart,
+          fileEnd: currentSection.fileStart + currentSection.size,
+          vmStart: currentSection.vmStart,
+          priority: stringSectionPriority(currentSection),
+        };
+        allSectionMaps.push(mapping);
+        if (mapping.priority !== null) stringSectionMaps.push(mapping);
+      }
     }
     currentSection = null;
   };
@@ -721,14 +800,21 @@ function parseOffsetMaps(output) {
       currentSegment &&
       Number.isFinite(currentSegment.fileStart) &&
       Number.isFinite(currentSegment.vmStart) &&
-      Number.isFinite(currentSegment.size) &&
-      currentSegment.size > 0
+      Number.isFinite(currentSegment.size)
     ) {
+      const initprot = Number.isFinite(currentSegment.initprot) ? currentSegment.initprot : 0;
       segments.push({
+        name: currentSegment.segname ?? null,
+        start: fmtAddr(currentSegment.vmStart),
+        end: fmtAddr(currentSegment.vmStart + (currentSegment.vmSize ?? currentSegment.size)),
+        length: currentSegment.vmSize ?? currentSegment.size,
         fileStart: currentSegment.fileStart,
         fileEnd: currentSegment.fileStart + currentSegment.size,
-        vmStart: currentSegment.vmStart,
-        priority: 100,
+        protection: protString(initprot),
+        readable: Boolean(initprot & 0x1),
+        writable: Boolean(initprot & 0x2),
+        executable: Boolean(initprot & 0x4),
+        sections: currentSegment.sections,
       });
     }
     currentSegment = null;
@@ -740,8 +826,8 @@ function parseOffsetMaps(output) {
       finalizeSegment();
       continue;
     }
-    if (line === "cmd LC_SEGMENT_64") {
-      currentSegment = {};
+    if (line === "cmd LC_SEGMENT_64" || line === "cmd LC_SEGMENT") {
+      currentSegment = { sections: [] };
       continue;
     }
     if (line === "Section") {
@@ -760,16 +846,36 @@ function parseOffsetMaps(output) {
       continue;
     }
     if (currentSegment) {
+      if (key === "segname") currentSegment.segname = value;
       if (key === "vmaddr") currentSegment.vmStart = parseInt(value, 16);
+      if (key === "vmsize") currentSegment.vmSize = parseInt(value, 16);
       if (key === "filesize") currentSegment.size = parseInt(value, 16);
       if (key === "fileoff") currentSegment.fileStart = parseInt(value, 10);
+      if (key === "initprot") currentSegment.initprot = parseInt(value, 16);
+      if (key === "maxprot") currentSegment.maxprot = parseInt(value, 16);
     }
   }
   finalizeSegment();
 
-  if (stringSections.length) return stringSections;
-  if (allSections.length) return allSections;
-  return segments;
+  let offsetMaps;
+  if (stringSectionMaps.length) offsetMaps = stringSectionMaps;
+  else if (allSectionMaps.length) offsetMaps = allSectionMaps;
+  else {
+    offsetMaps = segments
+      .filter((seg) => seg.fileEnd > seg.fileStart)
+      .map((seg) => ({
+        fileStart: seg.fileStart,
+        fileEnd: seg.fileEnd,
+        vmStart: parseInt(seg.start.replace("0x", ""), 16),
+        priority: 100,
+      }));
+  }
+
+  return { offsetMaps, segments };
+}
+
+function protString(prot) {
+  return `${prot & 0x1 ? "r" : "-"}${prot & 0x2 ? "w" : "-"}${prot & 0x4 ? "x" : "-"}`;
 }
 
 function offsetToVmAddress(offset, maps) {

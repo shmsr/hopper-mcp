@@ -9,13 +9,18 @@
   },
   "scripts": {
     "start": "node ./src/mcp-server.js",
-    "check": "node --check ./src/mcp-server.js && node --check ./src/hopper-live.js && node --check ./src/macho-importer.js && node --check ./src/official-hopper-backend.js && node --check ./src/official-snapshot.js && node --check ./src/knowledge-store.js && node --check ./src/transaction-manager.js && node --check ./test/protocol-compat.mjs && node --check ./test/smoke.mjs && node --check ./test/real-app.mjs && node --check ./test/live-hopper.mjs && node --check ./test/official-backend.mjs && node --check ./test/all-tools-real.mjs",
+    "check": "node --check ./src/mcp-server.js && node --check ./src/hopper-live.js && node --check ./src/macho-importer.js && node --check ./src/official-hopper-backend.js && node --check ./src/official-snapshot.js && node --check ./src/knowledge-store.js && node --check ./src/transaction-manager.js && node --check ./src/research-tools.js && node --check ./test/protocol-compat.mjs && node --check ./test/smoke.mjs && node --check ./test/real-app.mjs && node --check ./test/live-hopper.mjs && node --check ./test/official-backend.mjs && node --check ./test/all-tools-real.mjs && node --check ./test/research-tools.mjs && node --check ./test/research-integration.mjs && node --check ./test/multi-binary.mjs && node --check ./test/deep-coverage.mjs && node --check ./test/binary-zoo.mjs && node --check ./test/live-hopper-aggressive.mjs",
     "smoke": "node ./test/smoke.mjs",
     "test:protocol": "node ./test/protocol-compat.mjs",
     "test:real": "node ./test/real-app.mjs",
     "test:live": "node ./test/live-hopper.mjs",
     "test:official": "node ./test/official-backend.mjs",
-    "test:tools": "node ./test/all-tools-real.mjs"
+    "test:tools": "node ./test/all-tools-real.mjs",
+    "test:research": "node --test ./test/research-tools.mjs && node ./test/research-integration.mjs",
+    "test:multi": "node ./test/multi-binary.mjs",
+    "test:deep": "node ./test/deep-coverage.mjs",
+    "test:zoo": "node ./test/binary-zoo.mjs",
+    "test:live:aggressive": "node ./test/live-hopper-aggressive.mjs"
   },
   "engines": {
     "node": ">=20"

@@ -26,10 +26,9 @@ export class HopperAdapter {
     });
   }
 
-  async ingestCurrentDocument(options) {
-    throw new Error("Current-document ingest is not supported by Hopper's AppleScript interface. Use ingest_live_hopper or import_macho until the in-process bridge is available.");
-  }
-
+  // Default branch of commit_transaction when args.backend !== "official".
+  // The in-process Hopper plugin bridge isn't connected, so we report a
+  // no-op adapter result; the knowledge-store mutations still apply.
   async applyTransaction(_session, transaction) {
     return {
       appliedToHopper: false,

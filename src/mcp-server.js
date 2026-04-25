@@ -21,7 +21,10 @@ const serverInfo = {
   description: "MCP server for Hopper with resources, tools, prompts, and transaction-safe annotations.",
 };
 
-const store = new KnowledgeStore(process.env.HOPPER_MCP_STORE ?? join(ROOT, "data", "knowledge-store.json"));
+const store = new KnowledgeStore(
+  process.env.HOPPER_MCP_STORE ?? join(ROOT, "data", "knowledge-store.json"),
+  { sessionCap: Number(process.env.HOPPER_MCP_SESSION_CAP) || undefined },
+);
 const transactions = new TransactionManager(store);
 const adapter = new HopperAdapter({
   socketPath: process.env.HOPPER_MCP_SOCKET ?? null,

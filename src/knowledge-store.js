@@ -4,12 +4,20 @@ import { dirname } from "node:path";
 const EMPTY_STORE = {
   schemaVersion: 1,
   sessions: {},
-  snapshots: {},
 };
 
+const DEFAULT_SESSION_CAP = 16;
+
 export class KnowledgeStore {
-  constructor(path) {
+  // sessionCap bounds how many ingested sessions live on disk; the long-running
+  // server otherwise grows unbounded as users open binary after binary (we have
+  // observed >100 MiB stores in practice). The current session is never
+  // evicted; older entries are dropped by `updatedAt`.
+  constructor(path, { sessionCap = DEFAULT_SESSION_CAP } = {}) {
     this.path = path;
+    this.sessionCap = Number.isFinite(Number(sessionCap)) && Number(sessionCap) > 0
+      ? Math.floor(Number(sessionCap))
+      : DEFAULT_SESSION_CAP;
     this.state = structuredClone(EMPTY_STORE);
     this._savePromise = null;
   }
@@ -90,11 +98,33 @@ export class KnowledgeStore {
     if (existing) mergeUserAnnotations(normalized, existing);
     this.state.sessions[sessionId] = normalized;
     this.state.currentSessionId = sessionId;
+    this.pruneStaleSessions();
     // Background save: importer paths can produce ~100 MB stringify; keep
     // the response off the event-loop stall. Annotation tools that need
     // durability still call await store.save() explicitly.
     this.scheduleSave();
     return normalized;
+  }
+
+  // Drop oldest sessions (by updatedAt) once we exceed the cap, keeping the
+  // current session pinned. Returns the IDs that were evicted so callers can
+  // log if they want — no caller currently does, but it makes the behaviour
+  // testable without inspecting state directly.
+  pruneStaleSessions(cap = this.sessionCap) {
+    const ids = Object.keys(this.state.sessions);
+    if (ids.length <= cap) return [];
+    const current = this.state.currentSessionId;
+    const evictable = ids
+      .filter((id) => id !== current)
+      .map((id) => this.state.sessions[id])
+      .sort((a, b) => String(a.updatedAt ?? "").localeCompare(String(b.updatedAt ?? "")));
+    const overflow = ids.length - cap;
+    const evicted = [];
+    for (const session of evictable.slice(0, overflow)) {
+      delete this.state.sessions[session.sessionId];
+      evicted.push(session.sessionId);
+    }
+    return evicted;
   }
 
   resolve(query, sessionId = "current") {
@@ -236,43 +266,6 @@ export class KnowledgeStore {
     if (graphMatch) return this.getGraphSlice(graphMatch[2], { kind: graphMatch[1], radius: Number(parsed.query.get("radius") ?? 1) });
 
     throw new Error(`Unknown resource URI: ${uri}`);
-  }
-
-  listResources() {
-    const resources = [
-      ["hopper://session/current", "Current Hopper session"],
-      ["hopper://binary/metadata", "Binary metadata"],
-      ["hopper://binary/imports", "Imported symbols"],
-      ["hopper://binary/exports", "Exported symbols"],
-      ["hopper://binary/strings", "String index"],
-      ["hopper://binary/capabilities", "Imports bucketed by capability"],
-      ["hopper://binary/signing", "Code signing + entitlements"],
-      ["hopper://binary/entropy", "Section entropy"],
-      ["hopper://anti-analysis", "Anti-analysis findings"],
-      ["hopper://tags", "Address tags"],
-      ["hopper://hypotheses", "Researcher hypotheses"],
-      ["hopper://names", "Named addresses"],
-      ["hopper://bookmarks", "Bookmarks"],
-      ["hopper://comments", "Prefix comments"],
-      ["hopper://inline-comments", "Inline comments"],
-      ["hopper://cursor", "Captured cursor"],
-      ["hopper://functions", "Function index"],
-      ["hopper://objc/classes", "Objective-C classes"],
-      ["hopper://swift/symbols", "Swift symbols"],
-      ["hopper://transactions/pending", "Pending annotation transactions"],
-    ];
-
-    try {
-      const session = this.getSession();
-      for (const fn of Object.values(session.functions).slice(0, 100)) {
-        resources.push([`hopper://function/${fn.addr}`, `Function ${fn.name ?? fn.addr}`]);
-        resources.push([`hopper://function/${fn.addr}/evidence`, `Evidence for ${fn.name ?? fn.addr}`]);
-      }
-    } catch {
-      // No loaded session yet. The static resource list is still useful.
-    }
-
-    return resources.map(([uri, name]) => ({ uri, name, mimeType: "application/json" }));
   }
 
   describeSession(session) {

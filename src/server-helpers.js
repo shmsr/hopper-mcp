@@ -19,11 +19,6 @@ export function sessionOrNull(store, sessionId) {
   }
 }
 
-export function getSessionSegments(store, sessionId) {
-  const session = store.getSession(sessionId);
-  return session.binary?.segments ?? [];
-}
-
 export function listProcedures(store, sessionId, { maxResults } = {}) {
   const session = store.getSession(sessionId);
   return limitResults(
@@ -157,15 +152,6 @@ export function snapshotXrefs(store, address, sessionId) {
   }
 
   return [...new Set(refs.filter(Boolean).map(formatAddress))];
-}
-
-export function lookupName(store, address, sessionId) {
-  const session = store.getSession(sessionId);
-  const target = formatAddress(address);
-  const named = (session.names ?? []).find((item) => formatAddress(item.addr) === target);
-  if (named) return named;
-  const fn = session.functions?.[target];
-  return { addr: target, name: fn?.name ?? null, demangled: null };
 }
 
 export function limitResults(items, maxResults) {

@@ -60,8 +60,8 @@ try {
     _meta: { progressToken: "ingest-sample-test" },
   });
   const strings = await rpc(6, "tools/call", {
-    name: "search_strings",
-    arguments: { regex: "license" },
+    name: "search",
+    arguments: { kind: "strings", pattern: "license" },
   });
   const matches = await rpc(7, "tools/call", {
     name: "resolve",
@@ -100,8 +100,8 @@ try {
   if (!ingest.structuredContent?.counts?.functions) {
     throw new Error("Tool call did not return structuredContent with the ingested session counts.");
   }
-  if (!Array.isArray(strings.structuredContent?.result)) {
-    throw new Error("Array tool result was not wrapped in structuredContent.result.");
+  if (!strings.structuredContent || typeof strings.structuredContent !== "object" || Array.isArray(strings.structuredContent)) {
+    throw new Error("search kind=strings did not return an object payload (addr→value).");
   }
   if (!Array.isArray(matches.structuredContent?.result)) {
     throw new Error("Resolve tool result was not wrapped in structuredContent.result.");

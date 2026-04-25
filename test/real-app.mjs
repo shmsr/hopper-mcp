@@ -47,7 +47,7 @@ const metadata = await rpc("resources/read", { uri: "hopper://binary/metadata" }
 const resources = await rpc("resources/list");
 const security = await rpc("tools/call", { name: "resolve", arguments: { query: "Security" } });
 const xpc = await rpc("tools/call", { name: "resolve", arguments: { query: "_xpc_" } });
-const strings = await rpc("tools/call", { name: "search_strings", arguments: { regex: "Hopper|XPC|BinExport", semantic: true } });
+const strings = await rpc("tools/call", { name: "search", arguments: { kind: "strings", pattern: "Hopper|XPC|BinExport", semantic: true } });
 
 const targetFunction = session.functions.find((fn) => fn.name === "security_api_cluster") ?? session.functions[0];
 const analysis = await rpc("tools/call", {
@@ -60,14 +60,19 @@ const begin = await rpc("tools/call", {
   arguments: { name: "real app test annotation", rationale: "Verify transactional preview on a real imported Mach-O session." },
 });
 const transactionId = JSON.parse(begin.content[0].text).transactionId;
-const preview = await rpc("tools/call", {
-  name: "queue_comment",
+await rpc("tools/call", {
+  name: "queue",
   arguments: {
+    kind: "comment",
     transaction_id: transactionId,
     addr: targetFunction.addr,
-    comment: "Real-app MCP test annotation; do not apply to Hopper until adapter bridge is connected.",
+    value: "Real-app MCP test annotation; do not apply to Hopper until adapter bridge is connected.",
     rationale: "This validates queue/preview semantics using a real imported binary session.",
   },
+});
+const preview = await rpc("tools/call", {
+  name: "preview_transaction",
+  arguments: { transaction_id: transactionId },
 });
 await rpc("tools/call", { name: "rollback_transaction", arguments: { transaction_id: transactionId } });
 

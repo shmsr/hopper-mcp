@@ -76,15 +76,17 @@ try {
   const txn = await callTool("begin_transaction", { name: "research integration", rationale: "Exercise new tools." });
   const txnId = txn.transactionId;
 
-  await callTool("queue_tag", { transaction_id: txnId, addr: "0x100003f50", tags: ["license", "crypto"] });
+  await callTool("queue", { kind: "tag", transaction_id: txnId, addr: "0x100003f50", tags: ["license", "crypto"] });
 
-  await callTool("queue_rename_batch", {
+  await callTool("queue", {
+    kind: "rename_batch",
     transaction_id: txnId,
     mapping: { "0x100003f50": "validate_license_key", "0x100004120": "main_dispatch" },
     rationale: "Batch rename via new tool.",
   });
 
-  const hyp = await callTool("create_hypothesis", {
+  const hyp = await callTool("hypothesis", {
+    action: "create",
     transaction_id: txnId,
     topic: "License validation path",
     claim: "0x100003f50 implements license verification using SHA256 + keychain.",
@@ -92,16 +94,18 @@ try {
   });
   // hyp is a transaction preview - extract hypothesisId from operations
   const hypothesisId = hyp.operations.find((op) => op.kind === "hypothesis_create").hypothesisId;
-  assert.ok(hypothesisId, "hypothesis_create must yield a hypothesisId");
+  assert.ok(hypothesisId, "hypothesis action=create must yield a hypothesisId");
 
-  await callTool("link_evidence", {
+  await callTool("hypothesis", {
+    action: "link",
     transaction_id: txnId,
     hypothesis_id: hypothesisId,
     addr: "0x100003f50",
     evidence: "Calls _CC_SHA256 and SecKeychainItemCopyContent.",
   });
 
-  await callTool("set_hypothesis_status", {
+  await callTool("hypothesis", {
+    action: "status",
     transaction_id: txnId,
     hypothesis_id: hypothesisId,
     status: "supported",
@@ -112,10 +116,12 @@ try {
   const commit = await callTool("commit_transaction", { transaction_id: txnId });
   assert.equal(commit.status, "committed");
 
-  const tags = await callTool("list_tags", {});
+  const tagsResult = await rpc("resources/read", { uri: "hopper://tags" });
+  const tags = JSON.parse(tagsResult.contents[0].text);
   assert.deepEqual(tags["0x100003f50"], ["crypto", "license"]);
 
-  const hyps = await callTool("list_hypotheses", {});
+  const hypsResult = await rpc("resources/read", { uri: "hopper://hypotheses" });
+  const hyps = JSON.parse(hypsResult.contents[0].text);
   assert.equal(hyps.length, 1);
   assert.equal(hyps[0].status, "supported");
   assert.equal(hyps[0].evidence.length, 1);

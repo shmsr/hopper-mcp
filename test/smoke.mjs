@@ -43,14 +43,19 @@ const summary = await rpc("resources/read", { uri: "hopper://function/0x100003f5
 const analysis = await rpc("tools/call", { name: "analyze_function_deep", arguments: { addr: "0x100003f50" } });
 const transaction = await rpc("tools/call", { name: "begin_transaction", arguments: { name: "smoke rename", rationale: "Verify transactional writes." } });
 const transactionId = JSON.parse(transaction.content[0].text).transactionId;
-const preview = await rpc("tools/call", {
-  name: "queue_rename",
+await rpc("tools/call", {
+  name: "queue",
   arguments: {
+    kind: "rename",
     transaction_id: transactionId,
     addr: "0x100003f50",
-    new_name: "validate_license_key",
+    value: "validate_license_key",
     rationale: "Smoke test evidence references keychain and SHA256.",
   },
+});
+const preview = await rpc("tools/call", {
+  name: "preview_transaction",
+  arguments: { transaction_id: transactionId },
 });
 const commit = await rpc("tools/call", { name: "commit_transaction", arguments: { transaction_id: transactionId } });
 const text = analysis.content[0].text;

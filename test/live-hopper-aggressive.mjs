@@ -91,6 +91,13 @@ async function callTool(name, args = {}, opts = {}) {
   return payload(await rpc("tools/call", { name, arguments: args }, opts), opts);
 }
 
+async function readResource(uri, opts = {}) {
+  const result = await rpc("resources/read", { uri }, opts);
+  const text = result?.contents?.[0]?.text;
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return text; }
+}
+
 function normalizeAddr(value) {
   if (value == null) return null;
   if (typeof value === "number" && Number.isFinite(value)) return `0x${value.toString(16)}`;
@@ -172,62 +179,66 @@ try {
     console.log(`  ✓ ${tag} session=${ingested.session.sessionId.slice(0, 24)} fns=${ingested.session.counts.functions} strings=${ingested.session.counts.strings} elapsed=${elapsed}ms launch=${ingested.launch?.mode ?? "?"} skipped=${Boolean(ingested.launch?.skipped)}`);
 
     console.log(`  [B${i + 1}.tools] live mirror queries on ${tag}…`);
-    const docName = await callTool("current_document", {});
-    assert.equal(typeof docName, "string", `${tag}: current_document not a string`);
-    assert.equal(docName, tag, `${tag}: current_document=${docName} did not switch to active target`);
+    const sessionInfo = await readResource(`hopper://session/current?session_id=${ingested.session.sessionId}`);
+    const docName = sessionInfo?.binary?.name;
+    assert.equal(typeof docName, "string", `${tag}: hopper://session/current binary.name not a string`);
 
-    const segments = await callTool("list_segments", {});
-    assert.ok(segments && (Array.isArray(segments) || typeof segments === "object"), `${tag}: list_segments shape wrong`);
+    const metadata = await readResource(`hopper://binary/metadata?session_id=${ingested.session.sessionId}`);
+    const segments = metadata?.segments;
+    assert.ok(Array.isArray(segments), `${tag}: hopper://binary/metadata.segments missing`);
 
-    const procIndex = await callTool("list_procedures", { max_results: 20 });
+    const procIndex = await callTool("list_procedures", { session_id: ingested.session.sessionId, max_results: 20 });
     const procs = summarizeProcedures(procIndex);
     if (!procs.length) {
       const sample = JSON.stringify(procIndex).slice(0, 400);
       throw new Error(`${tag}: list_procedures returned 0 usable entries; raw sample=${sample}`);
     }
-    console.log(`    list_procedures=${procs.length} list_segments=${Array.isArray(segments) ? segments.length : Object.keys(segments).length}`);
+    console.log(`    list_procedures=${procs.length} segments=${segments.length}`);
 
     const samples = pickProcedureSamples(procs, 4);
     assert.ok(samples.length >= 1, `${tag}: no usable procedure samples`);
 
     console.log(`    drilling ${samples.length} procedures (info/assembly/callers/callees)…`);
     for (const sample of samples) {
-      const info = await callTool("procedure_info", { procedure: sample.addr });
-      assert.ok(info && typeof info === "object", `${tag}: procedure_info empty for ${sample.addr}`);
-      const asm = await callTool("procedure_assembly", { procedure: sample.addr });
-      assert.ok(asm, `${tag}: procedure_assembly empty for ${sample.addr}`);
-      const callers = await callTool("procedure_callers", { procedure: sample.addr });
-      const callees = await callTool("procedure_callees", { procedure: sample.addr });
+      const info = await callTool("procedure", { field: "info", procedure: sample.addr, session_id: ingested.session.sessionId });
+      assert.ok(info && typeof info === "object", `${tag}: procedure field=info empty for ${sample.addr}`);
+      const asm = await callTool("procedure", { field: "assembly", procedure: sample.addr, session_id: ingested.session.sessionId });
+      assert.ok(asm, `${tag}: procedure field=assembly empty for ${sample.addr}`);
+      const callers = await callTool("procedure", { field: "callers", procedure: sample.addr, session_id: ingested.session.sessionId });
+      const callees = await callTool("procedure", { field: "callees", procedure: sample.addr, session_id: ingested.session.sessionId });
       assert.ok(callers !== undefined && callees !== undefined, `${tag}: callers/callees undefined for ${sample.addr}`);
     }
 
-    console.log(`    parallel procedure_info×${samples.length}…`);
-    const parallel = await Promise.all(samples.map((s) => callTool("procedure_info", { procedure: s.addr })));
+    console.log(`    parallel procedure field=info × ${samples.length}…`);
+    const parallel = await Promise.all(
+      samples.map((s) => callTool("procedure", { field: "info", procedure: s.addr, session_id: ingested.session.sessionId })),
+    );
     assert.equal(parallel.length, samples.length, `${tag}: parallel info length mismatch`);
     parallel.forEach((p, idx) => assert.ok(p, `${tag}: parallel info index ${idx} empty`));
 
-    console.log(`    list_strings + list_names + list_bookmarks…`);
-    const strings = await callTool("list_strings", { max_results: 25 });
-    const names = await callTool("list_names", { max_results: 25 });
-    const bookmarks = await callTool("list_bookmarks", {});
-    assert.ok(strings, `${tag}: list_strings null`);
-    assert.ok(names, `${tag}: list_names null`);
-    assert.ok(bookmarks !== undefined, `${tag}: list_bookmarks undefined`);
+    console.log(`    hopper://binary/strings + hopper://names + hopper://bookmarks…`);
+    const strings = await readResource(`hopper://binary/strings?session_id=${ingested.session.sessionId}`);
+    const names = await readResource(`hopper://names?session_id=${ingested.session.sessionId}`);
+    const bookmarks = await readResource(`hopper://bookmarks?session_id=${ingested.session.sessionId}`);
+    assert.ok(Array.isArray(strings), `${tag}: hopper://binary/strings not an array`);
+    assert.ok(Array.isArray(names), `${tag}: hopper://names not an array`);
+    assert.ok(Array.isArray(bookmarks), `${tag}: hopper://bookmarks not an array`);
 
-    console.log(`    address_name + procedure_address round-trip…`);
+    console.log(`    resolve(addr) + resolve(name) round-trip…`);
     const firstSample = samples[0];
-    const nameAtAddr = await callTool("address_name", { address: firstSample.addr });
-    assert.equal(typeof nameAtAddr, "string", `${tag}: address_name not a string`);
+    const resolvedByAddr = await callTool("resolve", { query: firstSample.addr, session_id: ingested.session.sessionId });
+    assert.ok(Array.isArray(resolvedByAddr), `${tag}: resolve(addr) not an array`);
     if (firstSample.name && !/^sub_/.test(firstSample.name)) {
-      const reverseAddr = await callTool("procedure_address", { procedure: firstSample.name }, { allowError: true });
-      assert.ok(reverseAddr !== null, `${tag}: procedure_address(name=${firstSample.name}) returned null`);
+      const reverseResolve = await callTool("resolve", { query: firstSample.name, session_id: ingested.session.sessionId }, { allowError: true });
+      assert.ok(Array.isArray(reverseResolve) && reverseResolve.length > 0, `${tag}: resolve(name=${firstSample.name}) returned empty`);
     }
   }
 
-  console.log("[C] re-ingest first target (must reuse current_document if active)…");
+  console.log("[C] re-ingest first target (must reuse current document if active)…");
   const firstTarget = targets[0];
   const firstTag = basename(firstTarget);
-  const docNameBefore = await callTool("current_document", {});
+  const docNameBeforeSession = await readResource("hopper://session/current");
+  const docNameBefore = docNameBeforeSession?.binary?.name;
   const reingest1 = await callTool("ingest_live_hopper", {
     executable_path: firstTarget,
     timeout_ms: ingestTimeoutMs,
@@ -258,11 +269,12 @@ try {
   const someProc = summarizeProcedures(await callTool("list_procedures", { session_id: session.sessionId, max_results: 5 }))[0];
   if (someProc?.addr) {
     const txn = await callTool("begin_transaction", { session_id: session.sessionId, name: "live commit attempt" });
-    await callTool("queue_comment", {
+    await callTool("queue", {
+      kind: "comment",
       session_id: session.sessionId,
       transaction_id: txn.transactionId,
       addr: someProc.addr,
-      comment: "live test attempted comment",
+      value: "live test attempted comment",
     });
     const commitErr = await callTool("commit_transaction", {
       session_id: session.sessionId,
@@ -273,11 +285,11 @@ try {
     console.log(`  ✓ live commit blocked`);
   }
 
-  console.log("[F] refresh_snapshot (official snapshot rebuild against live Hopper)…");
-  const snapshot = await callTool("refresh_snapshot", { max_procedures: 5, include_procedure_info: true }, { timeoutMs: ingestTimeoutMs });
-  assert.ok(snapshot.session?.sessionId, "refresh_snapshot did not return a session");
-  assert.equal(snapshot.source, "official-hopper-mcp", `refresh_snapshot source=${snapshot.source}`);
-  assert.ok(snapshot.session.counts.functions <= 5, `refresh_snapshot honoured max_procedures (got ${snapshot.session.counts.functions})`);
+  console.log("[F] ingest_official_hopper (official snapshot rebuild against live Hopper)…");
+  const snapshot = await callTool("ingest_official_hopper", { max_procedures: 5, include_procedure_info: true }, { timeoutMs: ingestTimeoutMs });
+  assert.ok(snapshot.session?.sessionId, "ingest_official_hopper did not return a session");
+  assert.equal(snapshot.source, "official-hopper-mcp", `ingest_official_hopper source=${snapshot.source}`);
+  assert.ok(snapshot.session.counts.functions <= 5, `ingest_official_hopper honoured max_procedures (got ${snapshot.session.counts.functions})`);
   console.log(`  ✓ snapshot session=${snapshot.session.sessionId.slice(0, 24)} fns=${snapshot.session.counts.functions}`);
 
   console.log("[G] cross-session diff (imphash + segments + counts)…");
@@ -288,8 +300,8 @@ try {
   const sessionIds = [...sessionsByTarget.values()].map((s) => s.sessionId);
   console.log(`  recorded sessions: ${sessionIds.length} (${sessionIds.map((id) => id.slice(0, 16)).join(", ")})`);
 
-  const allSessions = await callTool("list_documents", {});
-  console.log(`  list_documents → ${Array.isArray(allSessions) ? allSessions.length : "?"} entries: ${JSON.stringify(allSessions).slice(0, 200)}`);
+  const allSessions = (await callTool("capabilities", {}))?.sessions ?? [];
+  console.log(`  capabilities.sessions → ${Array.isArray(allSessions) ? allSessions.length : "?"} entries: ${JSON.stringify(allSessions).slice(0, 200)}`);
 
   if (sessionIds.length >= 2) {
     const diff = await callTool("diff_sessions", {

@@ -44,7 +44,10 @@ try {
   const tools = payload(await rpc("tools/call", { name: "official_hopper_tools", arguments: {} }));
   if (!tools.some((tool) => tool.name === "list_documents")) throw new Error("Official Hopper tools did not include list_documents.");
 
-  const documents = payload(await rpc("tools/call", { name: "list_documents", arguments: { backend: "official" } }));
+  const documents = payload(await rpc("tools/call", {
+    name: "official_hopper_call",
+    arguments: { name: "list_documents", arguments: {} },
+  }));
   if (!Array.isArray(documents)) throw new Error("Official backend list_documents did not return an array.");
 
   const blocked = payload(await rpc("tools/call", {

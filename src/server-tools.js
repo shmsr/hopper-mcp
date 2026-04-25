@@ -27,51 +27,22 @@ import {
   defaultProcedureQuery,
   defaultAddressQuery,
   resolveProcedure,
-  officialSegment,
   officialProcedureInfo,
   assemblyLines,
   snapshotXrefs,
-  lookupName,
   limitResults,
   objectFromFunctions,
   objectFromAddressItems,
   searchStringsOfficial,
-  getSessionSegments,
 } from "./server-helpers.js";
 import { toolResult, boundedNumber, DEFAULT_MAX_TOOL_TEXT_CHARS } from "./server-format.js";
 import { sampleSession } from "./sample-session.js";
-
-const OFFICIAL_MIRROR_TOOLS = new Set([
-  "list_documents",
-  "current_document",
-  "list_segments",
-  "list_procedures",
-  "list_procedure_size",
-  "list_procedure_info",
-  "list_strings",
-  "search_strings",
-  "search_procedures",
-  "procedure_info",
-  "procedure_address",
-  "current_address",
-  "current_procedure",
-  "procedure_assembly",
-  "procedure_pseudo_code",
-  "procedure_callers",
-  "procedure_callees",
-  "xrefs",
-  "list_names",
-  "search_name",
-  "address_name",
-  "list_bookmarks",
-]);
 
 const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
 const READ_OPEN_WORLD = { readOnlyHint: true, openWorldHint: true };
 const WRITE_LOCAL = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const WRITE_LIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
 
-const backendEnum = z.enum(["snapshot", "official"]).optional();
 const optionalString = z.string().optional();
 const optionalNumber = z.number().optional();
 const optionalBool = z.boolean().optional();
@@ -97,12 +68,6 @@ export function registerTools(server, ctx) {
     } catch {}
   };
 
-  const callOfficialMirror = async (name, args) => {
-    const officialArgs = toOfficialArgs(name, args);
-    const result = await officialBackend.callTool(name, officialArgs);
-    return officialToolPayload(result);
-  };
-
   const sessionFor = (args) => args.session_id ?? "current";
 
   // ── meta + lifecycle ────────────────────────────────────────────────────
@@ -110,7 +75,7 @@ export function registerTools(server, ctx) {
     "capabilities",
     {
       title: "Capabilities",
-      description: "Report static/dynamic adapter capabilities.",
+      description: "Report static/dynamic adapter capabilities and the list of loaded sessions.",
       inputSchema: {},
       annotations: READ_ONLY,
     },
@@ -128,7 +93,7 @@ export function registerTools(server, ctx) {
     {
       title: "Official Hopper Call",
       description:
-        "Call Hopper's installed official MCP server. Write/navigation tools require HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1 and confirm_live_write=true.",
+        "Call Hopper's installed official MCP server directly. The single passthrough — name + arguments map to the official tool. Write/navigation tools require HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1 and confirm_live_write=true.",
       inputSchema: {
         name: z.string(),
         arguments: z.record(z.string(), z.any()).optional(),
@@ -183,23 +148,6 @@ export function registerTools(server, ctx) {
   }
 
   // ── ingest + import ────────────────────────────────────────────────────
-  const ingestOfficial = async (args, extra) => {
-    await notifyProgress(extra, 0, 2, "Reading live Hopper document through the official MCP backend.");
-    const snapshot = await buildOfficialSnapshot(officialBackend, {
-      maxProcedures: args.max_procedures,
-      includeProcedureInfo: args.include_procedure_info !== false,
-      includeAssembly: Boolean(args.include_assembly),
-      includePseudocode: Boolean(args.include_pseudocode),
-      includeCallGraph: Boolean(args.include_call_graph),
-      failOnTruncation: Boolean(args.fail_on_truncation),
-    });
-    await notifyProgress(extra, 1, 2, "Updating local snapshot store.");
-    const session = await store.upsertSession(snapshot);
-    notifyResourceListChanged();
-    await notifyProgress(extra, 2, 2, "Official Hopper snapshot refreshed.");
-    return toolResult({ session: store.describeSession(session), source: "official-hopper-mcp" });
-  };
-
   const ingestSchema = {
     max_procedures: optionalNumber,
     include_procedure_info: optionalBool,
@@ -217,19 +165,22 @@ export function registerTools(server, ctx) {
       inputSchema: ingestSchema,
       annotations: WRITE_LOCAL,
     },
-    ingestOfficial,
-  );
-
-  server.registerTool(
-    "refresh_snapshot",
-    {
-      title: "Refresh Snapshot",
-      description:
-        "Alias for ingest_official_hopper: refresh the local snapshot from the live official Hopper backend.",
-      inputSchema: ingestSchema,
-      annotations: WRITE_LOCAL,
+    async (args, extra) => {
+      await notifyProgress(extra, 0, 2, "Reading live Hopper document through the official MCP backend.");
+      const snapshot = await buildOfficialSnapshot(officialBackend, {
+        maxProcedures: args.max_procedures,
+        includeProcedureInfo: args.include_procedure_info !== false,
+        includeAssembly: Boolean(args.include_assembly),
+        includePseudocode: Boolean(args.include_pseudocode),
+        includeCallGraph: Boolean(args.include_call_graph),
+        failOnTruncation: Boolean(args.fail_on_truncation),
+      });
+      await notifyProgress(extra, 1, 2, "Updating local snapshot store.");
+      const session = await store.upsertSession(snapshot);
+      notifyResourceListChanged();
+      await notifyProgress(extra, 2, 2, "Official Hopper snapshot refreshed.");
+      return toolResult({ session: store.describeSession(session), source: "official-hopper-mcp" });
     },
-    ingestOfficial,
   );
 
   server.registerTool(
@@ -356,6 +307,7 @@ export function registerTools(server, ctx) {
     },
   );
 
+  // ── live binary disassembly ────────────────────────────────────────────
   server.registerTool(
     "disassemble_range",
     {
@@ -391,7 +343,7 @@ export function registerTools(server, ctx) {
     {
       title: "Find Xrefs",
       description:
-        "Find all code locations that reference a given address. Detects ADRP+ADD, ADRP+LDR, and bl/b patterns in ARM64.",
+        "Live disassembly: find code locations that reference a target address by scanning the binary with otool. For snapshot-based xrefs, use the `xrefs` tool.",
       inputSchema: {
         executable_path: optionalString,
         target_addr: z.string(),
@@ -472,12 +424,13 @@ export function registerTools(server, ctx) {
     },
   );
 
-  // ── resolve / analyze ────────────────────────────────────────────────────
+  // ── snapshot resolve / analyze ──────────────────────────────────────────
   server.registerTool(
     "resolve",
     {
       title: "Resolve",
-      description: "Resolve an address, name, string, import, or semantic query against the knowledge store.",
+      description:
+        "Resolve an address, name, string, import, or semantic query against the knowledge store. Use this instead of dropped helpers like address_name / procedure_address.",
       inputSchema: {
         query: z.string(),
         session_id: optionalString,
@@ -534,100 +487,38 @@ export function registerTools(server, ctx) {
       ),
   );
 
-  // ── snapshot read mirrors ────────────────────────────────────────────────
   server.registerTool(
-    "search_strings",
+    "query",
     {
-      title: "Search Strings",
+      title: "Query",
       description:
-        "Search indexed strings. Use pattern/case_sensitive for official-compatible output, or regex/semantic for the extended result shape.",
-      inputSchema: {
-        pattern: optionalString,
-        case_sensitive: optionalBool,
-        regex: optionalString,
-        semantic: optionalBool,
-        backend: backendEnum,
-        session_id: optionalString,
-        max_results: optionalNumber,
-      },
+        "Run a structured query against the active session. Predicates: name, calls, callers, callees, imports, string, tag, capability, anti, addr, pseudocode, size. Connectors: AND, OR, NOT, parens.",
+      inputSchema: { expression: z.string(), session_id: optionalString, max_results: optionalNumber },
       annotations: READ_ONLY,
     },
     async (args) => {
-      if (shouldUseOfficial("search_strings", args)) {
-        return toolResult(await callOfficialMirror("search_strings", args));
-      }
+      const session = store.getSession(sessionFor(args));
+      const matches = queryFunctions(session, args.expression, {
+        maxResults: args.max_results ?? 50,
+        capabilities: session.binary?.capabilities ?? null,
+        antiAnalysis: session.antiAnalysisFindings ?? [],
+      });
+      return toolResult({ count: matches.length, matches });
+    },
+  );
+
+  server.registerTool(
+    "xrefs",
+    {
+      title: "Xrefs (Snapshot)",
+      description:
+        "Snapshot xrefs: cross-references to/from an address in the active session's indexed metadata. For a live binary scan use `find_xrefs`.",
+      inputSchema: { address: optionalString, session_id: optionalString },
+      annotations: READ_ONLY,
+    },
+    async (args) => {
       const sessionId = sessionFor(args);
-      const pattern = args.pattern ?? args.regex;
-      if (!pattern) throw rpcError(-32602, "search_strings requires pattern or regex.");
-      let result;
-      if (args.pattern !== undefined) {
-        result = objectFromAddressItems(
-          searchStringsOfficial(store, pattern, {
-            caseSensitive: Boolean(args.case_sensitive),
-            sessionId,
-            maxResults: args.max_results,
-          }),
-          "value",
-        );
-      } else {
-        result = store.searchStrings(pattern, {
-          semantic: Boolean(args.semantic),
-          sessionId,
-          maxResults: args.max_results,
-        });
-        if (!result.length) {
-          result = await searchSessionBinaryStrings(store, pattern, {
-            semantic: Boolean(args.semantic),
-            sessionId,
-            maxResults: args.max_results,
-          });
-        }
-      }
-      return toolResult(result);
-    },
-  );
-
-  server.registerTool(
-    "list_documents",
-    {
-      title: "List Documents",
-      description: "List loaded snapshot sessions.",
-      inputSchema: { backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("list_documents", args)) return toolResult(await callOfficialMirror("list_documents", args));
-      return toolResult(store.listSessions().map((session) => session.name));
-    },
-  );
-
-  server.registerTool(
-    "current_document",
-    {
-      title: "Current Document",
-      description: "Return the active snapshot session.",
-      inputSchema: { backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("current_document", args)) {
-        return toolResult(await callOfficialMirror("current_document", args));
-      }
-      return toolResult(store.getSession(sessionFor(args)).binary?.name ?? "unknown");
-    },
-  );
-
-  server.registerTool(
-    "list_segments",
-    {
-      title: "List Segments",
-      description: "List segments from the active snapshot.",
-      inputSchema: { backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("list_segments", args)) return toolResult(await callOfficialMirror("list_segments", args));
-      return toolResult(getSessionSegments(store, sessionFor(args)).map(officialSegment));
+      return toolResult(snapshotXrefs(store, defaultAddressQuery(store, args.address, sessionId), sessionId));
     },
   );
 
@@ -635,372 +526,133 @@ export function registerTools(server, ctx) {
     "list_procedures",
     {
       title: "List Procedures",
-      description: "List procedure addresses and names from the active snapshot.",
-      inputSchema: { backend: backendEnum, session_id: optionalString, max_results: optionalNumber },
+      description: "List procedure addresses and names from the active snapshot, named-first then by address.",
+      inputSchema: { session_id: optionalString, max_results: optionalNumber },
       annotations: READ_ONLY,
     },
-    async (args) => {
-      if (shouldUseOfficial("list_procedures", args)) {
-        return toolResult(await callOfficialMirror("list_procedures", args));
-      }
-      return toolResult(
+    async (args) =>
+      toolResult(
         objectFromFunctions(
           listProcedures(store, sessionFor(args), { maxResults: args.max_results }),
           (fn) => fn.name ?? fn.addr,
         ),
-      );
-    },
+      ),
   );
 
+  // ── unified procedure / search ─────────────────────────────────────────
   server.registerTool(
-    "list_procedure_size",
+    "procedure",
     {
-      title: "List Procedure Size",
-      description: "List procedure sizes and basic-block counts from the active snapshot.",
-      inputSchema: { backend: backendEnum, session_id: optionalString, max_results: optionalNumber },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("list_procedure_size", args)) {
-        return toolResult(await callOfficialMirror("list_procedure_size", args));
-      }
-      return toolResult(
-        objectFromFunctions(listProcedures(store, sessionFor(args), { maxResults: args.max_results }), (fn) => ({
-          name: fn.name ?? null,
-          basicblock_count: fn.basicBlockCount ?? fn.basicBlocks?.length ?? 0,
-          size: fn.size ?? null,
-        })),
-      );
-    },
-  );
-
-  server.registerTool(
-    "list_procedure_info",
-    {
-      title: "List Procedure Info",
-      description: "List compact procedure metadata from the active snapshot.",
-      inputSchema: { backend: backendEnum, session_id: optionalString, max_results: optionalNumber },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("list_procedure_info", args)) {
-        return toolResult(await callOfficialMirror("list_procedure_info", args));
-      }
-      return toolResult(
-        objectFromFunctions(
-          listProcedures(store, sessionFor(args), { maxResults: args.max_results }),
-          officialProcedureInfo,
-        ),
-      );
-    },
-  );
-
-  server.registerTool(
-    "list_strings",
-    {
-      title: "List Strings",
-      description: "List indexed strings from the active snapshot.",
-      inputSchema: { backend: backendEnum, session_id: optionalString, max_results: optionalNumber },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("list_strings", args)) return toolResult(await callOfficialMirror("list_strings", args));
-      const session = store.getSession(sessionFor(args));
-      return toolResult(objectFromAddressItems(limitResults(session.strings ?? [], args.max_results), "value"));
-    },
-  );
-
-  server.registerTool(
-    "search_procedures",
-    {
-      title: "Search Procedures",
-      description: "Search procedure names and metadata in the active snapshot.",
+      title: "Procedure",
+      description:
+        "Read a single field from a procedure: info | assembly | pseudo_code | callers | callees. `procedure` accepts an address or name; defaults to the cursor procedure when omitted.",
       inputSchema: {
-        pattern: optionalString,
-        case_sensitive: optionalBool,
-        regex: optionalString,
-        backend: backendEnum,
-        session_id: optionalString,
-        max_results: optionalNumber,
-      },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("search_procedures", args)) {
-        return toolResult(await callOfficialMirror("search_procedures", args));
-      }
-      const pattern = args.pattern ?? args.regex;
-      if (!pattern) throw rpcError(-32602, "search_procedures requires pattern or regex.");
-      const regex = new RegExp(pattern, args.case_sensitive ? "" : "i");
-      return toolResult(
-        objectFromFunctions(
-          limitResults(
-            listProcedures(store, sessionFor(args)).filter((fn) =>
-              regex.test([fn.addr, fn.name, fn.signature, fn.summary].filter(Boolean).join(" ")),
-            ),
-            args.max_results,
-          ),
-          (fn) => fn.name ?? fn.addr,
-        ),
-      );
-    },
-  );
-
-  server.registerTool(
-    "procedure_info",
-    {
-      title: "Procedure Info",
-      description: "Return full procedure metadata for an address or name.",
-      inputSchema: { procedure: optionalString, backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("procedure_info", args)) {
-        return toolResult(await callOfficialMirror("procedure_info", args));
-      }
-      const sessionId = sessionFor(args);
-      return toolResult(
-        officialProcedureInfo(resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId)),
-      );
-    },
-  );
-
-  server.registerTool(
-    "procedure_address",
-    {
-      title: "Procedure Address",
-      description: "Resolve a procedure name or contained address to its entry address.",
-      inputSchema: { procedure: z.string(), backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("procedure_address", args)) {
-        return toolResult(await callOfficialMirror("procedure_address", args));
-      }
-      const sessionId = sessionFor(args);
-      return toolResult(
-        resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId).addr,
-      );
-    },
-  );
-
-  server.registerTool(
-    "procedure_assembly",
-    {
-      title: "Procedure Assembly",
-      description: "Return assembly captured from Hopper's public Python API.",
-      inputSchema: {
+        field: z.enum(["info", "assembly", "pseudo_code", "callers", "callees"]),
         procedure: optionalString,
-        backend: backendEnum,
         session_id: optionalString,
         max_lines: optionalNumber,
       },
       annotations: READ_ONLY,
     },
     async (args) => {
-      if (shouldUseOfficial("procedure_assembly", args)) {
-        return toolResult(await callOfficialMirror("procedure_assembly", args));
-      }
       const sessionId = sessionFor(args);
       const fn = resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId);
-      const lines = assemblyLines(fn);
-      const result = args.max_lines ? lines.slice(0, args.max_lines).join("\n") : lines.join("\n");
-      return toolResult(result);
-    },
-  );
-
-  server.registerTool(
-    "procedure_pseudo_code",
-    {
-      title: "Procedure Pseudo Code",
-      description: "Return pseudocode captured during live export, if include_pseudocode was enabled.",
-      inputSchema: { procedure: optionalString, backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("procedure_pseudo_code", args)) {
-        return toolResult(await callOfficialMirror("procedure_pseudo_code", args));
+      switch (args.field) {
+        case "info":
+          return toolResult(officialProcedureInfo(fn));
+        case "assembly": {
+          const lines = assemblyLines(fn);
+          return toolResult(args.max_lines ? lines.slice(0, args.max_lines).join("\n") : lines.join("\n"));
+        }
+        case "pseudo_code":
+          return toolResult(
+            fn.pseudocode ??
+              "Pseudocode was not captured. Re-run ingest_live_hopper with include_pseudocode=true for selected functions.",
+          );
+        case "callers":
+        case "callees": {
+          const session = store.getSession(sessionId);
+          const list = (args.field === "callers" ? fn.callers : fn.callees) ?? [];
+          return toolResult(list.map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr));
+        }
       }
-      const sessionId = sessionFor(args);
-      const fn = resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId);
-      return toolResult(
-        fn.pseudocode ??
-          "Pseudocode was not captured. Re-run ingest_live_hopper with include_pseudocode=true for selected functions.",
-      );
     },
   );
 
   server.registerTool(
-    "procedure_callers",
+    "search",
     {
-      title: "Procedure Callers",
-      description: "Return procedure callers from the active snapshot.",
-      inputSchema: { procedure: optionalString, backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("procedure_callers", args)) {
-        return toolResult(await callOfficialMirror("procedure_callers", args));
-      }
-      const sessionId = sessionFor(args);
-      const session = store.getSession(sessionId);
-      const fn = resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId);
-      return toolResult(
-        (fn.callers ?? []).map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr),
-      );
-    },
-  );
-
-  server.registerTool(
-    "procedure_callees",
-    {
-      title: "Procedure Callees",
-      description: "Return procedure callees from the active snapshot.",
-      inputSchema: { procedure: optionalString, backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("procedure_callees", args)) {
-        return toolResult(await callOfficialMirror("procedure_callees", args));
-      }
-      const sessionId = sessionFor(args);
-      const session = store.getSession(sessionId);
-      const fn = resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId);
-      return toolResult(
-        (fn.callees ?? []).map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr),
-      );
-    },
-  );
-
-  server.registerTool(
-    "xrefs",
-    {
-      title: "Xrefs",
-      description: "Return cross-references to and from an address from the active snapshot.",
-      inputSchema: { address: optionalString, backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("xrefs", args)) return toolResult(await callOfficialMirror("xrefs", args));
-      const sessionId = sessionFor(args);
-      return toolResult(snapshotXrefs(store, defaultAddressQuery(store, args.address, sessionId), sessionId));
-    },
-  );
-
-  server.registerTool(
-    "current_address",
-    {
-      title: "Current Address",
-      description: "Return the cursor address captured at export time.",
-      inputSchema: { backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("current_address", args)) {
-        return toolResult(await callOfficialMirror("current_address", args));
-      }
-      return toolResult(store.getSession(sessionFor(args)).cursor?.address ?? null);
-    },
-  );
-
-  server.registerTool(
-    "current_procedure",
-    {
-      title: "Current Procedure",
-      description: "Return the cursor procedure captured at export time.",
-      inputSchema: { backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("current_procedure", args)) {
-        return toolResult(await callOfficialMirror("current_procedure", args));
-      }
-      const session = store.getSession(sessionFor(args));
-      const addr = session.cursor?.procedure;
-      return toolResult(addr ? store.getFunctionIfKnown(session, addr).name ?? addr : null);
-    },
-  );
-
-  server.registerTool(
-    "list_names",
-    {
-      title: "List Names",
-      description: "List named addresses captured from Hopper.",
-      inputSchema: { backend: backendEnum, session_id: optionalString, max_results: optionalNumber },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("list_names", args)) return toolResult(await callOfficialMirror("list_names", args));
-      const session = store.getSession(sessionFor(args));
-      return toolResult(objectFromAddressItems(limitResults(session.names ?? [], args.max_results), "name"));
-    },
-  );
-
-  server.registerTool(
-    "search_name",
-    {
-      title: "Search Name",
-      description: "Search Hopper names captured in the snapshot.",
+      title: "Search",
+      description:
+        "Search the active snapshot by kind: strings | procedures | names. `pattern` is treated as a regex unless case_sensitive forces exact handling.",
       inputSchema: {
-        pattern: optionalString,
+        kind: z.enum(["strings", "procedures", "names"]),
+        pattern: z.string(),
         case_sensitive: optionalBool,
-        regex: optionalString,
-        backend: backendEnum,
+        semantic: optionalBool,
         session_id: optionalString,
         max_results: optionalNumber,
       },
       annotations: READ_ONLY,
     },
     async (args) => {
-      if (shouldUseOfficial("search_name", args)) return toolResult(await callOfficialMirror("search_name", args));
-      const session = store.getSession(sessionFor(args));
-      const pattern = args.pattern ?? args.regex;
-      if (!pattern) throw rpcError(-32602, "search_name requires pattern or regex.");
-      const regex = new RegExp(pattern, args.case_sensitive ? "" : "i");
+      const sessionId = sessionFor(args);
+      const flags = args.case_sensitive ? "" : "i";
+      if (args.kind === "strings") {
+        if (args.semantic) {
+          let result = store.searchStrings(args.pattern, {
+            semantic: true,
+            sessionId,
+            maxResults: args.max_results,
+          });
+          if (!result.length) {
+            result = await searchSessionBinaryStrings(store, args.pattern, {
+              semantic: true,
+              sessionId,
+              maxResults: args.max_results,
+            });
+          }
+          return toolResult(result);
+        }
+        return toolResult(
+          objectFromAddressItems(
+            searchStringsOfficial(store, args.pattern, {
+              caseSensitive: Boolean(args.case_sensitive),
+              sessionId,
+              maxResults: args.max_results,
+            }),
+            "value",
+          ),
+        );
+      }
+      if (args.kind === "procedures") {
+        const regex = new RegExp(args.pattern, flags);
+        return toolResult(
+          objectFromFunctions(
+            limitResults(
+              listProcedures(store, sessionId).filter((fn) =>
+                regex.test([fn.addr, fn.name, fn.signature, fn.summary].filter(Boolean).join(" ")),
+              ),
+              args.max_results,
+            ),
+            (fn) => fn.name ?? fn.addr,
+          ),
+        );
+      }
+      // names
+      const session = store.getSession(sessionId);
+      const regex = new RegExp(args.pattern, flags);
       return toolResult(
         objectFromAddressItems(
           limitResults(
-            (session.names ?? []).filter((item) => regex.test([item.addr, item.name, item.demangled].filter(Boolean).join(" "))),
+            (session.names ?? []).filter((item) =>
+              regex.test([item.addr, item.name, item.demangled].filter(Boolean).join(" ")),
+            ),
             args.max_results,
           ),
           "name",
         ),
       );
-    },
-  );
-
-  server.registerTool(
-    "address_name",
-    {
-      title: "Address Name",
-      description: "Return the name for an address, if captured.",
-      inputSchema: { address: optionalString, backend: backendEnum, session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("address_name", args)) return toolResult(await callOfficialMirror("address_name", args));
-      const sessionId = sessionFor(args);
-      return toolResult(
-        lookupName(store, defaultAddressQuery(store, args.address, sessionId), sessionId).name ??
-          "There is no name at this address",
-      );
-    },
-  );
-
-  server.registerTool(
-    "list_bookmarks",
-    {
-      title: "List Bookmarks",
-      description: "List Hopper bookmarks captured in the snapshot.",
-      inputSchema: { backend: backendEnum, session_id: optionalString, max_results: optionalNumber },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      if (shouldUseOfficial("list_bookmarks", args)) {
-        return toolResult(await callOfficialMirror("list_bookmarks", args));
-      }
-      const session = store.getSession(sessionFor(args));
-      return toolResult(limitResults(session.bookmarks ?? [], args.max_results));
     },
   );
 
@@ -1020,119 +672,30 @@ export function registerTools(server, ctx) {
   );
 
   server.registerTool(
-    "queue_rename",
+    "queue",
     {
-      title: "Queue Rename",
-      description: "Queue a function rename in the active transaction.",
+      title: "Queue Annotation",
+      description:
+        "Queue an annotation in the active transaction. `kind` selects the operation: rename | comment | inline_comment | type_patch | tag | untag | rename_batch. Required fields by kind: rename/comment/inline_comment/type_patch need `addr` + `value`; tag/untag need `addr` + `tag` (or `tags`); rename_batch needs `mapping`.",
       inputSchema: {
+        kind: z.enum(["rename", "comment", "inline_comment", "type_patch", "tag", "untag", "rename_batch"]),
         transaction_id: optionalString,
-        addr: z.string(),
-        new_name: z.string(),
+        addr: optionalString,
+        value: optionalString,
+        tag: optionalString,
+        tags: z.array(z.string()).optional(),
+        mapping: z.record(z.string(), z.string()).optional(),
         rationale: optionalString,
         session_id: optionalString,
       },
       annotations: WRITE_LOCAL,
     },
-    async (args) =>
-      toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "rename",
-            addr: args.addr,
-            newValue: args.new_name,
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      ),
-  );
-
-  server.registerTool(
-    "queue_comment",
-    {
-      title: "Queue Comment",
-      description: "Queue a function-level comment in the active transaction.",
-      inputSchema: {
-        transaction_id: optionalString,
-        addr: z.string(),
-        comment: z.string(),
-        rationale: optionalString,
-        session_id: optionalString,
-      },
-      annotations: WRITE_LOCAL,
+    async (args) => {
+      const op = buildQueueOperation(args);
+      return toolResult(
+        await transactions.queue(op, { sessionId: sessionFor(args) }),
+      );
     },
-    async (args) =>
-      toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "comment",
-            addr: args.addr,
-            newValue: args.comment,
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      ),
-  );
-
-  server.registerTool(
-    "queue_inline_comment",
-    {
-      title: "Queue Inline Comment",
-      description: "Queue an inline comment in the active transaction.",
-      inputSchema: {
-        transaction_id: optionalString,
-        addr: z.string(),
-        comment: z.string(),
-        rationale: optionalString,
-        session_id: optionalString,
-      },
-      annotations: WRITE_LOCAL,
-    },
-    async (args) =>
-      toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "inline_comment",
-            addr: args.addr,
-            newValue: args.comment,
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      ),
-  );
-
-  server.registerTool(
-    "queue_type_patch",
-    {
-      title: "Queue Type Patch",
-      description: "Queue a function type/signature patch in the active transaction.",
-      inputSchema: {
-        transaction_id: optionalString,
-        addr: z.string(),
-        type: z.string(),
-        rationale: optionalString,
-        session_id: optionalString,
-      },
-      annotations: WRITE_LOCAL,
-    },
-    async (args) =>
-      toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "type_patch",
-            addr: args.addr,
-            newValue: args.type,
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      ),
   );
 
   server.registerTool(
@@ -1192,6 +755,36 @@ export function registerTools(server, ctx) {
       toolResult(
         await transactions.rollback({ transactionId: args.transaction_id, sessionId: sessionFor(args) }),
       ),
+  );
+
+  // ── hypothesis ────────────────────────────────────────────────────────
+  server.registerTool(
+    "hypothesis",
+    {
+      title: "Hypothesis",
+      description:
+        "Manage research hypotheses. `action=create` creates a hypothesis (requires `topic`); `action=link` attaches evidence (requires `hypothesis_id`); `action=status` updates status (requires `hypothesis_id` + `status`).",
+      inputSchema: {
+        action: z.enum(["create", "link", "status"]),
+        transaction_id: optionalString,
+        hypothesis_id: optionalString,
+        topic: optionalString,
+        claim: optionalString,
+        status: z.enum(["open", "supported", "refuted", "abandoned"]).optional(),
+        addr: optionalString,
+        evidence: optionalString,
+        evidence_kind: z.enum(["address", "string", "import", "note", "selector"]).optional(),
+        rationale: optionalString,
+        session_id: optionalString,
+      },
+      annotations: WRITE_LOCAL,
+    },
+    async (args) => {
+      const op = buildHypothesisOperation(args);
+      return toolResult(
+        await transactions.queue(op, { sessionId: sessionFor(args) }),
+      );
+    },
   );
 
   // ── research / classification ─────────────────────────────────────────────
@@ -1392,256 +985,82 @@ export function registerTools(server, ctx) {
       return toolResult(diffSessions(left, right));
     },
   );
-
-  server.registerTool(
-    "query",
-    {
-      title: "Query",
-      description:
-        "Run a structured query against the active session. Predicates: name, calls, callers, callees, imports, string, tag, capability, anti, addr, pseudocode, size. Connectors: AND, OR, NOT, parens.",
-      inputSchema: { expression: z.string(), session_id: optionalString, max_results: optionalNumber },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      const session = store.getSession(sessionFor(args));
-      const matches = queryFunctions(session, args.expression, {
-        maxResults: args.max_results ?? 50,
-        capabilities: session.binary?.capabilities ?? null,
-        antiAnalysis: session.antiAnalysisFindings ?? [],
-      });
-      return toolResult({ count: matches.length, matches });
-    },
-  );
-
-  // ── tags / hypotheses ────────────────────────────────────────────────────
-  const tagSchema = {
-    transaction_id: optionalString,
-    addr: z.string(),
-    tag: optionalString,
-    tags: z.array(z.string()).optional(),
-    rationale: optionalString,
-    session_id: optionalString,
-  };
-
-  server.registerTool(
-    "queue_tag",
-    {
-      title: "Queue Tag",
-      description: "Queue a persistent tag (or list of tags) on an address in the current transaction.",
-      inputSchema: tagSchema,
-      annotations: WRITE_LOCAL,
-    },
-    async (args) => {
-      const tags = args.tags ?? (args.tag ? [args.tag] : []);
-      return toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "tag",
-            addr: args.addr,
-            tags,
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      );
-    },
-  );
-
-  server.registerTool(
-    "queue_untag",
-    {
-      title: "Queue Untag",
-      description: "Queue removal of one or more tags from an address.",
-      inputSchema: tagSchema,
-      annotations: WRITE_LOCAL,
-    },
-    async (args) => {
-      const tags = args.tags ?? (args.tag ? [args.tag] : []);
-      return toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "untag",
-            addr: args.addr,
-            tags,
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      );
-    },
-  );
-
-  server.registerTool(
-    "list_tags",
-    {
-      title: "List Tags",
-      description: "List address tags in the active session.",
-      inputSchema: { session_id: optionalString },
-      annotations: READ_ONLY,
-    },
-    async (args) => toolResult(store.getSession(sessionFor(args)).tags ?? {}),
-  );
-
-  server.registerTool(
-    "queue_rename_batch",
-    {
-      title: "Queue Rename Batch",
-      description: "Queue a bulk rename mapping {addr: newName} in the active transaction.",
-      inputSchema: {
-        transaction_id: optionalString,
-        mapping: z
-          .record(z.string(), z.string())
-          .describe("Object whose keys are addresses and values are new names."),
-        rationale: optionalString,
-        session_id: optionalString,
-      },
-      annotations: WRITE_LOCAL,
-    },
-    async (args) =>
-      toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "rename_batch",
-            mapping: args.mapping,
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      ),
-  );
-
-  server.registerTool(
-    "create_hypothesis",
-    {
-      title: "Create Hypothesis",
-      description: "Queue creation of a structured hypothesis record (topic, claim, status).",
-      inputSchema: {
-        transaction_id: optionalString,
-        topic: z.string(),
-        claim: optionalString,
-        status: z.enum(["open", "supported", "refuted", "abandoned"]).optional(),
-        rationale: optionalString,
-        session_id: optionalString,
-      },
-      annotations: WRITE_LOCAL,
-    },
-    async (args) =>
-      toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "hypothesis_create",
-            topic: args.topic,
-            claim: args.claim,
-            status: args.status ?? "open",
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      ),
-  );
-
-  server.registerTool(
-    "link_evidence",
-    {
-      title: "Link Evidence",
-      description: "Queue an evidence link onto a hypothesis (address, string, import, or note).",
-      inputSchema: {
-        transaction_id: optionalString,
-        hypothesis_id: z.string(),
-        addr: optionalString,
-        evidence: optionalString,
-        evidence_kind: z.enum(["address", "string", "import", "note", "selector"]).optional(),
-        rationale: optionalString,
-        session_id: optionalString,
-      },
-      annotations: WRITE_LOCAL,
-    },
-    async (args) =>
-      toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "hypothesis_link",
-            hypothesisId: args.hypothesis_id,
-            addr: args.addr,
-            evidence: args.evidence,
-            evidenceKind: args.evidence_kind ?? (args.addr ? "address" : "note"),
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      ),
-  );
-
-  server.registerTool(
-    "set_hypothesis_status",
-    {
-      title: "Set Hypothesis Status",
-      description: "Queue a status change on a hypothesis (open/supported/refuted/abandoned).",
-      inputSchema: {
-        transaction_id: optionalString,
-        hypothesis_id: z.string(),
-        status: z.enum(["open", "supported", "refuted", "abandoned"]),
-        rationale: optionalString,
-        session_id: optionalString,
-      },
-      annotations: WRITE_LOCAL,
-    },
-    async (args) =>
-      toolResult(
-        await transactions.queue(
-          {
-            transactionId: args.transaction_id,
-            kind: "hypothesis_status",
-            hypothesisId: args.hypothesis_id,
-            status: args.status,
-            rationale: args.rationale,
-          },
-          { sessionId: sessionFor(args) },
-        ),
-      ),
-  );
-
-  server.registerTool(
-    "list_hypotheses",
-    {
-      title: "List Hypotheses",
-      description: "List hypotheses recorded for the active session.",
-      inputSchema: {
-        session_id: optionalString,
-        status: z.enum(["open", "supported", "refuted", "abandoned"]).optional(),
-      },
-      annotations: READ_ONLY,
-    },
-    async (args) => {
-      const session = store.getSession(sessionFor(args));
-      const list = session.hypotheses ?? [];
-      return toolResult(args.status ? list.filter((h) => h.status === args.status) : list);
-    },
-  );
 }
 
 // ── private helpers ────────────────────────────────────────────────────────
-function shouldUseOfficial(name, args) {
-  return OFFICIAL_MIRROR_TOOLS.has(name) && args.backend === "official";
+
+function buildQueueOperation(args) {
+  const base = {
+    transactionId: args.transaction_id,
+    rationale: args.rationale ?? null,
+  };
+  switch (args.kind) {
+    case "rename":
+    case "comment":
+    case "inline_comment":
+    case "type_patch": {
+      if (!args.addr) throw rpcError(-32602, `queue kind=${args.kind} requires addr.`);
+      if (args.value === undefined || args.value === null) {
+        throw rpcError(-32602, `queue kind=${args.kind} requires value.`);
+      }
+      return { ...base, kind: args.kind, addr: args.addr, newValue: args.value };
+    }
+    case "tag":
+    case "untag": {
+      if (!args.addr) throw rpcError(-32602, `queue kind=${args.kind} requires addr.`);
+      const tags = args.tags ?? (args.tag ? [args.tag] : []);
+      if (!tags.length) throw rpcError(-32602, `queue kind=${args.kind} requires tag or tags.`);
+      return { ...base, kind: args.kind, addr: args.addr, tags };
+    }
+    case "rename_batch": {
+      if (!args.mapping || typeof args.mapping !== "object") {
+        throw rpcError(-32602, "queue kind=rename_batch requires mapping {addr: newName}.");
+      }
+      return { ...base, kind: "rename_batch", mapping: args.mapping };
+    }
+  }
+  throw rpcError(-32602, `Unknown queue kind: ${args.kind}`);
 }
 
-function toOfficialArgs(name, args) {
-  const officialArgs = {};
-  for (const [key, value] of Object.entries(args)) {
-    if (value === undefined) continue;
-    if (["backend", "session_id", "max_results", "semantic", "max_lines"].includes(key)) continue;
-    if (key === "regex" && args.pattern === undefined && ["search_strings", "search_procedures", "search_name"].includes(name)) {
-      officialArgs.pattern = value;
-      continue;
+function buildHypothesisOperation(args) {
+  const base = {
+    transactionId: args.transaction_id,
+    rationale: args.rationale ?? null,
+  };
+  switch (args.action) {
+    case "create": {
+      if (!args.topic) throw rpcError(-32602, "hypothesis action=create requires topic.");
+      return {
+        ...base,
+        kind: "hypothesis_create",
+        topic: args.topic,
+        claim: args.claim ?? null,
+        status: args.status ?? "open",
+      };
     }
-    officialArgs[key] = value;
+    case "link": {
+      if (!args.hypothesis_id) throw rpcError(-32602, "hypothesis action=link requires hypothesis_id.");
+      return {
+        ...base,
+        kind: "hypothesis_link",
+        hypothesisId: args.hypothesis_id,
+        addr: args.addr,
+        evidence: args.evidence,
+        evidenceKind: args.evidence_kind ?? (args.addr ? "address" : "note"),
+      };
+    }
+    case "status": {
+      if (!args.hypothesis_id) throw rpcError(-32602, "hypothesis action=status requires hypothesis_id.");
+      if (!args.status) throw rpcError(-32602, "hypothesis action=status requires status.");
+      return {
+        ...base,
+        kind: "hypothesis_status",
+        hypothesisId: args.hypothesis_id,
+        status: args.status,
+      };
+    }
   }
-  return officialArgs;
+  throw rpcError(-32602, `Unknown hypothesis action: ${args.action}`);
 }
 
 function findSimilarFunctions(store, { sessionId, addr, targetSessionId, minSimilarity, maxResults }) {

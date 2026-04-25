@@ -138,8 +138,9 @@ try {
     if (!list.resources.some((r) => r.uri.includes("binary/metadata"))) fail("missing metadata resource", list.resources.length);
     if (!list.resources.some((r) => r.uri.includes("binary/capabilities"))) fail("missing capabilities resource", list.resources.length);
 
-    const segs = await callTool("list_segments", { session_id: sid });
-    if (!Array.isArray(segs) || !segs.length) fail(`${target.id}: list_segments empty`, segs);
+    const segsRes = await rpc("resources/read", { uri: `hopper://binary/metadata?session_id=${sid}` });
+    const segs = JSON.parse(segsRes.contents[0].text)?.segments;
+    if (!Array.isArray(segs) || !segs.length) fail(`${target.id}: hopper://binary/metadata.segments empty`, segs);
 
     const procs = await callTool("list_procedures", { session_id: sid, max_results: 5 });
     assert.ok(procs && typeof procs === "object", `${target.id}: list_procedures must return object`);
@@ -149,9 +150,9 @@ try {
     const stringsProbe = target.id === "codesign" ? "Apple"
       : target.id === "calc" ? "scientific"
       : "usage";
-    const stringsHit = await callTool("search_strings", { session_id: sid, regex: stringsProbe, max_results: 3 });
-    assert.ok(Array.isArray(stringsHit), `${target.id}: search_strings must return array (got ${typeof stringsHit})`);
-    if (!stringsHit.length) fail(`${target.id}: search_strings(${stringsProbe}) returned no hits`, stringsHit);
+    const stringsHit = await callTool("search", { kind: "strings", session_id: sid, pattern: stringsProbe, max_results: 3 });
+    assert.ok(stringsHit && typeof stringsHit === "object", `${target.id}: search kind=strings must return object (got ${typeof stringsHit})`);
+    if (!Object.keys(stringsHit).length) fail(`${target.id}: search kind=strings(${stringsProbe}) returned no hits`, stringsHit);
 
     // resolve a known-good import per target
     const probe = target.id === "codesign" ? "_Sec"
@@ -279,12 +280,14 @@ try {
 
   // ─── Phase 12: tagging through transactions ────────────────────────────
   console.log("[phase 12] tags via transactions…");
+  const readResource = async (uri) => JSON.parse((await rpc("resources/read", { uri })).contents[0].text);
   const txnTags = await callTool("begin_transaction", {
     session_id: sessions.codesign.sessionId,
     name: "tag networking funcs",
     rationale: "Validate tagging end-to-end.",
   });
-  await callTool("queue_tag", {
+  await callTool("queue", {
+    kind: "tag",
     session_id: sessions.codesign.sessionId,
     transaction_id: txnTags.transactionId,
     addr: codesignFn.addr,
@@ -292,62 +295,67 @@ try {
   });
   const tagCommit = await callTool("commit_transaction", { session_id: sessions.codesign.sessionId, transaction_id: txnTags.transactionId });
   assert.equal(tagCommit.status, "committed");
-  const tags = await callTool("list_tags", { session_id: sessions.codesign.sessionId });
+  const tags = await readResource(`hopper://tags?session_id=${sessions.codesign.sessionId}`);
   assert.deepEqual(tags[codesignFn.addr]?.sort(), ["investigate", "network"]);
 
   // Untag one tag
   const txnUntag = await callTool("begin_transaction", { session_id: sessions.codesign.sessionId, name: "remove investigate tag" });
-  await callTool("queue_untag", {
+  await callTool("queue", {
+    kind: "untag",
     session_id: sessions.codesign.sessionId,
     transaction_id: txnUntag.transactionId,
     addr: codesignFn.addr,
     tags: ["investigate"],
   });
   await callTool("commit_transaction", { session_id: sessions.codesign.sessionId, transaction_id: txnUntag.transactionId });
-  const tags2 = await callTool("list_tags", { session_id: sessions.codesign.sessionId });
+  const tags2 = await readResource(`hopper://tags?session_id=${sessions.codesign.sessionId}`);
   assert.deepEqual(tags2[codesignFn.addr], ["network"]);
 
   // ─── Phase 13: hypothesis lifecycle ────────────────────────────────────
   console.log("[phase 13] hypotheses…");
   const txnHyp = await callTool("begin_transaction", { session_id: sessions.codesign.sessionId, name: "tls hypothesis" });
-  const hypResult = await callTool("create_hypothesis", {
+  const hypResult = await callTool("hypothesis", {
+    action: "create",
     session_id: sessions.codesign.sessionId,
     transaction_id: txnHyp.transactionId,
     topic: "TLS path",
     claim: "codesign uses CommonCrypto for hashing + Security framework for keychain.",
   });
   const hypothesisId = hypResult.operations.find((op) => op.kind === "hypothesis_create").hypothesisId;
-  await callTool("link_evidence", {
+  await callTool("hypothesis", {
+    action: "link",
     session_id: sessions.codesign.sessionId,
     transaction_id: txnHyp.transactionId,
     hypothesis_id: hypothesisId,
     addr: codesignFn.addr,
     evidence: "_CC_SHA256 import found",
   });
-  await callTool("set_hypothesis_status", {
+  await callTool("hypothesis", {
+    action: "status",
     session_id: sessions.codesign.sessionId,
     transaction_id: txnHyp.transactionId,
     hypothesis_id: hypothesisId,
     status: "supported",
   });
   await callTool("commit_transaction", { session_id: sessions.codesign.sessionId, transaction_id: txnHyp.transactionId });
-  const hyps = await callTool("list_hypotheses", { session_id: sessions.codesign.sessionId });
+  const hyps = await readResource(`hopper://hypotheses?session_id=${sessions.codesign.sessionId}`);
   assert.equal(hyps.length, 1, "expected 1 hypothesis");
   assert.equal(hyps[0].status, "supported");
   assert.equal(hyps[0].evidence.length, 1);
 
-  // Filter by status
-  const supported = await callTool("list_hypotheses", { session_id: sessions.codesign.sessionId, status: "supported" });
+  // Filter by status (manual filter — list resource returns all)
+  const supported = hyps.filter((h) => h.status === "supported");
   assert.equal(supported.length, 1);
-  const refuted = await callTool("list_hypotheses", { session_id: sessions.codesign.sessionId, status: "refuted" });
+  const refuted = hyps.filter((h) => h.status === "refuted");
   assert.equal(refuted.length, 0);
 
-  // ─── Phase 14: queue_rename_batch + rollback ───────────────────────────
+  // ─── Phase 14: rename_batch + rollback ─────────────────────────────────
   console.log("[phase 14] rename_batch + rollback…");
   const calcFns = sessions.calc.functions.slice(0, 2);
   if (calcFns.length >= 2) {
     const txnRen = await callTool("begin_transaction", { session_id: sessions.calc.sessionId, name: "batch rename" });
-    await callTool("queue_rename_batch", {
+    await callTool("queue", {
+      kind: "rename_batch",
       session_id: sessions.calc.sessionId,
       transaction_id: txnRen.transactionId,
       mapping: {
@@ -358,25 +366,26 @@ try {
     });
     const commit = await callTool("commit_transaction", { session_id: sessions.calc.sessionId, transaction_id: txnRen.transactionId });
     assert.equal(commit.status, "committed");
-    // Verify via procedure_info (accepts session_id).
-    const infoA = await callTool("procedure_info", { session_id: sessions.calc.sessionId, procedure: calcFns[0].addr });
+    // Verify via procedure(field=info).
+    const infoA = await callTool("procedure", { field: "info", session_id: sessions.calc.sessionId, procedure: calcFns[0].addr });
     assert.equal(infoA.name, "calc_entry_a", `batch rename A not applied (got ${infoA.name})`);
-    const infoB = await callTool("procedure_info", { session_id: sessions.calc.sessionId, procedure: calcFns[1].addr });
+    const infoB = await callTool("procedure", { field: "info", session_id: sessions.calc.sessionId, procedure: calcFns[1].addr });
     assert.equal(infoB.name, "calc_entry_b", `batch rename B not applied (got ${infoB.name})`);
 
     // Re-upload the same session — merge logic must preserve user renames.
     await callTool("open_session", { session: sessions.calc });
-    const reInfoA = await callTool("procedure_info", { session_id: sessions.calc.sessionId, procedure: calcFns[0].addr });
+    const reInfoA = await callTool("procedure", { field: "info", session_id: sessions.calc.sessionId, procedure: calcFns[0].addr });
     assert.equal(reInfoA.name, "calc_entry_a", `rename clobbered on re-upload (got ${reInfoA.name})`);
   }
 
   // Rollback path
   const txnRoll = await callTool("begin_transaction", { session_id: sessions.codesign.sessionId, name: "rollback test" });
-  await callTool("queue_comment", {
+  await callTool("queue", {
+    kind: "comment",
     session_id: sessions.codesign.sessionId,
     transaction_id: txnRoll.transactionId,
     addr: codesignFn.addr,
-    comment: "should be rolled back",
+    value: "should be rolled back",
   });
   const rb = await callTool("rollback_transaction", { session_id: sessions.codesign.sessionId, transaction_id: txnRoll.transactionId });
   assert.equal(rb.status, "rolled_back");
@@ -384,23 +393,26 @@ try {
   // ─── Phase 15: comment + inline_comment + type_patch ───────────────────
   console.log("[phase 15] comment / inline_comment / type_patch…");
   const txnAll = await callTool("begin_transaction", { session_id: sessions.codesign.sessionId, name: "annotation suite" });
-  await callTool("queue_comment", {
+  await callTool("queue", {
+    kind: "comment",
     session_id: sessions.codesign.sessionId,
     transaction_id: txnAll.transactionId,
     addr: codesignFn.addr,
-    comment: "function-level annotation",
+    value: "function-level annotation",
   });
-  await callTool("queue_inline_comment", {
+  await callTool("queue", {
+    kind: "inline_comment",
     session_id: sessions.codesign.sessionId,
     transaction_id: txnAll.transactionId,
     addr: codesignFn.addr,
-    comment: "inline annotation",
+    value: "inline annotation",
   });
-  await callTool("queue_type_patch", {
+  await callTool("queue", {
+    kind: "type_patch",
     session_id: sessions.codesign.sessionId,
     transaction_id: txnAll.transactionId,
     addr: codesignFn.addr,
-    type: "int (*)(const char *)",
+    value: "int (*)(const char *)",
   });
   const commitAll = await callTool("commit_transaction", { session_id: sessions.codesign.sessionId, transaction_id: txnAll.transactionId });
   assert.equal(commitAll.status, "committed");

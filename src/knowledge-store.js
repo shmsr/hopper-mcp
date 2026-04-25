@@ -154,6 +154,22 @@ export class KnowledgeStore {
       }
     }
 
+    for (const item of session.names ?? []) {
+      const addrMatch = byAddress !== null && parseAddress(item.addr) === byAddress;
+      const nameMatch = typeof item.name === "string" && item.name.toLowerCase().includes(lower);
+      if (addrMatch || nameMatch) {
+        matches.push({ kind: "name", score: addrMatch ? 0.85 : 0.6, item });
+      }
+    }
+
+    for (const item of session.bookmarks ?? []) {
+      const addrMatch = byAddress !== null && parseAddress(item.addr) === byAddress;
+      const labelMatch = typeof item.label === "string" && item.label.toLowerCase().includes(lower);
+      if (addrMatch || labelMatch) {
+        matches.push({ kind: "bookmark", score: addrMatch ? 0.8 : 0.55, item });
+      }
+    }
+
     return matches.sort((a, b) => b.score - a.score).slice(0, 20);
   }
 

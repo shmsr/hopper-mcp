@@ -237,14 +237,15 @@ try {
   // Heuristic: should be at least 6 resources (1 metadata × 6 sessions or similar)
   if (resList.resources.length < 6) fail("zoo resources too few", resList.resources.length);
 
-  // list_documents reflects all 6 zoo binaries (plus possibly extras from prior tests).
-  // After upsert, server should at least know each name.
-  const docs = await server.callTool("list_documents", {});
-  assert.ok(Array.isArray(docs), "list_documents not array");
+  // capabilities.sessions reflects all 6 zoo binaries (plus possibly extras from prior tests).
+  const capsAll = await server.callTool("capabilities", {});
+  const docs = capsAll?.sessions ?? [];
+  assert.ok(Array.isArray(docs), "capabilities.sessions not array");
+  const docNames = docs.map((s) => s?.binary?.name ?? s?.name ?? null).filter(Boolean);
   for (const target of ZOO) {
     const expectedName = sessions[target.id].binary.name;
-    if (!docs.some((d) => d === expectedName || d?.includes?.(expectedName))) {
-      fail(`${target.id}: missing from list_documents (${expectedName})`, docs.slice(0, 6));
+    if (!docNames.some((d) => d === expectedName || d?.includes?.(expectedName))) {
+      fail(`${target.id}: missing from capabilities.sessions (${expectedName})`, docNames.slice(0, 6));
     }
   }
 } finally {

@@ -4,8 +4,7 @@
 //   C. disassemble_range on a real entry, validates streaming output
 //   D. find_xrefs against a real branch target
 //   E. Knowledge-store persistence across MCP server restarts
-//   F. Older mirror tools: list_strings/list_names/list_bookmarks/search_procedures/
-//                          search_name/address_name/current_address/current_procedure/current_document
+//   F. Snapshot reads via hopper:// resources + unified search/resolve
 //   G. preview_transaction surfaces queued operations before commit
 //   H. Query DSL: combined predicates, NOT, regex literals, parens
 //   I. Error paths: invalid address, malformed query
@@ -136,7 +135,8 @@ lsSession.sessionId = "deep-ls";
   const txn = await round1.callTool("begin_transaction", { session_id: lsSession.sessionId, name: "persist tag" });
   // Tag at first real function addr.
   const fnAddr = lsSession.functions[0].addr;
-  await round1.callTool("queue_tag", {
+  await round1.callTool("queue", {
+    kind: "tag",
     session_id: lsSession.sessionId,
     transaction_id: txn.transactionId,
     addr: fnAddr,
@@ -153,12 +153,13 @@ lsSession.sessionId = "deep-ls";
   // Round 2: fresh server, no open_session — tags should still be there.
   const round2 = await spawnServer(storePath);
   await round2.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "deep", version: "0" } });
-  const tags = await round2.callTool("list_tags", { session_id: lsSession.sessionId });
+  const tagsRes = await round2.rpc("resources/read", { uri: `hopper://tags?session_id=${lsSession.sessionId}` });
+  const tags = JSON.parse(tagsRes.contents[0].text);
   if (!tags[fnAddr]) fail("persisted tag missing after restart", tags);
   if (!tags[fnAddr].includes("persisted") || !tags[fnAddr].includes("round1")) fail("tag content lost", tags[fnAddr]);
-  // list_documents should still see the session.
-  const docs = await round2.callTool("list_documents", {});
-  if (!Array.isArray(docs) || !docs.length) fail("list_documents empty after restart", docs);
+  // capabilities.sessions should still see the session.
+  const caps = await round2.callTool("capabilities", {});
+  if (!Array.isArray(caps?.sessions) || !caps.sessions.length) fail("capabilities.sessions empty after restart", caps);
   await round2.shutdown();
   console.log(`  ✓ store=${size}b tags persisted across restart`);
 }
@@ -177,60 +178,64 @@ try {
   calcSession.sessionId = "deep-calc";
   await server.callTool("open_session", { session: calcSession });
 
-  // ─── F: older mirror tools ─────────────────────────────────────────────
-  console.log("  [F] mirror tools…");
-  const curDoc = await server.callTool("current_document", { session_id: calcSession.sessionId });
-  if (!curDoc || typeof curDoc !== "string" || !/calculator/i.test(curDoc)) fail("current_document wrong", curDoc);
+  // ─── F: snapshot reads via resources + unified search/procedure ────────
+  console.log("  [F] snapshot reads via resources…");
+  const sessionInfo = await server.rpc("resources/read", { uri: `hopper://session/current?session_id=${calcSession.sessionId}` });
+  const sessionJson = JSON.parse(sessionInfo.contents[0].text);
+  const curDoc = sessionJson?.binary?.name;
+  if (!curDoc || typeof curDoc !== "string" || !/calculator/i.test(curDoc)) fail("hopper://session/current binary.name wrong", curDoc);
 
-  const curAddr = await server.callTool("current_address", { session_id: calcSession.sessionId });
-  // current_address may legitimately be null on imported sessions; just assert it doesn't throw and returns string|null
-  if (curAddr !== null && typeof curAddr !== "string") fail("current_address shape", curAddr);
+  const cursorRes = await server.rpc("resources/read", { uri: `hopper://cursor?session_id=${calcSession.sessionId}` });
+  const cursor = JSON.parse(cursorRes.contents[0].text);
+  // cursor.{address,procedure} may legitimately be null on imported sessions
+  if (cursor && cursor.address && typeof cursor.address !== "string") fail("cursor.address shape", cursor.address);
+  if (cursor && cursor.procedure && typeof cursor.procedure !== "string") fail("cursor.procedure shape", cursor.procedure);
 
-  const curProc = await server.callTool("current_procedure", { session_id: calcSession.sessionId });
-  if (curProc !== null && typeof curProc !== "string") fail("current_procedure shape", curProc);
+  // hopper://binary/strings — calc has 1500 strings; resource returns an array
+  const stringsRes = await server.rpc("resources/read", { uri: `hopper://binary/strings?session_id=${calcSession.sessionId}` });
+  const strs = JSON.parse(stringsRes.contents[0].text);
+  if (!Array.isArray(strs) || strs.length === 0) fail("hopper://binary/strings empty", strs);
 
-  // list_strings — calc has 1500 strings, use a small max to fit toolResult cap
-  const strs = await server.callTool("list_strings", { session_id: calcSession.sessionId, max_results: 5 });
-  if (!strs || typeof strs !== "object") fail("list_strings shape", strs);
-  if (Object.keys(strs).length === 0) fail("list_strings empty", strs);
+  // hopper://names — addr/name array
+  const namesRes = await server.rpc("resources/read", { uri: `hopper://names?session_id=${calcSession.sessionId}` });
+  const names = JSON.parse(namesRes.contents[0].text);
+  if (!Array.isArray(names)) fail("hopper://names shape", names);
 
-  // list_names — addr → name map
-  const names = await server.callTool("list_names", { session_id: calcSession.sessionId });
-  if (!names || typeof names !== "object") fail("list_names shape", names);
+  // hopper://bookmarks — should at least return an array (likely empty for imports)
+  const bookmarksRes = await server.rpc("resources/read", { uri: `hopper://bookmarks?session_id=${calcSession.sessionId}` });
+  const bookmarks = JSON.parse(bookmarksRes.contents[0].text);
+  if (!Array.isArray(bookmarks)) fail("hopper://bookmarks shape", bookmarks);
 
-  // list_bookmarks — should at least return an object (likely empty for imports)
-  const bookmarks = await server.callTool("list_bookmarks", { session_id: calcSession.sessionId });
-  if (bookmarks === null || bookmarks === undefined) fail("list_bookmarks null", bookmarks);
+  // search kind=procedures — find calc procedures by regex
+  const sproc = await server.callTool("search", { kind: "procedures", session_id: calcSession.sessionId, pattern: ".*", max_results: 3 });
+  if (!sproc) fail("search kind=procedures null", sproc);
 
-  // search_procedures — find calc procedures by regex
-  const sproc = await server.callTool("search_procedures", { session_id: calcSession.sessionId, regex: ".*", max_results: 3 });
-  if (!sproc) fail("search_procedures null", sproc);
+  // search kind=names — search the names index
+  const sname = await server.callTool("search", { kind: "names", session_id: calcSession.sessionId, pattern: ".*", max_results: 3 });
+  if (sname === null || sname === undefined) fail("search kind=names null", sname);
 
-  // search_name — search the names index
-  const sname = await server.callTool("search_name", { session_id: calcSession.sessionId, regex: ".*", max_results: 3 });
-  if (sname === null || sname === undefined) fail("search_name null", sname);
-
-  // address_name — for a real function entry, returns its name
+  // resolve(addr) — for a real function entry, returns matches with .item.name
   const calcFn = calcSession.functions[0];
-  const addrName = await server.callTool("address_name", { session_id: calcSession.sessionId, address: calcFn.addr });
-  // returns a string (name) or null
-  if (addrName !== null && typeof addrName !== "string") fail("address_name shape", addrName);
-  console.log(`    ✓ current_document="${curDoc}" list_strings=${Object.keys(strs).length} addr_name=${addrName}`);
+  const resolved = await server.callTool("resolve", { session_id: calcSession.sessionId, query: calcFn.addr });
+  if (!Array.isArray(resolved)) fail("resolve shape", resolved);
+  console.log(`    ✓ doc="${curDoc}" strings=${strs.length} names=${names.length} resolved=${resolved.length}`);
 
   // ─── G: preview_transaction ────────────────────────────────────────────
   console.log("  [G] preview_transaction…");
   const txnPreview = await server.callTool("begin_transaction", { session_id: calcSession.sessionId, name: "preview test" });
-  await server.callTool("queue_comment", {
+  await server.callTool("queue", {
+    kind: "comment",
     session_id: calcSession.sessionId,
     transaction_id: txnPreview.transactionId,
     addr: calcFn.addr,
-    comment: "preview-only annotation",
+    value: "preview-only annotation",
   });
-  await server.callTool("queue_rename", {
+  await server.callTool("queue", {
+    kind: "rename",
     session_id: calcSession.sessionId,
     transaction_id: txnPreview.transactionId,
     addr: calcFn.addr,
-    new_name: "preview_renamed_fn",
+    value: "preview_renamed_fn",
   });
   const preview = await server.callTool("preview_transaction", {
     session_id: calcSession.sessionId,
@@ -239,7 +244,7 @@ try {
   if (!preview || !Array.isArray(preview.operations)) fail("preview missing operations[]", preview);
   if (preview.operations.length !== 2) fail("preview should show 2 queued ops", preview.operations.length);
   // Preview must NOT mutate underlying state — name should still be the original.
-  const infoBefore = await server.callTool("procedure_info", { session_id: calcSession.sessionId, procedure: calcFn.addr });
+  const infoBefore = await server.callTool("procedure", { field: "info", session_id: calcSession.sessionId, procedure: calcFn.addr });
   if (infoBefore.name === "preview_renamed_fn") fail("preview leaked into state", infoBefore.name);
   // Roll back to clean up
   await server.callTool("rollback_transaction", { session_id: calcSession.sessionId, transaction_id: txnPreview.transactionId });
@@ -252,7 +257,8 @@ try {
   // Tag a function so we can compose tag + capability queries
   const lsFn = lsSession.functions[0];
   const tagTxn = await server.callTool("begin_transaction", { session_id: lsSession.sessionId, name: "compose tag" });
-  await server.callTool("queue_tag", {
+  await server.callTool("queue", {
+    kind: "tag",
     session_id: lsSession.sessionId,
     transaction_id: tagTxn.transactionId,
     addr: lsFn.addr,
@@ -294,12 +300,12 @@ try {
   // Invalid procedure address
   let threw = false;
   try {
-    await server.callTool("procedure_info", { session_id: calcSession.sessionId, procedure: "0xdeadbeefcafe" });
+    await server.callTool("procedure", { field: "info", session_id: calcSession.sessionId, procedure: "0xdeadbeefcafe" });
   } catch (e) {
     threw = true;
-    if (!/not found|unknown|no procedure|resolve/i.test(e.message)) fail("unexpected procedure_info error", e.message);
+    if (!/not found|unknown|no procedure|resolve/i.test(e.message)) fail("unexpected procedure error", e.message);
   }
-  if (!threw) fail("procedure_info should throw on bogus addr", "no throw");
+  if (!threw) fail("procedure field=info should throw on bogus addr", "no throw");
 
   // Empty/whitespace-only query — should either throw or return zero matches, not crash
   const emptyResult = await server.callTool("query", { session_id: lsSession.sessionId, expression: "   " }).catch((e) => ({ thrown: e.message }));
@@ -313,7 +319,7 @@ try {
     badTxnThrew = true;
   }
   if (!badTxnThrew) fail("commit of bogus txn should throw", "no throw");
-  console.log(`    ✓ procedure_info throws on bogus addr, bogus commit throws, empty query handled`);
+  console.log(`    ✓ procedure field=info throws on bogus addr, bogus commit throws, empty query handled`);
 
   // ─── J: entitlements ───────────────────────────────────────────────────
   console.log("  [J] entitlements (Calculator is sandboxed)…");

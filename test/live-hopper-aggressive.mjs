@@ -293,8 +293,8 @@ try {
 
   if (sessionIds.length >= 2) {
     const diff = await callTool("diff_sessions", {
-      session_a: sessionIds[0],
-      session_b: sessionIds[1],
+      left_session_id: sessionIds[0],
+      right_session_id: sessionIds[1],
     });
     assert.ok(diff && typeof diff === "object", "diff_sessions returned no object");
     console.log(`  ✓ diff between first two sessions: keys=${Object.keys(diff).join(",").slice(0, 100)}`);

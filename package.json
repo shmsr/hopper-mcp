@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node ./src/mcp-server.js",
-    "check": "node --check ./src/mcp-server.js && node --check ./src/hopper-live.js && node --check ./src/macho-importer.js && node --check ./src/official-hopper-backend.js && node --check ./src/official-snapshot.js && node --check ./src/knowledge-store.js && node --check ./src/transaction-manager.js && node --check ./src/research-tools.js && node --check ./test/protocol-compat.mjs && node --check ./test/smoke.mjs && node --check ./test/real-app.mjs && node --check ./test/live-hopper.mjs && node --check ./test/official-backend.mjs && node --check ./test/all-tools-real.mjs && node --check ./test/research-tools.mjs && node --check ./test/research-integration.mjs && node --check ./test/multi-binary.mjs && node --check ./test/deep-coverage.mjs && node --check ./test/binary-zoo.mjs && node --check ./test/live-hopper-aggressive.mjs",
+    "check": "node --check ./src/mcp-server.js && node --check ./src/server-tools.js && node --check ./src/server-resources.js && node --check ./src/server-prompts.js && node --check ./src/server-helpers.js && node --check ./src/server-format.js && node --check ./src/sample-session.js && node --check ./src/hopper-live.js && node --check ./src/macho-importer.js && node --check ./src/official-hopper-backend.js && node --check ./src/official-snapshot.js && node --check ./src/knowledge-store.js && node --check ./src/transaction-manager.js && node --check ./src/research-tools.js && node --check ./test/protocol-compat.mjs && node --check ./test/smoke.mjs && node --check ./test/real-app.mjs && node --check ./test/live-hopper.mjs && node --check ./test/official-backend.mjs && node --check ./test/all-tools-real.mjs && node --check ./test/research-tools.mjs && node --check ./test/research-integration.mjs && node --check ./test/multi-binary.mjs && node --check ./test/deep-coverage.mjs && node --check ./test/binary-zoo.mjs && node --check ./test/live-hopper-aggressive.mjs",
     "smoke": "node ./test/smoke.mjs",
     "test:protocol": "node ./test/protocol-compat.mjs",
     "test:real": "node ./test/real-app.mjs",
@@ -25,5 +25,9 @@
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.6"
+  }
 }

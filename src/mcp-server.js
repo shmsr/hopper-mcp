@@ -35,6 +35,59 @@ process.on("exit", () => {
   officialBackend.close();
 });
 
+// On a controlled shutdown, flush any in-flight save before exiting so the
+// last upsertSession's mutations are not lost (scheduleSave is fire-and-forget).
+async function gracefulShutdown(signal) {
+  try {
+    process.stderr.write(`[hopper-mcp] received ${signal}; flushing knowledge store.\n`);
+  } catch {}
+  try {
+    await store.save();
+  } catch (err) {
+    try {
+      process.stderr.write(`[hopper-mcp] flush failed: ${err?.stack ?? err}\n`);
+    } catch {}
+  }
+  process.exit(0);
+}
+process.on("SIGINT", () => { gracefulShutdown("SIGINT"); });
+process.on("SIGTERM", () => { gracefulShutdown("SIGTERM"); });
+
+const DEBUG_LIFECYCLE = process.env.HOPPER_MCP_DEBUG_LIFECYCLE === "1";
+function lifecycleLog(kind, payload) {
+  if (!DEBUG_LIFECYCLE) return;
+  try {
+    process.stderr.write(`[hopper-mcp] ${kind} ${JSON.stringify(payload)}\n`);
+  } catch {}
+}
+
+process.on("uncaughtException", (err) => {
+  try {
+    process.stderr.write(`[hopper-mcp] uncaughtException: ${err?.stack ?? err}\n`);
+  } catch {}
+});
+process.on("unhandledRejection", (reason) => {
+  try {
+    process.stderr.write(`[hopper-mcp] unhandledRejection: ${reason?.stack ?? reason}\n`);
+  } catch {}
+});
+process.stdin.on("error", (err) => {
+  try { process.stderr.write(`[hopper-mcp] stdin error: ${err?.message ?? err}\n`); } catch {}
+});
+process.stdout.on("error", (err) => {
+  // The previous handler called process.exit(0) silently, which made the
+  // server look like it "vanished" after a successful response if the host
+  // closed the pipe. Log first so the cause is visible in MCP logs, then
+  // try to flush the store before exiting.
+  try {
+    process.stderr.write(`[hopper-mcp] stdout error (${err?.code ?? "unknown"}): ${err?.message ?? err}\n`);
+  } catch {}
+  if (err && err.code === "EPIPE") {
+    store.save().catch(() => {}).finally(() => process.exit(0));
+    return;
+  }
+});
+
 const serverInfo = {
   name: "hopper-mcp",
   title: "Hopper MCP",
@@ -494,22 +547,60 @@ function negotiateProtocolVersion(requestedVersion) {
   return latestProtocolVersion;
 }
 
-let inputBuffer = Buffer.alloc(0);
+const FRAMED_PREFIX = Buffer.from("Content-Length:", "utf8");
+let inputChunks = [];
+let inputBytes = 0;
 let outputMode = "line";
 let processing = Promise.resolve();
+let inFlight = 0;
+let inFlightDrained = null;
 
 function scheduleDrain() {
   processing = processing.then(() => drainInputBuffer());
   return processing;
 }
 
+function trackHandler(promise) {
+  inFlight += 1;
+  Promise.resolve(promise).finally(() => {
+    inFlight -= 1;
+    if (inFlight === 0 && inFlightDrained) {
+      const resolve = inFlightDrained;
+      inFlightDrained = null;
+      resolve();
+    }
+  });
+}
+
+function readInputBuffer() {
+  if (inputChunks.length === 0) return Buffer.alloc(0);
+  if (inputChunks.length === 1) return inputChunks[0];
+  const merged = Buffer.concat(inputChunks, inputBytes);
+  inputChunks = [merged];
+  return merged;
+}
+
+function setRemainingInput(rest) {
+  if (!rest || rest.length === 0) {
+    inputChunks = [];
+    inputBytes = 0;
+  } else {
+    inputChunks = [rest];
+    inputBytes = rest.length;
+  }
+}
+
 process.stdin.on("data", (chunk) => {
-  inputBuffer = Buffer.concat([inputBuffer, chunk]);
+  inputChunks.push(chunk);
+  inputBytes += chunk.length;
   scheduleDrain();
 });
 
 await new Promise((resolve) => process.stdin.on("end", resolve));
 await scheduleDrain();
+if (inFlight > 0) {
+  await new Promise((resolve) => { inFlightDrained = resolve; });
+}
 
 async function dispatch(message) {
   const handler = handlers[message.method];
@@ -1407,43 +1498,70 @@ function resourceTemplates() {
 async function handleMessage(message, mode) {
   outputMode = mode;
   const hasId = Object.hasOwn(message, "id") && message.id !== null;
+  const startedAt = Date.now();
+  lifecycleLog("request", { id: message.id ?? null, method: message.method });
   try {
     if (!hasId && message.method?.startsWith("notifications/")) return;
     const result = await dispatch(message);
-    if (hasId) write({ jsonrpc: "2.0", id: message.id, result }, mode);
+    if (hasId) {
+      write({ jsonrpc: "2.0", id: message.id, result }, mode);
+      if (DEBUG_LIFECYCLE) {
+        // JSON.stringify(result) can be expensive on large results; only
+        // pay the cost when lifecycle logging is actually enabled.
+        lifecycleLog("response", { id: message.id, method: message.method, ms: Date.now() - startedAt, bytes: JSON.stringify(result).length });
+      }
+    }
   } catch (error) {
-    if (hasId) write({ jsonrpc: "2.0", id: message.id, error: { code: error.code ?? -32603, message: error.message } }, mode);
+    if (hasId) {
+      write({ jsonrpc: "2.0", id: message.id, error: { code: error.code ?? -32603, message: error.message } }, mode);
+      lifecycleLog("error", { id: message.id, method: message.method, ms: Date.now() - startedAt, message: error.message });
+    }
   }
 }
 
 async function drainInputBuffer() {
   for (;;) {
-    const parsed = parseNextMessage(inputBuffer);
+    const buffer = readInputBuffer();
+    const parsed = parseNextMessage(buffer);
     if (!parsed) return;
-    inputBuffer = parsed.rest;
+    setRemainingInput(parsed.rest);
     if (!parsed.message) continue;
-    await handleMessage(parsed.message, parsed.mode);
+    trackHandler(handleMessage(parsed.message, parsed.mode));
   }
+}
+
+function findHeaderTerminator(buffer) {
+  const limit = Math.min(buffer.length, 64 * 1024);
+  for (let i = 0; i < limit - 1; i += 1) {
+    if (buffer[i] === 0x0a && buffer[i + 1] === 0x0a) {
+      return { headerEnd: i, bodyStart: i + 2 };
+    }
+    if (
+      i + 3 < limit &&
+      buffer[i] === 0x0d &&
+      buffer[i + 1] === 0x0a &&
+      buffer[i + 2] === 0x0d &&
+      buffer[i + 3] === 0x0a
+    ) {
+      return { headerEnd: i, bodyStart: i + 4 };
+    }
+  }
+  return null;
 }
 
 function parseNextMessage(buffer) {
   if (!buffer.length) return null;
-  const text = buffer.toString("utf8");
 
-  if (text.startsWith("Content-Length:")) {
-    const crlfHeaderEnd = text.indexOf("\r\n\r\n");
-    const lfHeaderEnd = text.indexOf("\n\n");
-    const headerEnd = crlfHeaderEnd === -1 ? lfHeaderEnd : lfHeaderEnd === -1 ? crlfHeaderEnd : Math.min(crlfHeaderEnd, lfHeaderEnd);
-    if (headerEnd === -1) return null;
-    const header = text.slice(0, headerEnd);
+  if (buffer.length >= FRAMED_PREFIX.length && buffer.compare(FRAMED_PREFIX, 0, FRAMED_PREFIX.length, 0, FRAMED_PREFIX.length) === 0) {
+    const terminator = findHeaderTerminator(buffer);
+    if (!terminator) return null;
+    const header = buffer.subarray(0, terminator.headerEnd).toString("utf8");
     const match = header.match(/Content-Length:\s*(\d+)/i);
     if (!match) throw new Error("Invalid MCP frame: missing Content-Length.");
     const contentLength = Number(match[1]);
-    const separatorLength = text.slice(headerEnd, headerEnd + 4).startsWith("\r\n\r\n") ? 4 : 2;
-    const bodyStart = Buffer.byteLength(text.slice(0, headerEnd + separatorLength), "utf8");
-    const bodyEnd = bodyStart + contentLength;
+    const bodyEnd = terminator.bodyStart + contentLength;
     if (buffer.length < bodyEnd) return null;
-    const body = buffer.subarray(bodyStart, bodyEnd).toString("utf8");
+    const body = buffer.subarray(terminator.bodyStart, bodyEnd).toString("utf8");
     return {
       mode: "framed",
       message: JSON.parse(body),
@@ -1451,10 +1569,10 @@ function parseNextMessage(buffer) {
     };
   }
 
-  const newline = text.indexOf("\n");
+  const newline = buffer.indexOf(0x0a);
   if (newline === -1) return null;
-  const line = text.slice(0, newline).trim();
-  const rest = buffer.subarray(Buffer.byteLength(text.slice(0, newline + 1), "utf8"));
+  const line = buffer.subarray(0, newline).toString("utf8").trim();
+  const rest = buffer.subarray(newline + 1);
   if (!line) return { mode: outputMode, message: null, rest };
   return {
     mode: "line",

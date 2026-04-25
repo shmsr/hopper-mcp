@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 
 const DEFAULT_OFFICIAL_MCP = "/Applications/Hopper Disassembler.app/Contents/MacOS/HopperMCPServer";
 const OFFICIAL_PROTOCOL_VERSION = "2025-03-26";
+const STDERR_CAP_BYTES = 8000;
 
 const WRITE_TOOLS = new Set([
   "set_current_document",
@@ -25,8 +26,9 @@ export class OfficialHopperBackend {
     this.timeoutMs = timeoutMs;
     this.enableWrites = enableWrites;
     this.child = null;
-    this.responses = new Map();
-    this.stderr = "";
+    this.pending = new Map();
+    this.stderrChunks = [];
+    this.stderrBytes = 0;
     this.nextId = 0;
     this.initialized = false;
     this.tools = null;
@@ -92,35 +94,59 @@ export class OfficialHopperBackend {
   }
 
   async start() {
-    if (this.initialized) return;
+    if (this.initialized && this.child && !this.child.killed) return;
     if (this.startPromise) return this.startPromise;
-    this.startPromise = this.#start();
-    try {
-      await this.startPromise;
-    } finally {
+    this.startPromise = this.#start().finally(() => {
       this.startPromise = null;
-    }
+    });
+    return this.startPromise;
   }
 
   async #start() {
     this.child = spawn(this.command, [], { stdio: ["pipe", "pipe", "pipe"] });
+
     this.child.stderr.on("data", (chunk) => {
-      this.stderr = `${this.stderr}${chunk.toString("utf8")}`.slice(-8000);
+      const text = chunk.toString("utf8");
+      this.stderrChunks.push(text);
+      this.stderrBytes += text.length;
+      this.#trimStderr();
     });
-    this.child.on("exit", () => {
+
+    this.child.on("exit", (code, signal) => {
       this.initialized = false;
       this.tools = null;
+      const reason = signal ? `signal ${signal}` : `exit ${code}`;
+      const tail = this.#stderrTail();
+      const error = new Error(`Official Hopper MCP server terminated (${reason}). stderr: ${tail}`);
+      const pending = Array.from(this.pending.values());
+      this.pending.clear();
+      for (const entry of pending) {
+        clearTimeout(entry.timer);
+        entry.reject(error);
+      }
+    });
+
+    this.child.on("error", (err) => {
+      this.#noteStderr(`\n[child error] ${err?.message ?? err}`);
     });
 
     const rl = createInterface({ input: this.child.stdout });
     rl.on("line", (line) => {
       if (!line.trim()) return;
+      let message;
       try {
-        const message = JSON.parse(line);
-        if (Object.hasOwn(message, "id")) this.responses.set(message.id, message);
+        message = JSON.parse(line);
       } catch {
-        this.stderr = `${this.stderr}\n[non-json stdout] ${line}`.slice(-8000);
+        this.#noteStderr(`\n[non-json stdout] ${line}`);
+        return;
       }
+      if (!Object.hasOwn(message, "id")) return;
+      const entry = this.pending.get(message.id);
+      if (!entry) return;
+      this.pending.delete(message.id);
+      clearTimeout(entry.timer);
+      if (message.error) entry.reject(new Error(message.error.message));
+      else entry.resolve(message.result ?? {});
     });
 
     const initialized = await this.request("initialize", {
@@ -134,23 +160,24 @@ export class OfficialHopperBackend {
     this.initialized = true;
   }
 
-  async request(method, params = {}, timeoutMs = this.timeoutMs) {
-    if (!this.child || this.child.killed) throw new Error("Official Hopper MCP server is not running.");
-    const id = ++this.nextId;
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-    const deadline = Date.now() + timeoutMs;
-
-    while (Date.now() < deadline) {
-      if (this.responses.has(id)) {
-        const response = this.responses.get(id);
-        this.responses.delete(id);
-        if (response.error) throw new Error(response.error.message);
-        return response.result ?? {};
-      }
-      await new Promise((resolve) => setTimeout(resolve, 20));
+  request(method, params = {}, timeoutMs = this.timeoutMs) {
+    if (!this.child || this.child.killed) {
+      return Promise.reject(new Error("Official Hopper MCP server is not running."));
     }
-
-    throw new Error(`Timed out waiting for official Hopper MCP ${method} after ${timeoutMs}ms. stderr: ${this.stderr.slice(-1000)}`);
+    const id = ++this.nextId;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new Error(`Timed out waiting for official Hopper MCP ${method} after ${timeoutMs}ms. stderr: ${this.#stderrTail()}`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      } catch (err) {
+        if (this.pending.delete(id)) clearTimeout(timer);
+        reject(err);
+      }
+    });
   }
 
   close() {
@@ -158,7 +185,37 @@ export class OfficialHopperBackend {
     this.child = null;
     this.initialized = false;
     this.tools = null;
-    this.responses.clear();
+    const pending = Array.from(this.pending.values());
+    this.pending.clear();
+    const error = new Error("Official Hopper MCP backend closed.");
+    for (const entry of pending) {
+      clearTimeout(entry.timer);
+      entry.reject(error);
+    }
+  }
+
+  #noteStderr(text) {
+    this.stderrChunks.push(text);
+    this.stderrBytes += text.length;
+    this.#trimStderr();
+  }
+
+  #trimStderr() {
+    while (this.stderrBytes > STDERR_CAP_BYTES && this.stderrChunks.length > 1) {
+      this.stderrBytes -= this.stderrChunks[0].length;
+      this.stderrChunks.shift();
+    }
+    if (this.stderrChunks.length === 1 && this.stderrBytes > STDERR_CAP_BYTES) {
+      const overflow = this.stderrBytes - STDERR_CAP_BYTES;
+      this.stderrChunks[0] = this.stderrChunks[0].slice(overflow);
+      this.stderrBytes -= overflow;
+    }
+  }
+
+  #stderrTail() {
+    if (this.stderrChunks.length === 0) return "";
+    const joined = this.stderrChunks.length === 1 ? this.stderrChunks[0] : this.stderrChunks.join("");
+    return joined.slice(-1000);
   }
 }
 

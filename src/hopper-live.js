@@ -422,6 +422,9 @@ async function resolveMachOArch(executablePath, requestedArch = "auto") {
 }
 
 async function listMachOArchitectures(executablePath) {
+  if (!executablePath || typeof executablePath !== "string") {
+    throw new Error("listMachOArchitectures requires a non-empty executablePath string.");
+  }
   try {
     const result = await execFileAsync("lipo", ["-archs", executablePath], { maxBuffer: 1024 * 1024 });
     return result.stdout.trim().split(/\s+/).filter(Boolean);

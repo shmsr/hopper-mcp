@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 
 const EMPTY_STORE = {
@@ -11,6 +11,7 @@ export class KnowledgeStore {
   constructor(path) {
     this.path = path;
     this.state = structuredClone(EMPTY_STORE);
+    this._savePromise = null;
   }
 
   async load() {
@@ -24,9 +25,37 @@ export class KnowledgeStore {
     }
   }
 
+  // Durable: resolves once the latest enqueued write has hit disk.
   async save() {
+    return this._enqueueSave();
+  }
+
+  // Fire-and-forget. Errors get logged to stderr instead of becoming an
+  // unhandledRejection. Use this from hot paths where the response should
+  // not block on a 100 MB JSON.stringify + writeFile.
+  scheduleSave() {
+    this._enqueueSave().catch((err) => {
+      try {
+        process.stderr.write(`[hopper-mcp] knowledge-store save error: ${err?.stack ?? err}\n`);
+      } catch {}
+    });
+  }
+
+  // Single-flight serializer: chains writes so concurrent callers cannot
+  // race on the same file, and one failure does not poison the queue.
+  _enqueueSave() {
+    const next = (this._savePromise ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => this._writeStateToDisk());
+    this._savePromise = next;
+    return next;
+  }
+
+  async _writeStateToDisk() {
     await mkdir(dirname(this.path), { recursive: true });
-    await writeFile(this.path, JSON.stringify(this.state, null, 2) + "\n", "utf8");
+    const tmp = `${this.path}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmp, JSON.stringify(this.state) + "\n", "utf8");
+    await rename(tmp, this.path);
   }
 
   listSessions() {
@@ -61,7 +90,10 @@ export class KnowledgeStore {
     if (existing) mergeUserAnnotations(normalized, existing);
     this.state.sessions[sessionId] = normalized;
     this.state.currentSessionId = sessionId;
-    await this.save();
+    // Background save: importer paths can produce ~100 MB stringify; keep
+    // the response off the event-loop stall. Annotation tools that need
+    // durability still call await store.save() explicitly.
+    this.scheduleSave();
     return normalized;
   }
 

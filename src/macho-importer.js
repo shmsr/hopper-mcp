@@ -25,6 +25,9 @@ export async function importMachO(path, {
   includeEntropy = true,
   includeObjC = true,
 } = {}) {
+  if (!path || typeof path !== "string") {
+    throw new Error("import_macho requires executable_path (string).");
+  }
   const archSelection = await resolveMachOArch(path, arch);
   const selectedArch = archSelection.arch;
   const [fileInfo, libraries, symbols, stringRows, loadCommands] = await Promise.all([
@@ -554,6 +557,9 @@ async function resolveMachOArch(path, requestedArch = "auto") {
 }
 
 async function listMachOArchitectures(path) {
+  if (!path || typeof path !== "string") {
+    throw new Error("listMachOArchitectures requires a non-empty path string.");
+  }
   try {
     const result = await execFileAsync("lipo", ["-archs", path], { maxBuffer: 1024 * 1024 });
     return result.stdout.trim().split(/\s+/).filter(Boolean);

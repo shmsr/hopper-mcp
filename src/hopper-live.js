@@ -30,6 +30,7 @@ export async function ingestWithLiveHopper({
   waitForAnalysis = false,
   fullExport = false,
   failOnTruncation = fullExport,
+  officialBackend = null,
 } = {}) {
   if (!executablePath) throw new Error("ingest_live_hopper requires executable_path.");
   const executableKey = normalizeExecutableKey(executablePath);
@@ -52,6 +53,7 @@ export async function ingestWithLiveHopper({
     waitForAnalysis,
     fullExport,
     failOnTruncation,
+    officialBackend,
   }));
   liveIngestInFlight.set(executableKey, task);
   try {
@@ -77,6 +79,7 @@ async function ingestWithLiveHopperUnlocked({
   waitForAnalysis = false,
   fullExport = false,
   failOnTruncation = fullExport,
+  officialBackend = null,
 } = {}) {
   if (!executablePath) throw new Error("ingest_live_hopper requires executable_path.");
 
@@ -86,9 +89,17 @@ async function ingestWithLiveHopperUnlocked({
   const effectiveMaxBlocksPerFunction = fullExport ? (maxBlocksPerFunction ?? null) : (maxBlocksPerFunction ?? 64);
   const effectiveMaxInstructionsPerBlock = fullExport ? (maxInstructionsPerBlock ?? null) : (maxInstructionsPerBlock ?? 24);
   const effectiveMaxPseudocodeFunctions = includePseudocode ? (maxPseudocodeFunctions ?? 25) : 0;
-  const officialBackend = new OfficialHopperBackend({
-    timeoutMs: Math.min(Math.max(10000, Math.floor(timeoutMs / 4)), 30000),
-  });
+
+  // Reuse the caller's (singleton) backend when provided, so that live ingest
+  // doesn't spawn a second HopperMCPServer that races the parent's own. We
+  // only construct + close our own when no backend was threaded in (tests
+  // calling ingestWithLiveHopper directly).
+  const ownsBackend = !officialBackend;
+  if (!officialBackend) {
+    officialBackend = new OfficialHopperBackend({
+      timeoutMs: Math.min(Math.max(10000, Math.floor(timeoutMs / 4)), 30000),
+    });
+  }
 
   try {
     const baselineCurrentDocument = await safeCurrentDocument(officialBackend);
@@ -97,6 +108,21 @@ async function ingestWithLiveHopperUnlocked({
       executablePath,
       currentDocument: baselineCurrentDocument,
     });
+    // If a same-named document is open but unusable (no procedures, errored
+    // backend), AppleScript "open executable" tends to focus the existing
+    // window rather than re-analyzing. Close the stale shell first so the
+    // launch path actually starts a fresh analysis.
+    if (
+      !reusableCurrentDocument
+      && baselineCurrentDocument === basename(executablePath)
+      && isOsaScriptLauncher(hopperLauncher)
+    ) {
+      try {
+        await closeHopperDocument(baselineCurrentDocument, { hopperLauncher });
+      } catch {
+        // Best-effort. If we can't close it, the launch step will still try.
+      }
+    }
     const launch = await launchExecutableInHopper({
       executablePath,
       hopperLauncher,
@@ -132,8 +158,30 @@ async function ingestWithLiveHopperUnlocked({
       launch,
     };
   } finally {
-    officialBackend.close();
+    if (ownsBackend) officialBackend.close();
   }
+}
+
+// Best-effort: ask Hopper to close a document by name. Used by close_session
+// when the caller asked us to also evict the live document. Failures are
+// swallowed by callers — the user may have closed the document already, or
+// may be running without Automation permission.
+export async function closeHopperDocument(documentName, { hopperLauncher = DEFAULT_OSASCRIPT } = {}) {
+  if (!documentName) throw new Error("closeHopperDocument requires a document name.");
+  if (!isOsaScriptLauncher(hopperLauncher)) {
+    throw new Error("closeHopperDocument needs an osascript launcher to drive Hopper.");
+  }
+  const appleScript = [
+    'tell application "Hopper Disassembler" to ',
+    "close (every document whose name is ",
+    quoteAppleScriptString(documentName),
+    ") saving no",
+  ].join("");
+  await execFileAsync(hopperLauncher, ["-e", appleScript], {
+    timeout: 15000,
+    maxBuffer: 1024 * 1024,
+  });
+  return { documentName, appleScript };
 }
 
 function enqueueLiveIngest(work) {
@@ -210,14 +258,18 @@ async function shouldReuseCurrentDocument({
   currentDocument,
 }) {
   if (currentDocument !== basename(executablePath)) return false;
+  // Only reuse when the document already has a non-empty procedure index.
+  // A stale 'ls' document with zero procedures (or one whose backend errors
+  // with "The document has no content") would otherwise trick us into
+  // skipping the launch and then time out polling forever.
   try {
     const procedures = await officialBackend.callTool("list_procedures", {});
     const procedureIndex = officialToolPayload(procedures);
     if (procedureIndex && typeof procedureIndex === "object" && Object.keys(procedureIndex).length > 0) return true;
   } catch {
-    return true;
+    return false;
   }
-  return true;
+  return false;
 }
 
 async function waitForOfficialSnapshot({

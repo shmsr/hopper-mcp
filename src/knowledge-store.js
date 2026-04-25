@@ -85,17 +85,75 @@ export class KnowledgeStore {
     return this.state.sessions[id];
   }
 
-  async upsertSession(session) {
+  // Pin a previously-loaded session as the active one. Throws when the id is
+  // unknown so callers can surface "no such session" instead of silently
+  // creating a dangling currentSessionId pointer.
+  setCurrentSession(sessionId) {
+    if (!sessionId || !this.state.sessions[sessionId]) {
+      throw new Error(`No Hopper session loaded for '${sessionId}'.`);
+    }
+    this.state.currentSessionId = sessionId;
+    this.scheduleSave();
+    return this.state.sessions[sessionId];
+  }
+
+  // Drop a session from disk + memory. Returns the dropped session record so
+  // callers can read e.g. binary.name for a live-Hopper close-document call.
+  async dropSession(sessionId) {
+    const id = sessionId === "current" ? this.state.currentSessionId : sessionId;
+    if (!id || !this.state.sessions[id]) {
+      throw new Error(`No Hopper session loaded for '${sessionId}'.`);
+    }
+    const dropped = this.state.sessions[id];
+    delete this.state.sessions[id];
+    if (this.state.currentSessionId === id) {
+      const remaining = Object.values(this.state.sessions)
+        .sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+      this.state.currentSessionId = remaining[0]?.sessionId;
+    }
+    // Durable: drops are user-visible state changes that must survive a
+    // crash. Use await save instead of fire-and-forget.
+    await this.save();
+    return dropped;
+  }
+
+  async upsertSession(session, { overwrite = true, foldAliases = false } = {}) {
     const now = new Date().toISOString();
     const sessionId = session.sessionId ?? `session-${crypto.randomUUID()}`;
     const existing = this.state.sessions[sessionId];
+    if (existing && !overwrite) {
+      throw new Error(
+        `Session '${sessionId}' already exists. Pass overwrite=true to replace it, or close_session first.`,
+      );
+    }
+
+    // Optional: fold sessions that point at the same binary into the new one
+    // so re-ingesting via a different prefix (live-/official-/macho-) doesn't
+    // leave forks behind. Off by default because folding a sparse macho
+    // import on top of a rich live-Hopper session would discard the latter's
+    // function bodies — only the user's annotations are carried forward by
+    // mergeUserAnnotations. Callers that genuinely want to dedupe pass
+    // fold_aliases=true (e.g. after confirming both sources are equivalent).
+    const incomingPath = session.binary?.path ?? null;
+    const aliases = [];
+    if (foldAliases && incomingPath) {
+      for (const [otherId, other] of Object.entries(this.state.sessions)) {
+        if (otherId === sessionId) continue;
+        if (other.binary?.path && other.binary.path === incomingPath) aliases.push(other);
+      }
+    }
+
     const normalized = normalizeSession({
       ...session,
       sessionId,
-      createdAt: session.createdAt ?? existing?.createdAt ?? now,
+      createdAt: session.createdAt ?? existing?.createdAt ?? aliases[0]?.createdAt ?? now,
       updatedAt: now,
     });
     if (existing) mergeUserAnnotations(normalized, existing);
+    for (const alias of aliases) {
+      mergeUserAnnotations(normalized, alias);
+      delete this.state.sessions[alias.sessionId];
+    }
     this.state.sessions[sessionId] = normalized;
     this.state.currentSessionId = sessionId;
     this.pruneStaleSessions();

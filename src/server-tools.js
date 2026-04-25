@@ -9,6 +9,7 @@ import {
 } from "./macho-importer.js";
 import { officialToolPayload } from "./official-hopper-backend.js";
 import { buildOfficialSnapshot } from "./official-snapshot.js";
+import { closeHopperDocument } from "./hopper-live.js";
 import {
   classifyImports,
   detectAntiAnalysis,
@@ -85,6 +86,7 @@ export function registerTools(server, ctx) {
         adapter: adapter.capabilities(),
         officialBackend: officialBackend.capabilities(),
         sessions: store.listSessions(),
+        currentSessionId: store.state.currentSessionId ?? null,
       }),
   );
 
@@ -155,7 +157,19 @@ export function registerTools(server, ctx) {
     include_pseudocode: optionalBool,
     include_call_graph: optionalBool,
     fail_on_truncation: optionalBool,
+    overwrite: optionalBool,
   };
+
+  // Centralizes the upsertSession options for tools that ingest/replace
+  // sessions, so the overwrite + alias-fold semantics are consistent across
+  // ingest_official_hopper / ingest_live_hopper / import_macho / open_session.
+  // fold_aliases is opt-in: cross-source ingests (live ↔ macho ↔ official)
+  // produce intentionally different richness, so we don't auto-discard the
+  // older one.
+  const upsertOptions = (args) => ({
+    overwrite: args?.overwrite ?? true,
+    foldAliases: args?.fold_aliases ?? false,
+  });
 
   server.registerTool(
     "ingest_official_hopper",
@@ -176,7 +190,7 @@ export function registerTools(server, ctx) {
         failOnTruncation: Boolean(args.fail_on_truncation),
       });
       await notifyProgress(extra, 1, 2, "Updating local snapshot store.");
-      const session = await store.upsertSession(snapshot);
+      const session = await store.upsertSession(snapshot, upsertOptions(args));
       notifyResourceListChanged();
       await notifyProgress(extra, 2, 2, "Official Hopper snapshot refreshed.");
       return toolResult({ session: store.describeSession(session), source: "official-hopper-mcp" });
@@ -187,17 +201,20 @@ export function registerTools(server, ctx) {
     "open_session",
     {
       title: "Open Session",
-      description: "Create or replace a session from an already-indexed JSON payload.",
+      description:
+        "Create or replace a session from an already-indexed JSON payload. Pass overwrite=false to fail when a session with the same id already exists.",
       inputSchema: {
         session: z.record(z.string(), z.any()).describe(
           "Normalized session document with functions, strings, imports, exports, and metadata.",
         ),
+        overwrite: optionalBool,
+        fold_aliases: optionalBool,
       },
       annotations: WRITE_LOCAL,
     },
     async (args, extra) => {
       await notifyProgress(extra, 0, 1, "Opening indexed session.");
-      const session = store.describeSession(await store.upsertSession(args.session));
+      const session = store.describeSession(await store.upsertSession(args.session, upsertOptions(args)));
       notifyResourceListChanged();
       await notifyProgress(extra, 1, 1, "Indexed session opened.");
       return toolResult(session);
@@ -240,6 +257,8 @@ export function registerTools(server, ctx) {
         fail_on_truncation: optionalBool,
         include_pseudocode: optionalBool,
         max_pseudocode_functions: optionalNumber,
+        overwrite: optionalBool,
+        fold_aliases: optionalBool,
       },
       annotations: WRITE_LIVE,
     },
@@ -260,7 +279,7 @@ export function registerTools(server, ctx) {
         maxPseudocodeFunctions: args.max_pseudocode_functions,
       });
       await notifyProgress(extra, 1, 2, "Ingesting Hopper export.");
-      const session = await store.upsertSession(live.session);
+      const session = await store.upsertSession(live.session, upsertOptions(args));
       notifyResourceListChanged();
       await notifyProgress(extra, 2, 2, "Live Hopper session ingested.");
       return toolResult({ session: store.describeSession(session), launch: live.launch });
@@ -279,6 +298,8 @@ export function registerTools(server, ctx) {
         max_strings: optionalNumber,
         deep: optionalBool,
         max_functions: optionalNumber,
+        overwrite: optionalBool,
+        fold_aliases: optionalBool,
       },
       annotations: WRITE_LOCAL,
     },
@@ -297,12 +318,65 @@ export function registerTools(server, ctx) {
         maxFunctions: args.max_functions ?? 30000,
       });
       if (isDeep) await notifyProgress(extra, 2, 3, "Indexing discovered functions.");
-      const session = await store.upsertSession(imported);
+      const session = await store.upsertSession(imported, upsertOptions(args));
       notifyResourceListChanged();
       await notifyProgress(extra, isDeep ? 3 : 1, isDeep ? 3 : 1, "Mach-O import complete.");
       return toolResult({
         session: store.describeSession(session),
         source: isDeep ? "local-macho-deep" : "local-macho-importer",
+      });
+    },
+  );
+
+  server.registerTool(
+    "set_current_session",
+    {
+      title: "Set Current Session",
+      description:
+        "Pin a previously-loaded session as the active one for tools that default to session_id='current'.",
+      inputSchema: { session_id: z.string() },
+      annotations: WRITE_LOCAL,
+    },
+    async (args) => {
+      const session = store.setCurrentSession(args.session_id);
+      notifyResourceListChanged();
+      return toolResult({
+        currentSessionId: args.session_id,
+        session: store.describeSession(session),
+        sessions: store.listSessions(),
+      });
+    },
+  );
+
+  server.registerTool(
+    "close_session",
+    {
+      title: "Close Session",
+      description:
+        "Drop a session from the local store. Pass session_id='current' to drop the active session. Optionally also closes the document inside Hopper for live ingests via close_in_hopper=true.",
+      inputSchema: {
+        session_id: z.string(),
+        close_in_hopper: optionalBool,
+      },
+      annotations: WRITE_LOCAL,
+    },
+    async (args) => {
+      const dropped = await store.dropSession(args.session_id);
+      const documentName = dropped?.binary?.name ?? null;
+      let hopperClose = null;
+      if (args.close_in_hopper && documentName) {
+        try {
+          hopperClose = await closeHopperDocument(documentName);
+        } catch (err) {
+          hopperClose = { error: String(err?.message ?? err), documentName };
+        }
+      }
+      notifyResourceListChanged();
+      return toolResult({
+        droppedSessionId: dropped?.sessionId ?? null,
+        currentSessionId: store.state.currentSessionId ?? null,
+        sessions: store.listSessions(),
+        hopperClose,
       });
     },
   );

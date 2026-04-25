@@ -1,9 +1,14 @@
 import { ingestWithLiveHopper } from "./hopper-live.js";
 
 export class HopperAdapter {
-  constructor({ socketPath = null, hopperLauncher = null } = {}) {
+  constructor({ socketPath = null, hopperLauncher = null, officialBackend = null } = {}) {
     this.socketPath = socketPath;
     this.hopperLauncher = hopperLauncher;
+    // Threaded in by mcp-server.js so live ingest reuses the singleton
+    // HopperMCPServer subprocess instead of spawning a fresh one per call.
+    // Two concurrent backends both attach to the same Hopper UI and race
+    // for state changes; one is the right answer.
+    this.officialBackend = officialBackend;
   }
 
   capabilities() {
@@ -23,6 +28,7 @@ export class HopperAdapter {
     return ingestWithLiveHopper({
       ...options,
       hopperLauncher: options.hopperLauncher ?? this.hopperLauncher ?? undefined,
+      officialBackend: options.officialBackend ?? this.officialBackend ?? null,
     });
   }
 

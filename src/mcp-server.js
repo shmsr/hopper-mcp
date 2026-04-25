@@ -26,11 +26,12 @@ const store = new KnowledgeStore(
   { sessionCap: Number(process.env.HOPPER_MCP_SESSION_CAP) || undefined },
 );
 const transactions = new TransactionManager(store);
+const officialBackend = new OfficialHopperBackend();
 const adapter = new HopperAdapter({
   socketPath: process.env.HOPPER_MCP_SOCKET ?? null,
   hopperLauncher: process.env.HOPPER_LAUNCHER ?? null,
+  officialBackend,
 });
-const officialBackend = new OfficialHopperBackend();
 
 await store.load();
 
@@ -52,13 +53,20 @@ registerResources(mcp, store);
 registerPrompts(mcp);
 
 // ── lifecycle ──────────────────────────────────────────────────────────────
+let shuttingDown = false;
+let stdoutBroken = false;
+
 process.on("exit", () => {
-  officialBackend.close();
+  // Synchronous-only here — Node has stopped the event loop. Long-running
+  // cleanup (durable save) happens in gracefulShutdown.
+  try { officialBackend.close(); } catch {}
 });
 
-// On a controlled shutdown, flush any in-flight save before exiting so the
-// last upsertSession's mutations are not lost (scheduleSave is fire-and-forget).
-async function gracefulShutdown(signal) {
+// shuttingDown latches: signals can fire repeatedly during shutdown and we
+// want exactly one save+exit, not racing copies that double-write the store.
+async function gracefulShutdown(signal, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   try {
     process.stderr.write(`[hopper-mcp] received ${signal}; flushing knowledge store.\n`);
   } catch {}
@@ -69,42 +77,43 @@ async function gracefulShutdown(signal) {
       process.stderr.write(`[hopper-mcp] flush failed: ${err?.stack ?? err}\n`);
     } catch {}
   }
-  process.exit(0);
+  try { officialBackend.close(); } catch {}
+  process.exit(exitCode);
 }
-process.on("SIGINT", () => {
-  gracefulShutdown("SIGINT");
-});
-process.on("SIGTERM", () => {
-  gracefulShutdown("SIGTERM");
-});
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
+// stdin EOF is the canonical clean-shutdown signal for a stdio MCP server:
+// the host has closed the pipe, so flush durably and exit 0.
+process.stdin.on("end", () => gracefulShutdown("stdin EOF"));
+
+// uncaughtException / unhandledRejection used to be log-only, leaving the
+// process half-alive with corrupted in-memory state. Flush, then exit non-zero
+// so the host respawns instead of routing more traffic at us.
 process.on("uncaughtException", (err) => {
-  try {
-    process.stderr.write(`[hopper-mcp] uncaughtException: ${err?.stack ?? err}\n`);
-  } catch {}
+  gracefulShutdown(`uncaughtException: ${err?.stack ?? err}`, 1).catch(() => process.exit(1));
 });
 process.on("unhandledRejection", (reason) => {
-  try {
-    process.stderr.write(`[hopper-mcp] unhandledRejection: ${reason?.stack ?? reason}\n`);
-  } catch {}
+  gracefulShutdown(`unhandledRejection: ${reason?.stack ?? reason}`, 1).catch(() => process.exit(1));
 });
+
 process.stdin.on("error", (err) => {
   try {
     process.stderr.write(`[hopper-mcp] stdin error: ${err?.message ?? err}\n`);
   } catch {}
 });
+// EPIPE on stdout means the host went away. Previously we exited synchronously,
+// which made the server appear to vanish mid-response and prevented graceful
+// reconnect. Now we mark stdout broken, kick a durable save, and let stdin EOF
+// or SIGTERM trigger the actual exit. If the host abandons us without closing
+// stdin, the next signal cleans up.
 process.stdout.on("error", (err) => {
-  // Log first so the cause is visible in MCP logs (the previous server silently
-  // exited on EPIPE, which made it look like the process "vanished" right
-  // after returning a large response). Then flush the store.
   try {
     process.stderr.write(`[hopper-mcp] stdout error (${err?.code ?? "unknown"}): ${err?.message ?? err}\n`);
   } catch {}
-  if (err && err.code === "EPIPE") {
-    store
-      .save()
-      .catch(() => {})
-      .finally(() => process.exit(0));
+  if (err && err.code === "EPIPE" && !stdoutBroken) {
+    stdoutBroken = true;
+    store.save().catch(() => {});
   }
 });
 

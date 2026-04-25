@@ -1,7 +1,12 @@
 import { formatAddress, parseAddress } from "./knowledge-store.js";
 import { officialToolPayload } from "./official-hopper-backend.js";
 
-const DEFAULT_MAX_PROCEDURES = 500;
+// Library default: no implicit procedure cap. Capping was previously 500,
+// which silently truncated mid-analysis on real binaries (cursorsandbox
+// alone has thousands of procedures). Callers that need a cap pass one
+// explicitly; the tool layer surfaces it as max_procedures so the cap is
+// visible in the request rather than buried in a constant.
+const DEFAULT_MAX_PROCEDURES = null;
 
 export async function buildOfficialSnapshot(backend, {
   maxProcedures = DEFAULT_MAX_PROCEDURES,
@@ -155,8 +160,8 @@ async function optionalOfficialPayload(backend, name, args, fallback) {
 }
 
 function normalizeLimit(value) {
-  if (value === null) return null;
-  const parsed = Number(value ?? DEFAULT_MAX_PROCEDURES);
+  if (value === null || value === undefined) return null;
+  const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return Math.floor(parsed);
 }

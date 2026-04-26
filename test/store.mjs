@@ -63,7 +63,10 @@ test("setCurrentSession rejects unknown id and accepts known id", async () => {
     assert.throws(() => store.setCurrentSession("nope"), /No Hopper session|not found|unknown/i);
     store.setCurrentSession("a");
     assert.equal(store.state.currentSessionId, "a");
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally {
+    await store.save();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("listSessions returns every loaded session", async () => {
@@ -76,7 +79,10 @@ test("listSessions returns every loaded session", async () => {
     const list = store.listSessions();
     assert.equal(list.length, 2);
     assert.deepEqual(list.map((s) => s.sessionId).sort(), ["a", "b"]);
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally {
+    await store.save();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('getResource("hopper://transactions/pending") returns an array', async () => {
@@ -88,7 +94,10 @@ test('getResource("hopper://transactions/pending") returns an array', async () =
     store.setCurrentSession("a");
     const out = store.getResource("hopper://transactions/pending");
     assert.ok(Array.isArray(out));
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally {
+    await store.save();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('getResource("hopper://function/{addr}") returns the function record', async () => {
@@ -107,7 +116,10 @@ test('getResource("hopper://function/{addr}") returns the function record', asyn
     assert.ok(out);
     assert.equal(out.addr, "0x1000");
     assert.equal(out.name, "fnA");
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally {
+    await store.save();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("getResource with ?session_id reads from a non-current session", async () => {
@@ -130,7 +142,10 @@ test("getResource with ?session_id reads from a non-current session", async () =
     store.setCurrentSession("a");
     const out = store.getResource("hopper://function/0x2000?session_id=b");
     assert.equal(out?.name, "fnB");
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally {
+    await store.save();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("session cap evicts oldest non-current sessions", async () => {
@@ -146,7 +161,10 @@ test("session cap evicts oldest non-current sessions", async () => {
     const ids = Object.keys(store.state.sessions).sort();
     assert.deepEqual(ids, ["s2", "s3", "s4"]);
     assert.equal(store.state.currentSessionId, "s4");
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally {
+    await store.save();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("session cap pins currentSessionId even when oldest", async () => {
@@ -162,5 +180,8 @@ test("session cap pins currentSessionId even when oldest", async () => {
     const evicted = store.pruneStaleSessions(1);
     assert.deepEqual(Object.keys(store.state.sessions), ["old"]);
     assert.deepEqual(evicted.sort(), ["newer", "newest"]);
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally {
+    await store.save();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

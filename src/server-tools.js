@@ -43,7 +43,6 @@ import {
 } from "./server-helpers.js";
 import { toolResult, boundedNumber, DEFAULT_MAX_TOOL_TEXT_CHARS } from "./server-format.js";
 import { parseAddress, formatAddress } from "./knowledge-store.js";
-import { sampleSession } from "../test/fixtures/sample-session.mjs";
 
 const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
 const READ_OPEN_WORLD = { readOnlyHint: true, openWorldHint: true };
@@ -56,7 +55,6 @@ const optionalBool = z.boolean().optional();
 
 export function registerTools(server, ctx) {
   const { store, transactions, adapter, officialBackend, serverInfo } = ctx;
-  const enableDebugTools = process.env.HOPPER_MCP_ENABLE_DEBUG_TOOLS === "1";
 
   const notifyProgress = async (extra, progress, total, message) => {
     const progressToken = extra?._meta?.progressToken;
@@ -121,38 +119,6 @@ export function registerTools(server, ctx) {
       });
     },
   );
-
-  server.registerTool(
-    "official_hopper_tools",
-    {
-      title: "Official Hopper Tools",
-      description: "List tools exposed by Hopper's installed official MCP server.",
-      inputSchema: {},
-      annotations: READ_OPEN_WORLD,
-    },
-    async () => toolResult(await officialBackend.listTools()),
-  );
-
-  if (enableDebugTools) {
-    server.registerTool(
-      "debug_echo",
-      {
-        title: "Debug Echo",
-        description: "Internal test helper that echoes a payload through the MCP result formatter.",
-        inputSchema: {
-          value: z.string(),
-          max_result_chars: optionalNumber,
-          include_full_result: optionalBool,
-        },
-        annotations: READ_ONLY,
-      },
-      async (args) =>
-        toolResult(args.value, {
-          maxTextChars: boundedNumber(args.max_result_chars, DEFAULT_MAX_TOOL_TEXT_CHARS),
-          includeFullResult: Boolean(args.include_full_result),
-        }),
-    );
-  }
 
   // ── ingest + import ────────────────────────────────────────────────────
   const ingestSchema = {
@@ -222,23 +188,6 @@ export function registerTools(server, ctx) {
       const session = store.describeSession(await store.upsertSession(args.session, upsertOptions(args)));
       notifyResourceListChanged();
       await notifyProgress(extra, 1, 1, "Indexed session opened.");
-      return toolResult(session);
-    },
-  );
-
-  server.registerTool(
-    "ingest_sample",
-    {
-      title: "Ingest Sample",
-      description: "Load a small built-in sample session for smoke tests and client exploration.",
-      inputSchema: {},
-      annotations: WRITE_LOCAL,
-    },
-    async (_args, extra) => {
-      await notifyProgress(extra, 0, 1, "Loading sample session.");
-      const session = store.describeSession(await store.upsertSession(sampleSession()));
-      notifyResourceListChanged();
-      await notifyProgress(extra, 1, 1, "Sample session loaded.");
       return toolResult(session);
     },
   );

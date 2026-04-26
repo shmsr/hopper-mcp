@@ -1804,7 +1804,7 @@ export function registerTools(server, ctx) {
         case "entropy": {
           const binaryPath = session.binary?.path;
           if (!binaryPath) throw rpcError(-32602, "analyze_binary(entropy) requires a session with a binary path.");
-          return toolResult(await computeSectionEntropy(binaryPath, session.binary?.arch ?? "auto"));
+          return toolResult(await computeSectionEntropy(binaryPath, session.binary?.arch ?? "auto", { maxBytes: 4 * 1024 * 1024 }));
         }
         case "code_signing": {
           const binaryPath = session.binary?.path;
@@ -1814,9 +1814,10 @@ export function registerTools(server, ctx) {
         case "objc": {
           const binaryPath = session.binary?.path;
           if (!binaryPath) throw rpcError(-32602, "analyze_binary(objc) requires a session with a binary path.");
-          const classes = await extractObjCRuntime(binaryPath, session.binary?.arch ?? "auto");
+          const classes = await extractObjCRuntime(binaryPath, session.binary?.arch ?? "auto", { maxClasses: 1000 });
           return toolResult({ count: classes.length, classes });
         }
+        default: throw rpcError(-32602, `analyze_binary: unknown kind '${args.kind}'.`);
       }
     },
   );

@@ -104,9 +104,10 @@ test("analyze_binary({kind:'capabilities'}) returns capability buckets", async (
   } finally { await h.close(); }
 });
 
-// These kinds operate on the snapshot only (anti_analysis) or swallow tool
-// errors into a result envelope (code_signing): they resolve even when the
-// fixture's binary path doesn't exist on disk.
+// anti_analysis is pure in-memory and never shells out.
+// code_signing shells out to codesign, but extractCodeSigning catches its own
+// subprocess errors and returns them as result.error rather than throwing.
+// Both therefore resolve OK even when the fixture's binary path is synthetic.
 for (const kind of ["anti_analysis", "code_signing"]) {
   test(`analyze_binary({kind:'${kind}'}) returns a non-error result`, async () => {
     const h = await startWithSample();

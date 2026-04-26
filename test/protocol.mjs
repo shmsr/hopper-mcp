@@ -33,11 +33,14 @@ test("calling unknown tool returns clean error", async () => {
   } finally { await h.close(); }
 });
 
-test("malformed input rejected with -32602", async () => {
+test("malformed tool input is rejected with a descriptive error", async () => {
   const h = await startServer();
   try {
-    // `list.kind` is a Zod enum; the SDK should map schema validation
-    // failures to JSON-RPC -32602 (Invalid params).
+    // `list.kind` is a Zod enum. The SDK surfaces schema-validation
+    // failures inside a tools/call response as `isError: true` content
+    // (which our harness reflects as a rejected promise carrying the
+    // text). Both halves of the conjunction must match so neither side
+    // can silently drift.
     await assert.rejects(
       () => h.call("list", { kind: 42 }),
       (err) => /kind/i.test(err.message) && /(invalid|expected)/i.test(err.message),

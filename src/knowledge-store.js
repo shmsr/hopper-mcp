@@ -687,9 +687,6 @@ function inferPurpose(fn) {
   return "Purpose is not yet inferred; inspect evidence anchors before naming.";
 }
 
-// Inline projection for segments — mirrors officialSegment in server-helpers.js
-// without importing it (server-helpers imports from this module, so the inverse
-// would create a circular dependency).
 function projectSegment(segment) {
   const start = parseAddress(segment.start);
   const length = Number(segment.length ?? 0);

@@ -476,6 +476,55 @@ test("get_graph_slice kind='callees' returns graph with sub_100004010 in nodes",
   } finally { await h.close(); }
 });
 
+// ── negative cases ────────────────────────────────────────────────────────
+
+// xrefs for an unknown address returns an empty array (no cross-references exist).
+test("xrefs({address:'0xdeadbeef'}) returns empty array for unknown address", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("xrefs", { address: "0xdeadbeef" }),
+    );
+    assert.ok(Array.isArray(out), `expected array; got ${JSON.stringify(out)}`);
+    assert.equal(out.length, 0, `expected empty array; got ${JSON.stringify(out)}`);
+  } finally { await h.close(); }
+});
+
+// resolve shells out to the binary when no snapshot match is found; the fixture
+// uses a synthetic path so the subprocess always fails — assert the rejection.
+test("resolve({query:'this_will_not_match_anything_xyz'}) rejects for no-match query", async () => {
+  const h = await startWithSample();
+  try {
+    await assert.rejects(
+      () => h.call("resolve", { query: "this_will_not_match_anything_xyz" }),
+      /strings exited|SampleMachO/i,
+    );
+  } finally { await h.close(); }
+});
+
+// query with a name predicate that matches nothing returns count=0 and empty matches.
+test("query({expression:'name:does_not_exist_xyz'}) returns count=0 and empty matches", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("query", { expression: "name:does_not_exist_xyz" }),
+    );
+    assert.equal(out.count, 0, `expected count 0; got ${out.count}`);
+    assert.ok(Array.isArray(out.matches) && out.matches.length === 0, "expected empty matches array");
+  } finally { await h.close(); }
+});
+
+// get_graph_slice with an unknown seed address rejects with an unknown-function error.
+test("get_graph_slice({seed:'0xdeadbeef'}) rejects with unknown function error", async () => {
+  const h = await startWithSample();
+  try {
+    await assert.rejects(
+      () => h.call("get_graph_slice", { seed: "0xdeadbeef", radius: 1, kind: "calls" }),
+      /Unknown function address/i,
+    );
+  } finally { await h.close(); }
+});
+
 // ── procedure({field:'comments'}) ────────────────────────────────────────
 
 test("procedure({field:'comments'}) returns prefix + inline comments map", async () => {

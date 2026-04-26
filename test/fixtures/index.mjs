@@ -9,6 +9,7 @@ const REPO = resolve(fileURLToPath(import.meta.url), "../../..");
 const SERVER = join(REPO, "src/mcp-server.js");
 
 export { sampleSession } from "./sample-session.mjs";
+import { sampleSession } from "./sample-session.mjs";
 
 // Spawn the MCP server in an isolated store path; returns { call, close }.
 export async function startServer({ env = {} } = {}) {
@@ -35,7 +36,10 @@ export async function startServer({ env = {} } = {}) {
         const { resolve, reject } = pending.get(msg.id);
         pending.delete(msg.id);
         if (msg.error) reject(Object.assign(new Error(msg.error.message), msg.error));
-        else resolve(msg.result);
+        else if (msg.result?.isError) {
+          const text = msg.result.content?.find((c) => c.type === "text")?.text ?? "tool error";
+          reject(new Error(text));
+        } else resolve(msg.result);
       }
     }
   });

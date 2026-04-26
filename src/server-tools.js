@@ -1366,6 +1366,23 @@ export function registerTools(server, ctx) {
     },
   );
 
+  server.registerTool(
+    "list",
+    {
+      title: "List",
+      description:
+        "List items from the active session by kind: procedures | strings | names | segments | bookmarks | imports | exports. " +
+        "For procedures, optional `detail`: brief (default, addr→name) | size (addr→{name,size,basicblock_count}) | info (addr→full procedure info).",
+      inputSchema: {
+        kind: z.enum(["procedures", "strings", "names", "segments", "bookmarks", "imports", "exports"]),
+        detail: z.enum(["brief", "size", "info"]).optional(),
+        session_id: optionalString,
+      },
+      annotations: READ_ONLY,
+    },
+    async (args) => toolResult(store.listByKind(sessionFor(args), args.kind, args.detail ?? "brief")),
+  );
+
   // Address-in-range lookup. The 'procedure' tool throws when given an address
   // that isn't a function entrypoint; this tool answers the implicit
   // "what function contains this instruction?" question explicitly.

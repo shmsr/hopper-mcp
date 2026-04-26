@@ -409,6 +409,63 @@ export class KnowledgeStore {
       },
     };
   }
+
+  // Single dispatch point used by the `list` tool. Each kind returns a shape
+  // compatible with the corresponding pre-overhaul `list_*` tool.
+  listByKind(sessionId, kind, detail = "brief") {
+    const session = this.getSession(sessionId);
+    switch (kind) {
+      case "procedures": return this._listProcedures(session, detail);
+      case "strings":    return this._listStrings(session);
+      case "names":      return this._listNames(session);
+      case "segments":   return session.segments ?? [];
+      case "bookmarks":  return session.bookmarks ?? [];
+      case "imports":    return session.imports ?? [];
+      case "exports":    return session.exports ?? [];
+      default:
+        throw new Error(`Unknown list kind '${kind}'. Expected one of procedures|strings|names|segments|bookmarks|imports|exports.`);
+    }
+  }
+
+  _listProcedures(session, detail) {
+    const fns = Object.values(session.functions ?? {});
+    const out = {};
+    for (const fn of fns) {
+      const addr = formatAddress(fn.addr);
+      if (detail === "size") {
+        out[addr] = { name: fn.name ?? null, size: fn.size ?? 0, basicblock_count: fn.basicBlocks?.length ?? 0 };
+      } else if (detail === "info") {
+        out[addr] = {
+          name: fn.name ?? null,
+          entrypoint: addr,
+          length: fn.size ?? 0,
+          basicblock_count: fn.basicBlocks?.length ?? 0,
+          basicblocks: fn.basicBlocks ?? [],
+          signature: fn.signature ?? null,
+          locals: fn.locals ?? [],
+        };
+      } else {
+        out[addr] = fn.name ?? addr;
+      }
+    }
+    return out;
+  }
+
+  _listStrings(session) {
+    const out = {};
+    for (const s of session.strings ?? []) {
+      out[formatAddress(s.addr)] = { value: s.value };
+    }
+    return out;
+  }
+
+  _listNames(session) {
+    const out = {};
+    for (const n of session.names ?? []) {
+      out[formatAddress(n.addr)] = { name: n.name, demangled: n.demangled ?? null };
+    }
+    return out;
+  }
 }
 
 export function normalizeSession(session) {

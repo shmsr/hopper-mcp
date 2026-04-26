@@ -234,8 +234,11 @@ test("procedure({field:'callees'}) returns array containing sub_100004010", asyn
 test("procedure({field:'info'}) rejects unknown address", async () => {
   const h = await startWithSample();
   try {
+    // resolveProcedure throws "Address 0x... is not the entrypoint of any
+    // known function and is not contained in any known function body."
     await assert.rejects(
       () => h.call("procedure", { field: "info", procedure: "0xdeadbeef" }),
+      /not the entrypoint|not contained|unknown procedure/i,
     );
   } finally { await h.close(); }
 });
@@ -282,7 +285,11 @@ test("search({kind:'names', pattern:'sub_'}) returns non-empty address-keyed obj
 test("search({kind:'wrong'}) rejects with schema validation error", async () => {
   const h = await startWithSample();
   try {
-    await assert.rejects(() => h.call("search", { kind: "wrong", pattern: "x" }));
+    // Zod surfaces the bad enum as an "invalid"/"expected" message naming `kind`.
+    await assert.rejects(
+      () => h.call("search", { kind: "wrong", pattern: "x" }),
+      /kind/i,
+    );
   } finally { await h.close(); }
 });
 
@@ -423,12 +430,14 @@ test("analyze_function_deep({addr:'0x100003f50'}) returns object with pseudocode
   } finally { await h.close(); }
 });
 
-// analyze_function_deep with an unknown address should reject.
+// analyze_function_deep with an unknown address should reject — getFunction
+// throws "Unknown function address: 0x...".
 test("analyze_function_deep({addr:'0xdeadbeef'}) rejects with unknown-function error", async () => {
   const h = await startWithSample();
   try {
     await assert.rejects(
       () => h.call("analyze_function_deep", { addr: "0xdeadbeef" }),
+      /Unknown function address/i,
     );
   } finally { await h.close(); }
 });
@@ -442,8 +451,11 @@ test("get_graph_slice radius=1 kind='calls' returns a graph object", async () =>
     const out = decodeToolResult(
       await h.call("get_graph_slice", { seed: "0x100003f50", radius: 1, kind: "calls" }),
     );
-    assert.ok(out && typeof out === "object");
-    assert.ok("nodes" in out || "callers" in out || "callees" in out, "graph slice should expose nodes or call lists");
+    // getGraphSlice always returns { root, nodes, edges } regardless of kind;
+    // pin to nodes (the same shape callers/callees tests below assert) so a
+    // regression that drops nodes for kind="calls" can't slip through.
+    assert.ok(Array.isArray(out.nodes), `expected nodes array; got ${JSON.stringify(out)}`);
+    assert.ok(out.nodes.length > 0, "calls graph from a connected seed should be non-empty");
   } finally { await h.close(); }
 });
 
@@ -490,15 +502,15 @@ test("xrefs({address:'0xdeadbeef'}) returns empty array for unknown address", as
   } finally { await h.close(); }
 });
 
-// resolve shells out to the binary when no snapshot match is found; the fixture
-// uses a synthetic path so the subprocess always fails — assert the rejection.
+// resolve shells out to the binary when no snapshot match is found; the
+// fixture's synthetic path makes the subprocess fail. Don't pin a regex —
+// the rejection message is an implementation detail of the no-match path,
+// and a tighter regex would be brittle without proving the right code path
+// rejected (the synthetic path could fail for unrelated reasons too).
 test("resolve({query:'this_will_not_match_anything_xyz'}) rejects for no-match query", async () => {
   const h = await startWithSample();
   try {
-    await assert.rejects(
-      () => h.call("resolve", { query: "this_will_not_match_anything_xyz" }),
-      /strings exited|SampleMachO/i,
-    );
+    await assert.rejects(() => h.call("resolve", { query: "this_will_not_match_anything_xyz" }));
   } finally { await h.close(); }
 });
 

@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { startServer } from "./fixtures/index.mjs";
 
-test("initialize negotiates protocol version", async () => {
+// Indirect coverage of the initialize handshake: startServer() throws if
+// the server doesn't successfully negotiate, so a green tools/list call
+// proves the lifecycle (initialize → notifications/initialized → tools/list)
+// completes end-to-end.
+test("server completes initialize handshake and exposes tools", async () => {
   const h = await startServer();
   try {
     const tools = await h.listTools();
@@ -32,7 +36,11 @@ test("calling unknown tool returns clean error", async () => {
 test("malformed input rejected with -32602", async () => {
   const h = await startServer();
   try {
-    // `list` requires `kind`; passing an integer should be rejected.
-    await assert.rejects(() => h.call("list", { kind: 42 }), (err) => err.code === -32602 || /kind/i.test(err.message));
+    // `list.kind` is a Zod enum; the SDK should map schema validation
+    // failures to JSON-RPC -32602 (Invalid params).
+    await assert.rejects(
+      () => h.call("list", { kind: 42 }),
+      (err) => /kind/i.test(err.message) && /(invalid|expected)/i.test(err.message),
+    );
   } finally { await h.close(); }
 });

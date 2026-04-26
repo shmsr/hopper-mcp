@@ -1,43 +1,89 @@
 # Hopper MCP
 
-MCP server for Hopper. It can import Mach-O data with local macOS tools, or open a binary in Hopper and export indexed state through Hopper's Python scripting API.
+An MCP server that gives an LLM client structured, transaction-safe access to a [Hopper](https://www.hopperapp.com) reverse-engineering session — without putting the disassembler in the model's context window.
 
-Default write behavior is local-only: transaction commits update the JSON store and return `appliedToHopper: false`. Comment/rename write-back can be routed through Hopper's installed official MCP server, but only when `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` is set and the commit passes `confirm_live_write: true`.
+Two ways to load a binary:
+
+- **Local Mach-O** (fast, no Hopper required) — `import_macho` parses the binary with `otool` / native macOS tools.
+- **Live Hopper** (slower, full analysis) — `ingest_live_hopper` opens the binary in Hopper, runs an in-app Python exporter, and ingests the analyzed document.
+
+Reads (`resolve`, `procedure`, `search`, `analyze_binary`, …) hit a local indexed snapshot so they're cheap to call repeatedly. Writes (renames, comments, tags, hypotheses) go through a `begin_transaction → queue → preview → commit` pipeline. By default commits land in the local store only; flipping `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` plus `confirm_live_write: true` routes them through Hopper's official MCP server too.
 
 ## Requirements
 
 - macOS
-- Hopper installed
 - Node.js 20+
-- macOS Automation permission for the terminal or app that launches Hopper
+- Hopper.app installed (only required for `ingest_live_hopper` / `ingest_official_hopper` / official-backend writes; the local importer works without it)
+- Automation permission for the launcher app, granted via *System Settings → Privacy & Security → Automation*
 
-## Run
+## Install
 
 ```bash
-npm run start     # launch the MCP server over stdio
-npm test          # run the offline test suite (119 tests, ~12s)
-npm run test:live # run the live-Hopper suite (HOPPER_MCP_LIVE=1, requires Hopper installed)
-npm run test:all  # offline + live, when both are available
+git clone <this repo> hopper-mcp
+cd hopper-mcp
+npm install
+npm test            # 119 offline tests, ~12s
+npm run test:live   # adds the live-Hopper suite (HOPPER_MCP_LIVE=1)
 ```
 
-If macOS blocks Automation, allow the launcher app to control Hopper in `System Settings > Privacy & Security > Automation`.
+## Add to a client
 
-For large binaries, start with the faster local importer:
+Replace `/abs/path/to/hopper-mcp` with the absolute path to your clone.
+
+**Claude Code**
+
+```bash
+claude mcp add -s user hopper -- node /abs/path/to/hopper-mcp/src/mcp-server.js
+```
+
+**Codex CLI**
+
+```bash
+codex mcp add hopper -- node /abs/path/to/hopper-mcp/src/mcp-server.js
+```
+
+**Cursor / Claude Desktop / generic MCP** — add to the client's `mcpServers` JSON:
 
 ```json
 {
-  "executable_path": "/path/to/binary",
-  "max_strings": 10000
+  "mcpServers": {
+    "hopper": {
+      "command": "node",
+      "args": ["/abs/path/to/hopper-mcp/src/mcp-server.js"],
+      "env": {}
+    }
+  }
 }
 ```
 
-Call that as `import_macho`. The local Mach-O tools auto-select an architecture by default, preferring `arm64e`, then `arm64`, then `x86_64`. Pass `arch` only when you need a specific slice. If `arch: "arm64"` is requested for an `arm64e`-only system binary, the importer selects `arm64e` and records both `requestedArch` and the selected `arch` in the session metadata.
+**MCP Inspector** (for poking at the server interactively):
 
-Use `ingest_live_hopper` when you need a Hopper Python export for a specific executable path. Exporting the frontmost Hopper document is not exposed yet; that needs the future in-process Hopper adapter.
+```bash
+npx @modelcontextprotocol/inspector node /abs/path/to/hopper-mcp/src/mcp-server.js
+```
 
-Live Hopper export modes:
+If you previously installed any other Hopper-related MCP entry, remove it first — running both at once will confuse the client's tool registry.
 
-```json
+## Workflows
+
+### Quick local triage (no Hopper needed)
+
+```jsonc
+// import_macho
+{ "executable_path": "/path/to/binary", "max_strings": 10000 }
+```
+
+The local importer auto-selects the architecture (`arm64e` → `arm64` → `x86_64`). Pass `arch` only when you need a specific slice. For a deeper local analysis that scans ARM64 disassembly, finds frame-prologue functions, builds call edges from `bl`, and links ADRP+ADD/LDR string refs:
+
+```jsonc
+// import_macho
+{ "executable_path": "/path/to/binary", "deep": true, "max_functions": 5000 }
+```
+
+### Full Hopper analysis
+
+```jsonc
+// ingest_live_hopper
 {
   "executable_path": "/path/to/binary",
   "wait_for_analysis": true,
@@ -45,207 +91,130 @@ Live Hopper export modes:
 }
 ```
 
-`full_export: true` forces `wait_for_analysis: true`, removes the function/string/basic-block/instruction caps unless you pass explicit caps, and adds `capabilities.liveExport` metadata with totals, exported counts, and truncation flags. If a cap is passed with `full_export: true`, truncation fails the export by default. Set `fail_on_truncation: false` only when a partial export is acceptable.
+`full_export: true` removes the function/string/basic-block caps and records `capabilities.liveExport` totals so the client can tell if anything was truncated. Pseudocode is opt-in (`include_pseudocode: true`) because it's expensive.
 
-To capture pseudocode in the snapshot, opt in explicitly:
+### Refresh from Hopper's official live backend
 
-```json
-{
-  "executable_path": "/path/to/binary",
-  "wait_for_analysis": true,
-  "include_pseudocode": true,
-  "max_pseudocode_functions": 25
-}
+If Hopper is open with the document already analyzed, `ingest_official_hopper` pulls a snapshot through Hopper's installed MCP server:
+
+```jsonc
+{ "max_procedures": 500, "include_procedure_info": true }
 ```
 
-Pseudocode export can be slow, so it is off by default. Without it, `procedure(field: pseudo_code)` returns a clear "not captured" result.
+Keep `include_assembly` / `include_pseudocode` / `include_call_graph` off unless you need them — each adds a per-procedure round-trip.
 
-Deep local import:
+### Annotation lifecycle
 
-```json
-{
-  "executable_path": "/path/to/binary",
-  "deep": true,
-  "max_functions": 5000,
-  "max_strings": 50000
-}
+```text
+begin_transaction              → returns transactionId
+queue(kind: rename | comment | inline_comment | type_patch | tag | untag | rename_batch)
+hypothesis(action: create | link | status)
+preview_transaction            → review what's about to land
+commit_transaction             → applies to local store; optionally to Hopper
+rollback_transaction           → discards
 ```
 
-With `deep: true`, `import_macho` also scans ARM64 disassembly with `otool`, discovers frame-prologue functions, builds call edges from `bl` instructions, and links ADRP+ADD/LDR string references where they can be resolved.
+Local-only commits return `appliedToHopper: false`. To write back through Hopper:
 
-Local helper tools:
-
-- `disassemble_range`: disassemble a VM address range with `otool`.
-- `find_xrefs`: scan for direct branches/calls and ADRP+ADD/LDR references to an address.
-- `find_functions`: discover ARM64 frame-prologue functions, optionally with `merge_session: true`.
-
-To call any Hopper official tool directly, use `official_hopper_call`. Write/navigation official tools are blocked by default; enabling them requires both `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` in the server environment and `confirm_live_write: true` on the call.
-
-Direct official calls cap large text results by default so a single decompile does not overwhelm the client. Pass `max_result_chars` to tune the preview size, or `include_full_result: true` if the client can safely handle the full result in `structuredContent`.
-
-To refresh this server's local snapshot from Hopper's official live backend, call:
-
-```json
-{
-  "max_procedures": 500,
-  "include_procedure_info": true,
-  "include_assembly": false,
-  "include_pseudocode": false,
-  "include_call_graph": false
-}
+```jsonc
+// commit_transaction
+{ "transaction_id": "txn-…", "backend": "official", "confirm_live_write": true }
 ```
 
-as `ingest_official_hopper`. This gives our resource/cache layer a current official-Hopper snapshot without relying on private Hopper APIs. Keep `include_assembly`, `include_pseudocode`, and `include_call_graph` off unless needed; they require per-procedure official backend calls and can be slow on large documents.
+Both `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` (server env) AND `confirm_live_write: true` (call arg) are required. Operations with no official-backend equivalent (e.g. `type_patch`) fail rather than silently apply only to the local cache.
 
-To commit a reviewed local transaction through the official backend:
+### Direct passthrough
 
-```json
-{
-  "transaction_id": "txn-id",
-  "backend": "official",
-  "confirm_live_write": true
-}
-```
+`official_hopper_call` calls any tool exposed by Hopper's installed MCP server. Large text results are capped by default; pass `max_result_chars` to widen the preview or `include_full_result: true` to receive the untruncated payload in `structuredContent`.
 
-The server must also be started with `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1`. Operations with no official-backend equivalent (such as `queue(kind: type_patch)`) are rejected rather than silently applied only to the local cache.
+## Tool surface (30 tools)
 
-## Add To Clients
+Every tool is one of: a snapshot reader, the live passthrough `official_hopper_call`, or a mutator. Live access is only via `official_hopper_call`; live writes are only via `commit_transaction(backend: "official")`.
 
-Replace `/path/to/hopper-mcp` with the absolute path to this repo.
+| Group | Tools |
+|---|---|
+| **Meta** | `capabilities`, `official_hopper_call` |
+| **Lifecycle / ingest** | `import_macho`, `ingest_live_hopper`, `ingest_official_hopper`, `open_session`, `close_session`, `set_current_session` |
+| **Local binary helpers** | `disassemble_range`, `find_xrefs`, `find_functions` |
+| **Snapshot reads** | `procedure`, `search`, `list`, `xrefs`, `containing_function`, `resolve`, `query`, `analyze_function_deep`, `get_graph_slice` |
+| **Transactions** | `begin_transaction`, `queue`, `hypothesis`, `preview_transaction`, `commit_transaction`, `rollback_transaction` |
+| **Forensics** | `analyze_binary`, `compute_fingerprints`, `find_similar_functions`, `diff_sessions` |
 
-Generic MCP JSON:
+Discriminator-style tools (`procedure`, `search`, `list`, `queue`, `hypothesis`, `analyze_binary`) take a `kind:` (or `action:` / `field:`) argument that selects the variant.
 
-```json
-{
-  "mcpServers": {
-    "hopper": {
-      "command": "node",
-      "args": ["/path/to/hopper-mcp/src/mcp-server.js"]
-    }
-  }
-}
-```
-
-Claude Code:
-
-```bash
-claude mcp remove hopper -s user
-claude mcp add -s user hopper -- node /path/to/hopper-mcp/src/mcp-server.js
-claude mcp list
-```
-
-Codex:
-
-```bash
-codex mcp remove hopper
-codex mcp add hopper -- node /path/to/hopper-mcp/src/mcp-server.js
-codex mcp list
-```
-
-Cursor:
-
-Edit `~/.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "hopper": {
-      "command": "node",
-      "args": ["/path/to/hopper-mcp/src/mcp-server.js"],
-      "env": {}
-    }
-  }
-}
-```
-
-Claude Desktop:
-
-Edit the Claude Desktop config and add the same server entry under `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "hopper": {
-      "command": "node",
-      "args": ["/path/to/hopper-mcp/src/mcp-server.js"]
-    }
-  }
-}
-```
-
-MCP Inspector:
-
-```bash
-npx @modelcontextprotocol/inspector node /path/to/hopper-mcp/src/mcp-server.js
-```
-
-To remove older Hopper entries, delete any other `hopper`, `HopperMCPServer`, or Hopper-related server blocks from the same client config before adding this one.
-
-## MCP Surface
-
-Tools follow a strict invariant: every tool is one of (a) a snapshot reader,
-(b) the live passthrough `official_hopper_call`, or (c) a mutator. There is no
-per-tool `backend:` flag — live access goes through `official_hopper_call`,
-and live writes go through `commit_transaction(backend:"official")` (gated by
-`HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` and `confirm_live_write: true`).
-
-**Meta (2)**
-- `capabilities`
-- `official_hopper_call`
-
-**Lifecycle / ingest (6)**
-- `import_macho`
-- `ingest_live_hopper`
-- `ingest_official_hopper`
-- `open_session`
-- `close_session`
-- `set_current_session`
-
-**Local binary helpers (3)**
-- `disassemble_range`
-- `find_xrefs`
-- `find_functions`
-
-**Snapshot reads (9)**
-- `procedure(field: info|assembly|pseudo_code|callers|callees|comments)`
-- `search(kind: strings|procedures|names)`
-- `list(kind: procedures|strings|names|segments|bookmarks|imports|exports)`
-- `xrefs`, `containing_function`, `resolve`, `query`, `analyze_function_deep`, `get_graph_slice`
-
-**Transactions (6)**
-- `begin_transaction`, `queue(kind: …)`, `hypothesis(action: …)`, `preview_transaction`, `commit_transaction`, `rollback_transaction`
-
-**Forensics (4)**
-- `analyze_binary(kind: capabilities|anti_analysis|entropy|code_signing|objc)`
-- `compute_fingerprints`, `find_similar_functions`, `diff_sessions`
-
-**Resources** — 30 entries; see `src/server-resources.js`.
+**Resources** — 30 `hopper://` URIs (binary metadata, strings, functions, graph slices, transactions, …); see `src/server-resources.js`.
 
 **Prompts** — `function_triage`, `hypothesis_workspace`.
 
-## Protocol Notes
+## Configuration
 
-- Stdio transport uses newline-delimited JSON-RPC.
-- The server supports MCP protocol versions `2025-11-25`, `2025-06-18`, and `2025-03-26`.
-- Tool results include both `structuredContent` and a JSON text block.
-- Ingest tools emit progress notifications when the client supplies a progress token.
+| Env var | Default | Purpose |
+|---|---|---|
+| `HOPPER_MCP_STORE` | `<repo>/data/knowledge-store.json` | Path to the JSON store. Use a per-project path to keep sessions separate. |
+| `HOPPER_MCP_SESSION_CAP` | `16` | Max sessions kept on disk (oldest evicted by `updatedAt`; current session is pinned). |
+| `HOPPER_MCP_ENABLE_OFFICIAL_WRITES` | unset | Set to `1` to allow live writes through Hopper's official MCP server. Each call must also pass `confirm_live_write: true`. |
+| `HOPPER_MCP_SOCKET` | unset | Reserved for the future in-process Hopper adapter. |
+| `HOPPER_LAUNCHER` | unset | Override the path used to launch Hopper for live ingest. |
+| `HOPPER_MCP_DEBUG` | unset (file logging on) | `0` disables debug logging entirely. `1` or `stderr` additionally mirrors records to stderr. |
+| `HOPPER_MCP_DEBUG_LOG` | `<repo>/data/debug.log` | Override the structured NDJSON log path. |
+| `HOPPER_MCP_LIVE` | unset | Test-only — `1` opts into the live test suite. |
+
+## Debugging
+
+The server writes a structured NDJSON log to `data/debug.log` by default — one record per line, including matched `tool_start` / `tool_end` pairs, lifecycle events (`boot`, `store_loaded`, `transport_connected`, `shutdown`), and crash sentinels (`uncaughtException`, `unhandledRejection`, EPIPE) with a snapshot of currently in-flight tool calls.
+
+```bash
+tail -f data/debug.log | jq .
+```
+
+Useful queries:
+
+```bash
+# Was the last shutdown clean?
+grep -E '"kind":"(shutdown|uncaught|unhandled)"' data/debug.log | tail
+
+# Slowest tool calls in the most recent run
+grep '"kind":"tool_end"' data/debug.log | jq -r '[.ms,.name] | @tsv' | sort -nr | head
+
+# Disable file logging entirely (e.g. for short-lived test harnesses)
+HOPPER_MCP_DEBUG=0 node src/mcp-server.js
+```
+
+Shutdown is gated by an internal dirty bit: read-only tool batches exit in ~10ms (no full-store rewrite); only batches that mutated state pay the JSON serialization cost on the way out.
+
+## Protocol notes
+
+- Stdio transport, newline-delimited JSON-RPC.
+- Supported MCP protocol versions: `2025-11-25`, `2025-06-18`, `2025-03-26`.
+- Tool results carry both a JSON text block and `structuredContent`.
+- Ingest tools emit `notifications/progress` when the client supplies a progress token.
 - Session changes emit `notifications/resources/list_changed`.
 
 ## Layout
 
 ```text
 MCP client
-  -> Node stdio server
-  -> JSON store
-  -> Hopper live exporter
-  -> Hopper
+  → stdio JSON-RPC
+  → src/mcp-server.js          process entry
+    ├─ src/server-tools.js     30 tools
+    ├─ src/server-resources.js hopper:// resource handlers
+    ├─ src/server-prompts.js   prompts
+    ├─ src/knowledge-store.js  durable JSON snapshot
+    ├─ src/transaction-manager.js  begin / queue / preview / commit / rollback
+    ├─ src/macho-importer.js   local Mach-O importer (otool-based)
+    ├─ src/hopper-live.js      Hopper Python exporter driver
+    ├─ src/official-hopper-backend.js  bridge to Hopper's installed MCP server
+    └─ src/debug-log.js        structured NDJSON debug logger
+  → data/knowledge-store.json  per-session indexed state
+  → data/debug.log             diagnostic log
 ```
 
-Main files:
+Further reading:
 
-- `src/mcp-server.js`
-- `src/hopper-live.js`
-- `src/knowledge-store.js`
-- `src/transaction-manager.js`
-- `docs/adapter-protocol.md`
-- `docs/official-hopper-mcp-notes.md`
+- `docs/adapter-protocol.md` — internal adapter wire format
+- `docs/official-hopper-mcp-notes.md` — notes on Hopper's official MCP server
+- `CONTRIBUTING.md` — dev setup and PR conventions
+
+## License
+
+MIT — see `LICENSE`.

@@ -128,7 +128,6 @@ test("queue rename_batch → preview_transaction shows the rename_batch operatio
     const preview = await queue(h, { kind: "rename_batch", mapping });
     const op = preview.operations.find((o) => o.kind === "rename_batch");
     assert.ok(op, "expected rename_batch op in operations");
-    assert.ok(op.mapping, "expected mapping field on op");
     assert.equal(op.mapping["0x100003f50"], "fnA");
     assert.equal(op.mapping["0x100004010"], "fnB");
   } finally { await h.close(); }
@@ -175,7 +174,8 @@ test("commit_transaction (local) applies rename to knowledge store", async () =>
 
 // ── rollback_transaction ──────────────────────────────────────────────────────
 
-// rollback_transaction discards queued ops; a second preview shows empty operations.
+// rollback_transaction discards queued ops: the rename never lands and a
+// follow-up procedure({field:"info"}) shows the original name.
 test("rollback_transaction discards queued ops", async () => {
   const h = await startWithSample();
   try {
@@ -183,10 +183,7 @@ test("rollback_transaction discards queued ops", async () => {
     await queue(h, { kind: "rename", addr: "0x100003f50", value: "shouldNotApply" });
     const rollback = decodeToolResult(await h.call("rollback_transaction", {}));
     assert.equal(rollback.transactionId, txnId);
-    assert.ok(
-      rollback.status === "rolled_back" || rollback.status === "rolled-back",
-      `expected rolled_back status; got ${rollback.status}`,
-    );
+    assert.equal(rollback.status, "rolled_back");
     // Name should NOT have changed since we rolled back.
     const info = decodeToolResult(
       await h.call("procedure", { field: "info", procedure: "0x100003f50" }),
@@ -220,7 +217,7 @@ test("commit_transaction official backend without HOPPER_MCP_ENABLE_OFFICIAL_WRI
   const h = await startWithSample();
   try {
     await beginTxn(h);
-    await queue(h, { kind: "rename", addr: "0x100003f50", value: "officalTest" });
+    await queue(h, { kind: "rename", addr: "0x100003f50", value: "officialTest" });
     await assert.rejects(
       () => h.call("commit_transaction", { backend: "official", confirm_live_write: true }),
       /HOPPER_MCP_ENABLE_OFFICIAL_WRITES|enable.*writes/i,

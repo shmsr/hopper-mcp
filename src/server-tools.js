@@ -1804,11 +1804,7 @@ export function registerTools(server, ctx) {
         case "entropy": {
           const binaryPath = session.binary?.path;
           if (!binaryPath) throw rpcError(-32602, "analyze_binary(entropy) requires a session with a binary path.");
-          try {
-            return toolResult(await computeSectionEntropy(binaryPath, session.binary?.arch ?? "auto"));
-          } catch (err) {
-            return toolResult({ sections: [], error: err.message ?? String(err) });
-          }
+          return toolResult(await computeSectionEntropy(binaryPath, session.binary?.arch ?? "auto"));
         }
         case "code_signing": {
           const binaryPath = session.binary?.path;
@@ -1818,12 +1814,8 @@ export function registerTools(server, ctx) {
         case "objc": {
           const binaryPath = session.binary?.path;
           if (!binaryPath) throw rpcError(-32602, "analyze_binary(objc) requires a session with a binary path.");
-          try {
-            const classes = await extractObjCRuntime(binaryPath, session.binary?.arch ?? "auto");
-            return toolResult({ count: classes.length, classes });
-          } catch (err) {
-            return toolResult({ count: 0, classes: [], error: err.message ?? String(err) });
-          }
+          const classes = await extractObjCRuntime(binaryPath, session.binary?.arch ?? "auto");
+          return toolResult({ count: classes.length, classes });
         }
       }
     },

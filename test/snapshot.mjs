@@ -104,12 +104,27 @@ test("analyze_binary({kind:'capabilities'}) returns capability buckets", async (
   } finally { await h.close(); }
 });
 
-for (const kind of ["anti_analysis", "entropy", "code_signing", "objc"]) {
+// These kinds operate on the snapshot only (anti_analysis) or swallow tool
+// errors into a result envelope (code_signing): they resolve even when the
+// fixture's binary path doesn't exist on disk.
+for (const kind of ["anti_analysis", "code_signing"]) {
   test(`analyze_binary({kind:'${kind}'}) returns a non-error result`, async () => {
     const h = await startWithSample();
     try {
       const out = decodeToolResult(await h.call("analyze_binary", { kind }));
       assert.notEqual(out, null);
+    } finally { await h.close(); }
+  });
+}
+
+// entropy + objc shell out to otool against the binary path. Against the
+// fixture's synthetic /tmp/SampleMachO path otool fails — assert that the
+// error propagates (matches legacy compute_section_entropy / extract_objc_runtime).
+for (const kind of ["entropy", "objc"]) {
+  test(`analyze_binary({kind:'${kind}'}) propagates errors when binary path is invalid`, async () => {
+    const h = await startWithSample();
+    try {
+      await assert.rejects(() => h.call("analyze_binary", { kind }));
     } finally { await h.close(); }
   });
 }

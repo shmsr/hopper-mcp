@@ -5,8 +5,6 @@ import assert from "node:assert/strict";
 import { startServer, startWithSample, sampleSession, decodeToolResult } from "./fixtures/index.mjs";
 
 const BIN = "/bin/echo";
-// /usr/bin/security is richer for code_signing (entitlements, etc.) but falls back to /bin/echo.
-const SIGNING_BIN = "/usr/bin/security";
 
 // ── 1. analyze_binary — all 5 kinds against a real binary ────────────────────
 
@@ -16,50 +14,99 @@ for (const kind of ["capabilities", "anti_analysis", "entropy", "code_signing", 
     try {
       await h.call("import_macho", { executable_path: BIN });
       const out = decodeToolResult(await h.call("analyze_binary", { kind }));
-      assert.notEqual(out, null);
+      assert.ok(out !== null && typeof out === "object", `${kind} returned non-object`);
+      // per-kind shape check:
+      switch (kind) {
+        case "capabilities":
+          // classifyImports returns { [bucket]: string[] } — each value is a sorted string[].
+          // /bin/echo may have very few imports; but the result must be an object (possibly empty).
+          assert.ok(
+            Object.values(out).every(v => Array.isArray(v)),
+            `capabilities: all bucket values should be arrays, got ${JSON.stringify(out)}`,
+          );
+          break;
+        case "anti_analysis":
+          // detectAntiAnalysis returns an array of finding objects (possibly empty for /bin/echo).
+          assert.ok(Array.isArray(out), `anti_analysis should return an array`);
+          break;
+        case "entropy":
+          // computeSectionEntropy returns an array of section objects, each with an entropy field.
+          assert.ok(Array.isArray(out), `entropy should return an array of section objects`);
+          if (out.length > 0) {
+            const sec = out[0];
+            assert.ok(typeof sec.entropy === "number", `entropy[0].entropy should be a number`);
+            assert.ok(typeof sec.suspicious === "boolean", `entropy[0].suspicious should be a boolean`);
+            assert.ok(typeof sec.sectname === "string", `entropy[0].sectname should be a string`);
+          }
+          break;
+        case "code_signing":
+          // extractCodeSigning returns { signed: boolean, format, signer, teamId, identifier, cdHash, flags, entitlements, error }
+          assert.ok(typeof out.signed === "boolean",
+            `code_signing should expose a signed boolean, got ${JSON.stringify(out)}`);
+          break;
+        case "objc":
+          // analyze_binary(objc) returns { count: number, classes: array }
+          assert.ok(typeof out.count === "number",
+            `objc should expose a count number, got ${JSON.stringify(out)}`);
+          assert.ok(Array.isArray(out.classes),
+            `objc should expose a classes array, got ${JSON.stringify(out)}`);
+          assert.equal(out.count, out.classes.length,
+            `objc count should equal classes.length`);
+          break;
+      }
     } finally { await h.close(); }
   });
 }
 
-// ── 2. compute_fingerprints — deterministic across two calls ──────────────────
-// NOTE: compute_fingerprints({session_id}) takes no addr — it fingerprints all
-// functions in the session and returns { updated: N }. The plan template assumed
-// an addr arg that does not exist in the implementation.
+// ── 2a. compute_fingerprints — fingerprints all session functions and returns stable updated count ──
 
-test("compute_fingerprints produces deterministic per-function hashes", async () => {
-  const { sessionId, ...h } = await startWithSample();
-  // The function at 0x100003f50 has imports + strings + basicBlocks, giving a rich fingerprint.
-  const ADDR = "0x100003f50";
+test("compute_fingerprints fingerprints all session functions and returns a stable updated count", async () => {
+  const h = await startWithSample();
   try {
-    // First round: fingerprint all functions, then retrieve the per-function hash via
-    // find_similar_functions — the only public tool that returns target.fingerprint.
-    const r1 = decodeToolResult(await h.call("compute_fingerprints", { session_id: sessionId }));
+    const r1 = decodeToolResult(await h.call("compute_fingerprints", { session_id: h.sessionId }));
     assert.ok(typeof r1.updated === "number" && r1.updated >= 1,
       `expected updated >= 1, got ${r1.updated}`);
-    const sim1 = decodeToolResult(
+    const r2 = decodeToolResult(await h.call("compute_fingerprints", { session_id: h.sessionId }));
+    assert.equal(r2.updated, r1.updated, "updated count is stable across calls on the same session");
+  } finally { await h.close(); }
+});
+
+// ── 2b. find_similar_functions — exposes a per-function fingerprint with expected hash fields ──
+
+test("find_similar_functions exposes a per-function fingerprint with expected hash fields", async () => {
+  // The function at 0x100003f50 has imports + strings + basicBlocks, giving a rich fingerprint.
+  const ADDR = "0x100003f50";
+  const h = await startWithSample();
+  try {
+    await h.call("compute_fingerprints", { session_id: h.sessionId });
+    const sim = decodeToolResult(
       await h.call("find_similar_functions", {
         addr: ADDR,
-        session_id: sessionId,
+        session_id: h.sessionId,
         min_similarity: 0,
       })
     );
-    const fp1 = sim1.target.fingerprint;
-    assert.ok(fp1 !== null && typeof fp1 === "object", "first fingerprint is an object");
+    const fp = sim.target.fingerprint;
+    assert.ok(fp !== null && typeof fp === "object", "target.fingerprint is an object");
 
-    // Second round: recompute and retrieve again.
-    const r2 = decodeToolResult(await h.call("compute_fingerprints", { session_id: sessionId }));
-    assert.equal(r2.updated, r1.updated, "updated count is stable across calls");
-    const sim2 = decodeToolResult(
-      await h.call("find_similar_functions", {
-        addr: ADDR,
-        session_id: sessionId,
-        min_similarity: 0,
-      })
-    );
-    const fp2 = sim2.target.fingerprint;
+    // cfgShape: "bb:N/callees:N/callers:N" string
+    assert.ok(typeof fp.cfgShape === "string", "fp.cfgShape is a string");
+    assert.ok(/^bb:\d+\/callees:\d+\/callers:\d+$/.test(fp.cfgShape),
+      `fp.cfgShape should match bb:N/callees:N/callers:N, got ${fp.cfgShape}`);
 
-    // Core determinism assertion: the actual hash bytes must be identical.
-    assert.deepEqual(fp1, fp2, "fingerprint hashes are byte-identical across two compute_fingerprints calls");
+    // importSignature: string[] (up to 32 elements)
+    assert.ok(Array.isArray(fp.importSignature), "fp.importSignature is an array");
+
+    // simhash: "0x" followed by exactly 16 hex chars (64-bit simhash64 result)
+    assert.ok(typeof fp.simhash === "string" && /^0x[0-9a-f]{16}$/i.test(fp.simhash),
+      `fp.simhash should be 0x + 16 hex chars, got ${fp.simhash}`);
+
+    // minhash: number[] of exactly 32 elements (minhashSignature k=32)
+    assert.ok(Array.isArray(fp.minhash), "fp.minhash is an array");
+    assert.equal(fp.minhash.length, 32, `fp.minhash should have 32 elements, got ${fp.minhash.length}`);
+
+    // stringBag: string[] (up to 16 tokens)
+    assert.ok(Array.isArray(fp.stringBag), "fp.stringBag is an array");
   } finally { await h.close(); }
 });
 

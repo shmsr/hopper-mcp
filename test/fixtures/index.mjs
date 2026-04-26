@@ -110,8 +110,7 @@ export function decodeToolResult(result) {
 // Convenience: starts server, ingests the sample session, returns harness + sessionId.
 export async function startWithSample(opts) {
   const harness = await startServer(opts);
-  // Sample is loaded via open_session (ingest_sample is going away in Task 14;
-  // we never depend on the deprecated tool from tests).
+  // Sample is loaded via open_session; ingest_sample was removed in Task 16.
   try {
     const result = await harness.call("open_session", { session: sampleSession() });
     const session = decodeToolResult(result);

@@ -98,7 +98,7 @@ export class OfficialHopperBackend {
     }
     const schema = this.tools?.find?.((t) => t.name === name);
     if (!schema) {
-      return new Error(`Unknown official Hopper tool '${name}'. Use official_hopper_tools to list available.`);
+      return new Error(`Unknown official Hopper tool '${name}'. Call official_hopper_call with name="list_tools" to see available tools.`);
     }
     const props = schema.inputSchema?.properties ?? {};
     const allowed = new Set(Object.keys(props));

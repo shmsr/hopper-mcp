@@ -52,23 +52,47 @@ export function defaultAddressQuery(store, address, sessionId) {
   throw rpcError(-32602, "No address supplied and no current address was captured in the snapshot.");
 }
 
+// Find the function whose body contains `address`, if any. We require a
+// known size (deep-mode discovery sets it; skeleton imports do not) so we
+// never silently invent a containing function from a zero-length record.
+export function findContainingFunction(session, address) {
+  if (address === null || Number.isNaN(address)) return null;
+  let best = null;
+  for (const fn of Object.values(session.functions ?? {})) {
+    const start = parseAddress(fn.addr);
+    const size = Number(fn.size ?? 0);
+    if (start === null || size <= 0) continue;
+    if (address < start || address >= start + size) continue;
+    if (!best || size < Number(best.size ?? 0)) best = fn;
+  }
+  return best;
+}
+
+// Numeric queries must NEVER fall through to substring-name matching.
+// Address digits collide constantly (every "0x100..." prefix matches),
+// so a query like 0x100079808 used to silently return some unrelated
+// function whose addr/name happened to share digits. Refusing instead
+// pushes the user toward containing_function or re-ingest with deep=true.
 export function resolveProcedure(store, query, sessionId) {
   const session = store.getSession(sessionId);
   const address = parseAddress(query);
   if (address !== null && !Number.isNaN(address)) {
-    const exact = session.functions[formatAddress(address)];
+    const normalized = formatAddress(address);
+    const exact = session.functions[normalized];
     if (exact) return exact;
-    const containing = Object.values(session.functions ?? {}).find((fn) => {
-      const start = parseAddress(fn.addr);
-      const size = Number(fn.size ?? 0);
-      return start !== null && size > 0 && address >= start && address < start + size;
-    });
+    const containing = findContainingFunction(session, address);
     if (containing) return containing;
+    throw rpcError(
+      -32602,
+      `Address ${normalized} is not the entrypoint of any known function and is not contained in any known function body. ` +
+        `Use 'containing_function' to query for the covering function (sizes are populated only by deep-mode imports), ` +
+        `or re-ingest with deep=true / via Hopper to populate function ranges.`,
+    );
   }
 
   const lower = String(query).toLowerCase();
   const matches = Object.values(session.functions ?? {}).filter((fn) => {
-    const fields = [fn.name, fn.signature, fn.addr].filter(Boolean).map((value) => String(value).toLowerCase());
+    const fields = [fn.name, fn.signature].filter(Boolean).map((value) => String(value).toLowerCase());
     return fields.some((field) => field === lower || field.includes(lower));
   });
   if (!matches.length) throw rpcError(-32602, `Unknown procedure: ${query}`);

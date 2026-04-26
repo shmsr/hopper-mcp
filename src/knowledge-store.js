@@ -197,6 +197,17 @@ export class KnowledgeStore {
         matches.push({ kind: "function", score: 1, item: publicFunction(fn) });
         continue;
       }
+      // Address-in-range: a query for an instruction address inside a known
+      // function body should still surface that function (lower score so the
+      // exact-entrypoint match always sorts above containment).
+      if (byAddress !== null) {
+        const start = parseAddress(fn.addr);
+        const size = Number(fn.size ?? 0);
+        if (start !== null && size > 0 && byAddress > start && byAddress < start + size) {
+          matches.push({ kind: "function", score: 0.9, item: publicFunction(fn), containment: { entrypoint: fn.addr, offset: byAddress - start } });
+          continue;
+        }
+      }
       const haystack = [fn.name, fn.summary, ...(fn.strings ?? []), ...(fn.imports ?? [])]
         .filter(Boolean)
         .join(" ")

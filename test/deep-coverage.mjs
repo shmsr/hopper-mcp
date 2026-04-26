@@ -303,7 +303,7 @@ try {
     await server.callTool("procedure", { field: "info", session_id: calcSession.sessionId, procedure: "0xdeadbeefcafe" });
   } catch (e) {
     threw = true;
-    if (!/not found|unknown|no procedure|resolve/i.test(e.message)) fail("unexpected procedure error", e.message);
+    if (!/not found|unknown|no procedure|resolve|not the entrypoint|not contained/i.test(e.message)) fail("unexpected procedure error", e.message);
   }
   if (!threw) fail("procedure field=info should throw on bogus addr", "no throw");
 

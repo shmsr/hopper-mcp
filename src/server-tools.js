@@ -9,6 +9,15 @@ import {
 } from "./macho-importer.js";
 import { officialToolPayload } from "./official-hopper-backend.js";
 import { buildOfficialSnapshot } from "./official-snapshot.js";
+import {
+  fetchHopperProcedureIndex,
+  computeProcedureDrift,
+  fetchHopperXrefs,
+  fetchHopperDecompilation,
+  fetchHopperAssembly,
+  fetchHopperCallees,
+  fetchHopperNames,
+} from "./hopper-bridge.js";
 import { closeHopperDocument } from "./hopper-live.js";
 import {
   classifyImports,
@@ -28,6 +37,7 @@ import {
   defaultProcedureQuery,
   defaultAddressQuery,
   resolveProcedure,
+  findContainingFunction,
   officialProcedureInfo,
   assemblyLines,
   snapshotXrefs,
@@ -37,6 +47,7 @@ import {
   searchStringsOfficial,
 } from "./server-helpers.js";
 import { toolResult, boundedNumber, DEFAULT_MAX_TOOL_TEXT_CHARS } from "./server-format.js";
+import { parseAddress, formatAddress } from "./knowledge-store.js";
 import { sampleSession } from "./sample-session.js";
 
 const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
@@ -47,6 +58,7 @@ const WRITE_LIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint:
 const optionalString = z.string().optional();
 const optionalNumber = z.number().optional();
 const optionalBool = z.boolean().optional();
+const optionalBackend = z.enum(["local", "official"]).optional();
 
 export function registerTools(server, ctx) {
   const { store, transactions, adapter, officialBackend, serverInfo } = ctx;
@@ -70,6 +82,10 @@ export function registerTools(server, ctx) {
   };
 
   const sessionFor = (args) => args.session_id ?? "current";
+  const officialRead = async (name, args = {}, options = {}) => {
+    const officialResult = await officialBackend.callTool(name, args, { confirmLiveWrite: false });
+    return toolResult(officialToolPayload(officialResult), options);
+  };
 
   // ── meta + lifecycle ────────────────────────────────────────────────────
   server.registerTool(
@@ -252,6 +268,9 @@ export function registerTools(server, ctx) {
         analysis: optionalBool,
         parse_objective_c: optionalBool,
         parse_swift: optionalBool,
+        parse_exceptions: optionalBool,
+        close_after_export: optionalBool,
+        live_backend: z.enum(["python", "official"]).optional(),
         wait_for_analysis: optionalBool,
         full_export: optionalBool,
         fail_on_truncation: optionalBool,
@@ -272,6 +291,9 @@ export function registerTools(server, ctx) {
         analysis: args.analysis,
         parseObjectiveC: args.parse_objective_c,
         parseSwift: args.parse_swift,
+        parseExceptions: args.parse_exceptions,
+        closeAfterExport: args.close_after_export,
+        liveBackend: args.live_backend,
         waitForAnalysis: args.wait_for_analysis,
         fullExport: args.full_export,
         failOnTruncation: args.fail_on_truncation,
@@ -291,7 +313,7 @@ export function registerTools(server, ctx) {
     {
       title: "Import MachO",
       description:
-        "Import Mach-O metadata using local macOS tools. With deep=true, also discovers functions from disassembly, builds call graphs, and resolves string cross-references via ADRP+ADD patterns.",
+        "Import Mach-O metadata using local macOS tools. With deep=true, also discovers functions from disassembly, builds call graphs, and resolves string cross-references via ADRP+ADD patterns. Pass use_hopper=true to additionally fuse Hopper's procedure index into the deep merge — entrypoints, sizes, basicblocks, signatures, and locals from Hopper override the heuristic-derived ones when Hopper has the same binary loaded.",
       inputSchema: {
         executable_path: z.string(),
         arch: optionalString,
@@ -300,31 +322,204 @@ export function registerTools(server, ctx) {
         max_functions: optionalNumber,
         overwrite: optionalBool,
         fold_aliases: optionalBool,
+        use_hopper: optionalBool,
+        hopper_procedure_info: optionalBool,
+        hopper_max_procedure_info: optionalNumber,
+        hopper_include_names: optionalBool,
       },
       annotations: WRITE_LOCAL,
     },
     async (args, extra) => {
       const isDeep = Boolean(args.deep);
+      const useHopper = Boolean(args.use_hopper) && isDeep;
+      const totalSteps = useHopper ? 4 : isDeep ? 3 : 1;
       await notifyProgress(
         extra,
         0,
-        isDeep ? 3 : 1,
+        totalSteps,
         isDeep ? "Deep Mach-O import: extracting metadata." : "Importing Mach-O metadata.",
       );
+
+      let hopperIndex = null;
+      let hopperFusion = null;
+      let hopperLabels = null;
+      if (useHopper) {
+        await notifyProgress(extra, 1, totalSteps, "Fetching Hopper procedure index.");
+        const result = await fetchHopperProcedureIndex(officialBackend, {
+          expectedDocument: args.executable_path,
+          documentMustMatch: true,
+          fetchProcedureInfo: Boolean(args.hopper_procedure_info),
+          maxProcedureInfo: Number(args.hopper_max_procedure_info ?? 200),
+        });
+        hopperFusion = {
+          reachable: Boolean(result?.reachable),
+          documentName: result?.documentName ?? null,
+          documentMismatch: result?.documentMismatch ?? null,
+          reason: result?.reason ?? null,
+          procedureCount: result?.procedures?.map?.size ?? 0,
+          procedureError: result?.procedures?.error ?? null,
+        };
+        if (result?.procedures?.map && !result.documentMismatch) {
+          hopperIndex = result.procedures.map;
+          // Also pull Hopper's full named-address dictionary (labels for
+          // proc starts, vars, string-pool tags, vtables, etc.). On real
+          // binaries this is strictly larger than nm because Hopper labels
+          // post-discovery targets too — useful for cross-section analysis.
+          // Gated behind hopper_include_names so callers can opt out.
+          if (args.hopper_include_names !== false) {
+            const namesResult = await fetchHopperNames(officialBackend, {
+              expectedDocument: args.executable_path,
+              documentMustMatch: true,
+            });
+            if (namesResult?.names instanceof Map) {
+              hopperLabels = namesResult.names;
+              hopperFusion.namedAddressCount = hopperLabels.size;
+            } else if (namesResult?.reason) {
+              hopperFusion.namesReason = namesResult.reason;
+            }
+          }
+        }
+      }
+
       const imported = await importMachO(args.executable_path, {
         arch: args.arch ?? "auto",
         maxStrings: args.max_strings ?? 15000,
         deep: isDeep,
         maxFunctions: args.max_functions ?? 30000,
+        hopperIndex,
+        hopperLabels,
       });
-      if (isDeep) await notifyProgress(extra, 2, 3, "Indexing discovered functions.");
+      if (isDeep) await notifyProgress(extra, totalSteps - 1, totalSteps, "Indexing discovered functions.");
       const session = await store.upsertSession(imported, upsertOptions(args));
       notifyResourceListChanged();
-      await notifyProgress(extra, isDeep ? 3 : 1, isDeep ? 3 : 1, "Mach-O import complete.");
+      await notifyProgress(extra, totalSteps, totalSteps, "Mach-O import complete.");
       return toolResult({
         session: store.describeSession(session),
-        source: isDeep ? "local-macho-deep" : "local-macho-importer",
+        source: hopperIndex ? "local-macho-deep+hopper" : isDeep ? "local-macho-deep" : "local-macho-importer",
+        hopperFusion,
       });
+    },
+  );
+
+  server.registerTool(
+    "compare_with_hopper",
+    {
+      title: "Compare With Hopper",
+      description:
+        "Diagnostic: run the local Mach-O deep importer and Hopper's procedure index side-by-side, and report drift — procedures only in one set, size mismatches, and name mismatches. Useful for validating the heuristic-driven analysis against Hopper ground truth.",
+      inputSchema: {
+        executable_path: z.string(),
+        arch: optionalString,
+        max_strings: optionalNumber,
+        max_functions: optionalNumber,
+        max_per_category: optionalNumber,
+        document_must_match: optionalBool,
+      },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args, extra) => {
+      await notifyProgress(extra, 0, 3, "Running local deep importer.");
+      const local = await importMachO(args.executable_path, {
+        arch: args.arch ?? "auto",
+        maxStrings: args.max_strings ?? 15000,
+        deep: true,
+        maxFunctions: args.max_functions ?? 30000,
+      });
+      await notifyProgress(extra, 1, 3, "Fetching Hopper procedure index.");
+      const hopperResult = await fetchHopperProcedureIndex(officialBackend, {
+        expectedDocument: args.executable_path,
+        documentMustMatch: args.document_must_match !== false,
+      });
+      await notifyProgress(extra, 2, 3, "Computing drift.");
+      const report = computeProcedureDrift(local, hopperResult, {
+        maxPerCategory: Number(args.max_per_category ?? 100),
+      });
+      await notifyProgress(extra, 3, 3, "Drift report ready.");
+      return toolResult(report);
+    },
+  );
+
+  server.registerTool(
+    "hopper_decompile",
+    {
+      title: "Hopper Decompile",
+      description:
+        "Decompile a procedure to C-like pseudo-code via Hopper's `procedure_pseudo_code`. Result is cached per (Hopper document, procedure addr) and invalidated whenever Hopper's procedure-size dictionary changes (rename, re-analysis, etc.). Procedures with more basic blocks than max_basic_blocks (default 250) are skipped because pseudo-code generation is O(blocks^2) at the Hopper end and routinely takes 5+ seconds on large entrypoints.",
+      inputSchema: {
+        procedure_addr: z.string().describe("Procedure entrypoint as a hex address."),
+        executable_path: optionalString.describe("Optional binary path; if set, the call fails when Hopper has a different document open."),
+        document_must_match: optionalBool,
+        max_basic_blocks: optionalNumber,
+        use_cache: optionalBool,
+        max_result_chars: optionalNumber,
+        include_full_result: optionalBool,
+      },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      const result = await fetchHopperDecompilation(officialBackend, args.procedure_addr, {
+        expectedDocument: args.executable_path ?? null,
+        documentMustMatch: args.document_must_match !== false,
+        maxBasicBlocks: Number(args.max_basic_blocks ?? 250),
+        useCache: args.use_cache !== false,
+      });
+      return toolResult(result, {
+        maxTextChars: boundedNumber(args.max_result_chars, DEFAULT_MAX_TOOL_TEXT_CHARS),
+        includeFullResult: Boolean(args.include_full_result),
+      });
+    },
+  );
+
+  server.registerTool(
+    "hopper_assembly",
+    {
+      title: "Hopper Assembly",
+      description:
+        "Render a procedure's annotated assembly via Hopper's `procedure_assembly`. Strictly more readable than `disassemble_range` for whole-function views because Hopper formats labels, comments, and basic-block boundaries. Result cached the same way as `hopper_decompile`.",
+      inputSchema: {
+        procedure_addr: z.string().describe("Procedure entrypoint as a hex address."),
+        executable_path: optionalString,
+        document_must_match: optionalBool,
+        use_cache: optionalBool,
+        max_result_chars: optionalNumber,
+        include_full_result: optionalBool,
+      },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      const result = await fetchHopperAssembly(officialBackend, args.procedure_addr, {
+        expectedDocument: args.executable_path ?? null,
+        documentMustMatch: args.document_must_match !== false,
+        useCache: args.use_cache !== false,
+      });
+      return toolResult(result, {
+        maxTextChars: boundedNumber(args.max_result_chars, DEFAULT_MAX_TOOL_TEXT_CHARS),
+        includeFullResult: Boolean(args.include_full_result),
+      });
+    },
+  );
+
+  server.registerTool(
+    "hopper_callees",
+    {
+      title: "Hopper Callees",
+      description:
+        "List procedures called BY a given procedure (forward call-graph). Resolves Hopper's `procedure_callees` name list to entrypoint addresses via `list_procedures`. Companion to `find_xrefs use_hopper=true` which returns the reverse direction (callers).",
+      inputSchema: {
+        procedure_addr: z.string(),
+        executable_path: optionalString,
+        document_must_match: optionalBool,
+        max_results: optionalNumber,
+      },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      const result = await fetchHopperCallees(officialBackend, args.procedure_addr, {
+        expectedDocument: args.executable_path ?? null,
+        documentMustMatch: args.document_must_match !== false,
+        maxResults: Number(args.max_results ?? 200),
+      });
+      return toolResult(result);
     },
   );
 
@@ -417,13 +612,15 @@ export function registerTools(server, ctx) {
     {
       title: "Find Xrefs",
       description:
-        "Live disassembly: find code locations that reference a target address by scanning the binary with otool. For snapshot-based xrefs, use the `xrefs` tool.",
+        "Cross-references to a target address. By default scans the binary live with otool. Pass use_hopper=true to delegate to Hopper's analyzed `xrefs` tool when Hopper has the same binary loaded — strictly more authoritative because Hopper resolves indirect-jump tables and runtime-dispatch heuristics that pure disassembly can't see. With use_hopper=true and include_callees=true the response also reports the procedures called BY the target (forward call-graph slice). Falls back to otool when Hopper unreachable or document mismatched. For local snapshot-based xrefs, use the `xrefs` tool.",
       inputSchema: {
         executable_path: optionalString,
         target_addr: z.string(),
         arch: optionalString,
         max_results: optionalNumber,
         session_id: optionalString,
+        use_hopper: optionalBool,
+        include_callees: optionalBool,
       },
       annotations: READ_ONLY,
     },
@@ -431,11 +628,50 @@ export function registerTools(server, ctx) {
       const sessionId = sessionFor(args);
       const binaryPath = args.executable_path ?? store.getSession(sessionId)?.binary?.path;
       if (!binaryPath) throw rpcError(-32602, "No executable_path and no session binary path available.");
+      const maxResults = args.max_results ?? 50;
+
+      if (args.use_hopper) {
+        await notifyProgress(extra, 0, 1, "Querying Hopper analyzed xrefs.");
+        const hopperRes = await fetchHopperXrefs(officialBackend, args.target_addr, {
+          expectedDocument: binaryPath,
+          documentMustMatch: true,
+          resolveCallers: true,
+          includeCallees: Boolean(args.include_callees),
+          maxResults,
+        });
+        if (hopperRes?.xrefs) {
+          await notifyProgress(extra, 1, 1, `Hopper returned ${hopperRes.xrefs.length} xrefs.`);
+          return toolResult({
+            source: "hopper-analyzed",
+            documentName: hopperRes.documentName,
+            xrefs: hopperRes.xrefs,
+            callerProcedures: hopperRes.callerProcedures,
+            calleeProcedures: hopperRes.calleeProcedures,
+          });
+        }
+        // Fall through to otool with a note about why Hopper was skipped.
+        const reason = hopperRes?.documentMismatch
+          ? `Hopper has '${hopperRes.documentMismatch.got}' open, expected '${hopperRes.documentMismatch.expected}'`
+          : (hopperRes?.reason ?? "Hopper unavailable");
+        await notifyProgress(extra, 0, 1, `Hopper skipped: ${reason}. Falling back to otool scan.`);
+        const fallback = await findXrefs(binaryPath, {
+          arch: args.arch ?? "auto",
+          targetAddr: args.target_addr,
+          maxResults,
+        });
+        await notifyProgress(extra, 1, 1, `otool found ${fallback.length} xrefs.`);
+        return toolResult({
+          source: "otool-fallback",
+          hopperSkippedReason: reason,
+          xrefs: fallback,
+        });
+      }
+
       await notifyProgress(extra, 0, 1, "Scanning binary for cross-references (streaming otool).");
       const result = await findXrefs(binaryPath, {
         arch: args.arch ?? "auto",
         targetAddr: args.target_addr,
-        maxResults: args.max_results ?? 50,
+        maxResults,
       });
       await notifyProgress(extra, 1, 1, `Found ${result.length} xrefs.`);
       return toolResult(result);
@@ -587,10 +823,15 @@ export function registerTools(server, ctx) {
       title: "Xrefs (Snapshot)",
       description:
         "Snapshot xrefs: cross-references to/from an address in the active session's indexed metadata. For a live binary scan use `find_xrefs`.",
-      inputSchema: { address: optionalString, session_id: optionalString },
+      inputSchema: { address: optionalString, session_id: optionalString, backend: optionalBackend },
       annotations: READ_ONLY,
     },
     async (args) => {
+      if (args.backend === "official") {
+        const address = args.address ?? await officialToolPayload(await officialBackend.callTool("current_address", {}));
+        if (!address) throw rpcError(-32602, "xrefs backend=official needs address or a current Hopper address.");
+        return officialRead("xrefs", { address });
+      }
       const sessionId = sessionFor(args);
       return toolResult(snapshotXrefs(store, defaultAddressQuery(store, args.address, sessionId), sessionId));
     },
@@ -601,16 +842,488 @@ export function registerTools(server, ctx) {
     {
       title: "List Procedures",
       description: "List procedure addresses and names from the active snapshot, named-first then by address.",
-      inputSchema: { session_id: optionalString, max_results: optionalNumber },
+      inputSchema: { session_id: optionalString, max_results: optionalNumber, backend: optionalBackend },
       annotations: READ_ONLY,
     },
-    async (args) =>
-      toolResult(
+    async (args) => {
+      if (args.backend === "official") return officialRead("list_procedures");
+      return toolResult(
         objectFromFunctions(
           listProcedures(store, sessionFor(args), { maxResults: args.max_results }),
           (fn) => fn.name ?? fn.addr,
         ),
-      ),
+      );
+    },
+  );
+
+  // ── official-compatible snapshot tools ─────────────────────────────────
+  server.registerTool(
+    "list_documents",
+    {
+      title: "List Documents",
+      description: "List open Hopper documents via backend=official, or locally loaded snapshot names by default.",
+      inputSchema: { backend: optionalBackend },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) =>
+      args.backend === "official"
+        ? officialRead("list_documents")
+        : toolResult(store.listSessions().map((session) => session.name)),
+  );
+
+  server.registerTool(
+    "current_document",
+    {
+      title: "Current Document",
+      description: "Return the live Hopper current document with backend=official, or the current local snapshot name.",
+      inputSchema: { backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") {
+        try {
+          return await officialRead("current_document");
+        } catch (err) {
+          if (/no document/i.test(String(err?.message ?? err))) return toolResult(null);
+          throw err;
+        }
+      }
+      const session = sessionOrNull(store, sessionFor(args));
+      return toolResult(session?.binary?.name ?? null);
+    },
+  );
+
+  server.registerTool(
+    "list_segments",
+    {
+      title: "List Segments",
+      description: "List segment metadata from the local snapshot or Hopper's official backend.",
+      inputSchema: { backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("list_segments");
+      const session = store.getSession(sessionFor(args));
+      return toolResult((session.binary?.segments ?? []).map(officialSegment));
+    },
+  );
+
+  server.registerTool(
+    "list_procedure_size",
+    {
+      title: "List Procedure Size",
+      description: "Return procedure size/basic-block metadata keyed by address.",
+      inputSchema: { backend: optionalBackend, session_id: optionalString, max_results: optionalNumber },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("list_procedure_size");
+      return toolResult(
+        Object.fromEntries(
+          listProcedures(store, sessionFor(args), { maxResults: args.max_results }).map((fn) => [
+            fn.addr,
+            {
+              name: fn.name ?? null,
+              basicblock_count: fn.basicBlockCount ?? fn.basicBlocks?.length ?? 0,
+              size: fn.size ?? null,
+            },
+          ]),
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
+    "list_procedure_info",
+    {
+      title: "List Procedure Info",
+      description: "Return official-shaped procedure metadata keyed by address.",
+      inputSchema: { backend: optionalBackend, session_id: optionalString, max_results: optionalNumber },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("list_procedure_info");
+      return toolResult(
+        Object.fromEntries(
+          listProcedures(store, sessionFor(args), { maxResults: args.max_results }).map((fn) => [
+            fn.addr,
+            officialProcedureInfo(fn),
+          ]),
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
+    "list_strings",
+    {
+      title: "List Strings",
+      description: "List strings keyed by address from the local snapshot or official backend.",
+      inputSchema: { backend: optionalBackend, session_id: optionalString, max_results: optionalNumber },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("list_strings");
+      return toolResult(
+        objectFromAddressItems(limitResults(store.getSession(sessionFor(args)).strings ?? [], args.max_results), "value"),
+      );
+    },
+  );
+
+  server.registerTool(
+    "list_names",
+    {
+      title: "List Names",
+      description: "List named addresses keyed by address from the local snapshot or official backend.",
+      inputSchema: { backend: optionalBackend, session_id: optionalString, max_results: optionalNumber },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("list_names");
+      const session = store.getSession(sessionFor(args));
+      return toolResult(
+        objectFromAddressItems(limitResults(localNameItems(session), args.max_results), "name"),
+      );
+    },
+  );
+
+  server.registerTool(
+    "list_bookmarks",
+    {
+      title: "List Bookmarks",
+      description: "List bookmarks from the local snapshot or official backend.",
+      inputSchema: { backend: optionalBackend, session_id: optionalString, max_results: optionalNumber },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("list_bookmarks");
+      return toolResult(limitResults(store.getSession(sessionFor(args)).bookmarks ?? [], args.max_results));
+    },
+  );
+
+  server.registerTool(
+    "current_address",
+    {
+      title: "Current Address",
+      description: "Return Hopper's current address or the address captured in the current local snapshot.",
+      inputSchema: { backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("current_address");
+      return toolResult(store.getSession(sessionFor(args)).cursor?.address ?? null);
+    },
+  );
+
+  server.registerTool(
+    "current_procedure",
+    {
+      title: "Current Procedure",
+      description: "Return Hopper's current procedure name or the name/address captured in the current local snapshot.",
+      inputSchema: { backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("current_procedure");
+      const session = store.getSession(sessionFor(args));
+      const proc = session.cursor?.procedure ? store.getFunctionIfKnown(session, session.cursor.procedure) : null;
+      return toolResult(proc?.name ?? proc?.addr ?? null);
+    },
+  );
+
+  server.registerTool(
+    "procedure_info",
+    {
+      title: "Procedure Info",
+      description: "Return official-shaped metadata for a procedure address or name.",
+      inputSchema: { procedure: optionalString, backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") {
+        const procedure = args.procedure ?? await officialToolPayload(await officialBackend.callTool("current_procedure", {}));
+        if (!procedure) throw rpcError(-32602, "procedure_info backend=official needs procedure or a current Hopper procedure.");
+        return officialRead("procedure_info", { procedure });
+      }
+      const sessionId = sessionFor(args);
+      const fn = resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId);
+      return toolResult(officialProcedureInfo(fn));
+    },
+  );
+
+  server.registerTool(
+    "procedure_address",
+    {
+      title: "Procedure Address",
+      description: "Resolve a procedure name or address to its entrypoint.",
+      inputSchema: { procedure: z.string(), backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("procedure_address", { procedure: args.procedure });
+      return toolResult(resolveProcedure(store, args.procedure, sessionFor(args)).addr);
+    },
+  );
+
+  server.registerTool(
+    "procedure_assembly",
+    {
+      title: "Procedure Assembly",
+      description: "Return procedure assembly from the snapshot or Hopper's official backend.",
+      inputSchema: {
+        procedure: optionalString,
+        backend: optionalBackend,
+        session_id: optionalString,
+        max_lines: optionalNumber,
+        max_result_chars: optionalNumber,
+        include_full_result: optionalBool,
+      },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") {
+        const procedure = args.procedure ?? await officialToolPayload(await officialBackend.callTool("current_procedure", {}));
+        if (!procedure) throw rpcError(-32602, "procedure_assembly backend=official needs procedure or a current Hopper procedure.");
+        return officialRead("procedure_assembly", { procedure }, {
+          maxTextChars: boundedNumber(args.max_result_chars, DEFAULT_MAX_TOOL_TEXT_CHARS),
+          includeFullResult: Boolean(args.include_full_result),
+        });
+      }
+      const sessionId = sessionFor(args);
+      const fn = resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId);
+      const lines = assemblyLines(fn);
+      return toolResult(args.max_lines ? lines.slice(0, args.max_lines).join("\n") : lines.join("\n"));
+    },
+  );
+
+  server.registerTool(
+    "procedure_pseudo_code",
+    {
+      title: "Procedure Pseudo Code",
+      description: "Return captured pseudocode from the snapshot or Hopper's official backend.",
+      inputSchema: {
+        procedure: optionalString,
+        backend: optionalBackend,
+        session_id: optionalString,
+        max_result_chars: optionalNumber,
+        include_full_result: optionalBool,
+      },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") {
+        const procedure = args.procedure ?? await officialToolPayload(await officialBackend.callTool("current_procedure", {}));
+        if (!procedure) throw rpcError(-32602, "procedure_pseudo_code backend=official needs procedure or a current Hopper procedure.");
+        return officialRead("procedure_pseudo_code", { procedure }, {
+          maxTextChars: boundedNumber(args.max_result_chars, DEFAULT_MAX_TOOL_TEXT_CHARS),
+          includeFullResult: Boolean(args.include_full_result),
+        });
+      }
+      const sessionId = sessionFor(args);
+      const fn = resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId);
+      return toolResult(fn.pseudocode ?? null);
+    },
+  );
+
+  server.registerTool(
+    "procedure_callers",
+    {
+      title: "Procedure Callers",
+      description: "Return caller procedure names for a procedure.",
+      inputSchema: { procedure: optionalString, backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") {
+        const procedure = args.procedure ?? await officialToolPayload(await officialBackend.callTool("current_procedure", {}));
+        if (!procedure) throw rpcError(-32602, "procedure_callers backend=official needs procedure or a current Hopper procedure.");
+        return officialRead("procedure_callers", { procedure });
+      }
+      const sessionId = sessionFor(args);
+      const session = store.getSession(sessionId);
+      const fn = resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId);
+      return toolResult((fn.callers ?? []).map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr));
+    },
+  );
+
+  server.registerTool(
+    "procedure_callees",
+    {
+      title: "Procedure Callees",
+      description: "Return callee procedure names for a procedure.",
+      inputSchema: { procedure: optionalString, backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") {
+        const procedure = args.procedure ?? await officialToolPayload(await officialBackend.callTool("current_procedure", {}));
+        if (!procedure) throw rpcError(-32602, "procedure_callees backend=official needs procedure or a current Hopper procedure.");
+        return officialRead("procedure_callees", { procedure });
+      }
+      const sessionId = sessionFor(args);
+      const session = store.getSession(sessionId);
+      const fn = resolveProcedure(store, defaultProcedureQuery(store, args.procedure, sessionId), sessionId);
+      return toolResult((fn.callees ?? []).map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr));
+    },
+  );
+
+  server.registerTool(
+    "search_strings",
+    {
+      title: "Search Strings",
+      description: "Search strings and return an address-keyed official-style object.",
+      inputSchema: {
+        pattern: z.string(),
+        case_sensitive: optionalBool,
+        backend: optionalBackend,
+        session_id: optionalString,
+        max_results: optionalNumber,
+      },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") {
+        return officialRead("search_strings", {
+          pattern: args.pattern,
+          ...(args.case_sensitive === undefined ? {} : { case_sensitive: args.case_sensitive }),
+        });
+      }
+      return toolResult(
+        objectFromAddressItems(
+          searchStringsOfficial(store, args.pattern, {
+            caseSensitive: Boolean(args.case_sensitive),
+            sessionId: sessionFor(args),
+            maxResults: args.max_results,
+          }),
+          "value",
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
+    "search_procedures",
+    {
+      title: "Search Procedures",
+      description: "Search procedure addresses/names/signatures and return an address-keyed object.",
+      inputSchema: {
+        pattern: z.string(),
+        case_sensitive: optionalBool,
+        backend: optionalBackend,
+        session_id: optionalString,
+        max_results: optionalNumber,
+      },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") {
+        return officialRead("search_procedures", {
+          pattern: args.pattern,
+          ...(args.case_sensitive === undefined ? {} : { case_sensitive: args.case_sensitive }),
+        });
+      }
+      const regex = new RegExp(args.pattern, args.case_sensitive ? "" : "i");
+      return toolResult(
+        objectFromFunctions(
+          limitResults(
+            listProcedures(store, sessionFor(args)).filter((fn) =>
+              regex.test([fn.addr, fn.name, fn.signature, fn.summary].filter(Boolean).join(" ")),
+            ),
+            args.max_results,
+          ),
+          (fn) => fn.name ?? fn.addr,
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
+    "search_name",
+    {
+      title: "Search Name",
+      description: "Search named addresses and return an address-keyed object.",
+      inputSchema: {
+        pattern: z.string(),
+        case_sensitive: optionalBool,
+        backend: optionalBackend,
+        session_id: optionalString,
+        max_results: optionalNumber,
+      },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") {
+        return officialRead("search_name", {
+          pattern: args.pattern,
+          ...(args.case_sensitive === undefined ? {} : { case_sensitive: args.case_sensitive }),
+        });
+      }
+      const regex = new RegExp(args.pattern, args.case_sensitive ? "" : "i");
+      const session = store.getSession(sessionFor(args));
+      return toolResult(
+        objectFromAddressItems(
+          limitResults(
+            localNameItems(session).filter((item) =>
+              regex.test([item.addr, item.name, item.demangled].filter(Boolean).join(" ")),
+            ),
+            args.max_results,
+          ),
+          "name",
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
+    "address_name",
+    {
+      title: "Address Name",
+      description: "Resolve an address to a name in the snapshot or official backend.",
+      inputSchema: { address: z.string(), backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("address_name", { address: args.address });
+      const session = store.getSession(sessionFor(args));
+      const normalized = formatAddress(args.address);
+      const fn = session.functions?.[normalized];
+      const named = (session.names ?? []).find((item) => formatAddress(item.addr) === normalized);
+      return toolResult(fn?.name ?? named?.name ?? null);
+    },
+  );
+
+  server.registerTool(
+    "comment",
+    {
+      title: "Comment",
+      description: "Read a prefix comment from the snapshot or official backend.",
+      inputSchema: { address: z.string(), backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("comment", { address: args.address });
+      const normalized = formatAddress(args.address);
+      const session = store.getSession(sessionFor(args));
+      const direct = (session.comments ?? []).find((item) => formatAddress(item.addr) === normalized);
+      return toolResult(direct?.comment ?? direct?.value ?? session.functions?.[normalized]?.comment ?? null);
+    },
+  );
+
+  server.registerTool(
+    "inline_comment",
+    {
+      title: "Inline Comment",
+      description: "Read an inline comment from the snapshot or official backend.",
+      inputSchema: { address: z.string(), backend: optionalBackend, session_id: optionalString },
+      annotations: READ_OPEN_WORLD,
+    },
+    async (args) => {
+      if (args.backend === "official") return officialRead("inline_comment", { address: args.address });
+      const normalized = formatAddress(args.address);
+      const session = store.getSession(sessionFor(args));
+      const direct = (session.inlineComments ?? []).find((item) => formatAddress(item.addr) === normalized);
+      return toolResult(direct?.comment ?? direct?.value ?? null);
+    },
   );
 
   // ── unified procedure / search ─────────────────────────────────────────
@@ -650,6 +1363,61 @@ export function registerTools(server, ctx) {
           return toolResult(list.map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr));
         }
       }
+    },
+  );
+
+  // Address-in-range lookup. The 'procedure' tool throws when given an address
+  // that isn't a function entrypoint; this tool answers the implicit
+  // "what function contains this instruction?" question explicitly.
+  server.registerTool(
+    "containing_function",
+    {
+      title: "Containing function",
+      description:
+        "Find the function whose body covers an address. Requires deep-mode imports (or live Hopper) to have populated function sizes. Returns null when sizes are unavailable instead of guessing.",
+      inputSchema: {
+        address: z.string().describe("Hex (0x...) or decimal instruction address."),
+        session_id: optionalString,
+      },
+      annotations: READ_ONLY,
+    },
+    async (args) => {
+      const sessionId = sessionFor(args);
+      const session = store.getSession(sessionId);
+      const address = parseAddress(args.address);
+      if (address === null || Number.isNaN(address)) {
+        throw rpcError(-32602, `containing_function requires a numeric address; got '${args.address}'.`);
+      }
+      const normalized = formatAddress(address);
+      const exact = session.functions[normalized];
+      if (exact) {
+        return toolResult({
+          match: "entrypoint",
+          function: officialProcedureInfo(exact),
+          offset: 0,
+        });
+      }
+      const containing = findContainingFunction(session, address);
+      if (containing) {
+        const start = parseAddress(containing.addr) ?? 0;
+        return toolResult({
+          match: "containment",
+          function: officialProcedureInfo(containing),
+          offset: address - start,
+        });
+      }
+      const sizedCount = Object.values(session.functions ?? {}).filter((fn) => Number(fn.size ?? 0) > 0).length;
+      const totalCount = Object.keys(session.functions ?? {}).length;
+      return toolResult({
+        match: "none",
+        address: normalized,
+        sizedFunctions: sizedCount,
+        totalFunctions: totalCount,
+        hint:
+          sizedCount === 0
+            ? "No function in this session has a known size. Re-ingest with deep=true (import_macho) or via Hopper to populate function ranges."
+            : `Address falls outside all ${sizedCount} sized functions. It may be in stub/PLT code, data, or a region not yet discovered.`,
+      });
     },
   );
 
@@ -1172,6 +1940,17 @@ function findSimilarFunctions(store, { sessionId, addr, targetSessionId, minSimi
     target: { sessionId: session.sessionId, addr: target.addr, name: target.name ?? null, fingerprint: target.fingerprint },
     matches: results.slice(0, maxResults),
   };
+}
+
+function localNameItems(session) {
+  const merged = new Map();
+  for (const item of session.names ?? []) {
+    if (item?.addr) merged.set(formatAddress(item.addr), { ...item, addr: formatAddress(item.addr) });
+  }
+  for (const fn of Object.values(session.functions ?? {})) {
+    if (fn?.addr && fn?.name) merged.set(formatAddress(fn.addr), { addr: formatAddress(fn.addr), name: fn.name });
+  }
+  return [...merged.values()];
 }
 
 async function resolveFromBinaryStrings(store, query, { sessionId, maxResults }) {

@@ -2,6 +2,7 @@
 
 These notes are from clean-room behavioral testing of Hopper's installed MCP server over stdio JSON-RPC.
 They do not depend on decompiling or copying the proprietary server implementation.
+For disassembly-derived interoperability notes, see `docs/official-hoppermcpserver-re.md`.
 
 ## Binary
 

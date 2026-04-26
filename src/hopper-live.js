@@ -8,7 +8,7 @@ import { OfficialHopperBackend, officialToolPayload } from "./official-hopper-ba
 import { buildOfficialSnapshot } from "./official-snapshot.js";
 
 const DEFAULT_OSASCRIPT = "/usr/bin/osascript";
-const DEFAULT_HOPPER_CLI = "/Applications/Hopper Disassembler.app/Contents/MacOS/Hopper Disassembler";
+const DEFAULT_HOPPER_CLI = "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
 const execFileAsync = promisify(execFile);
 const PREFERRED_ARCHS = ["arm64e", "arm64", "x86_64"];
 const liveIngestInFlight = new Map();
@@ -16,10 +16,13 @@ let liveIngestQueue = Promise.resolve();
 
 export async function ingestWithLiveHopper({
   executablePath,
-  hopperLauncher = DEFAULT_OSASCRIPT,
+  hopperLauncher = DEFAULT_HOPPER_CLI,
   analysis = true,
   parseObjectiveC = true,
   parseSwift = true,
+  parseExceptions = true,
+  closeAfterExport = false,
+  liveBackend = process.env.HOPPER_LIVE_BACKEND ?? "python",
   timeoutMs = 600000,
   maxFunctions,
   maxStrings,
@@ -43,6 +46,9 @@ export async function ingestWithLiveHopper({
     analysis,
     parseObjectiveC,
     parseSwift,
+    parseExceptions,
+    closeAfterExport,
+    liveBackend,
     timeoutMs,
     maxFunctions,
     maxStrings,
@@ -65,10 +71,13 @@ export async function ingestWithLiveHopper({
 
 async function ingestWithLiveHopperUnlocked({
   executablePath,
-  hopperLauncher = DEFAULT_OSASCRIPT,
+  hopperLauncher = DEFAULT_HOPPER_CLI,
   analysis = true,
   parseObjectiveC = true,
   parseSwift = true,
+  parseExceptions = true,
+  closeAfterExport = false,
+  liveBackend = process.env.HOPPER_LIVE_BACKEND ?? "python",
   timeoutMs = 600000,
   maxFunctions,
   maxStrings,
@@ -89,6 +98,50 @@ async function ingestWithLiveHopperUnlocked({
   const effectiveMaxBlocksPerFunction = fullExport ? (maxBlocksPerFunction ?? null) : (maxBlocksPerFunction ?? 64);
   const effectiveMaxInstructionsPerBlock = fullExport ? (maxInstructionsPerBlock ?? null) : (maxInstructionsPerBlock ?? 24);
   const effectiveMaxPseudocodeFunctions = includePseudocode ? (maxPseudocodeFunctions ?? 25) : 0;
+
+  if (liveBackend !== "official") {
+    const exported = await runHopperExporter({
+      hopperLauncher,
+      timeoutMs,
+      maxFunctions: effectiveMaxFunctions,
+      maxStrings: effectiveMaxStrings,
+      maxBlocksPerFunction: effectiveMaxBlocksPerFunction,
+      maxInstructionsPerBlock: effectiveMaxInstructionsPerBlock,
+      includePseudocode,
+      maxPseudocodeFunctions: effectiveMaxPseudocodeFunctions,
+      waitForAnalysis: effectiveWaitForAnalysis,
+      fullExport,
+      failOnTruncation,
+      closeAfterExport,
+      buildLaunchSpec: (scriptPath) => buildLiveExportLaunchSpec({
+        executablePath,
+        scriptPath,
+        analysis,
+        parseObjectiveC,
+        parseSwift,
+        parseExceptions,
+        hopperLauncher,
+      }),
+      diagnostics: {
+        executablePath,
+        parseObjectiveC,
+        parseSwift,
+        parseExceptions,
+        closeAfterExport,
+        liveBackend: "python",
+      },
+    });
+    await enrichSnapshotBinary(exported.session, executablePath);
+    exported.session.capabilities = {
+      ...(exported.session.capabilities ?? {}),
+      liveExport: {
+        ...(exported.session.capabilities?.liveExport ?? {}),
+        backend: "hopper-python-bridge",
+      },
+    };
+    exported.session = normalizeSession(exported.session);
+    return exported;
+  }
 
   // Reuse the caller's (singleton) backend when provided, so that live ingest
   // doesn't spawn a second HopperMCPServer that races the parent's own. We
@@ -114,7 +167,7 @@ async function ingestWithLiveHopperUnlocked({
     // launch path actually starts a fresh analysis.
     if (
       !reusableCurrentDocument
-      && baselineCurrentDocument === basename(executablePath)
+      && documentMatchesExecutableName(baselineCurrentDocument, executablePath)
       && isOsaScriptLauncher(hopperLauncher)
     ) {
       try {
@@ -129,6 +182,7 @@ async function ingestWithLiveHopperUnlocked({
       analysis,
       parseObjectiveC,
       parseSwift,
+      parseExceptions,
       skipLaunch: reusableCurrentDocument,
     });
     const snapshot = await waitForOfficialSnapshot({
@@ -177,10 +231,20 @@ export async function closeHopperDocument(documentName, { hopperLauncher = DEFAU
     quoteAppleScriptString(documentName),
     ") saving no",
   ].join("");
-  await execFileAsync(hopperLauncher, ["-e", appleScript], {
-    timeout: 15000,
-    maxBuffer: 1024 * 1024,
-  });
+  try {
+    await execFileAsync(hopperLauncher, ["-e", appleScript], {
+      timeout: 15000,
+      maxBuffer: 1024 * 1024,
+    });
+  } catch (err) {
+    const output = `${err?.stdout ?? ""}\n${err?.stderr ?? ""}\n${err?.message ?? ""}`;
+    if (/-1708/.test(output) || /doesn.t understand the .close. message/i.test(output)) {
+      throw new Error(
+        "Hopper did not accept AppleScript document close. Exact live close requires the Hopper Python bridge; the local session was still removed.",
+      );
+    }
+    throw err;
+  }
   return { documentName, appleScript };
 }
 
@@ -198,6 +262,7 @@ async function launchExecutableInHopper({
   analysis,
   parseObjectiveC,
   parseSwift,
+  parseExceptions,
   skipLaunch = false,
 }) {
   if (skipLaunch) {
@@ -217,6 +282,7 @@ async function launchExecutableInHopper({
     analysis,
     parseObjectiveC,
     parseSwift,
+    parseExceptions,
     hopperLauncher,
   });
 
@@ -257,7 +323,7 @@ async function shouldReuseCurrentDocument({
   executablePath,
   currentDocument,
 }) {
-  if (currentDocument !== basename(executablePath)) return false;
+  if (!documentMatchesExecutableName(currentDocument, executablePath)) return false;
   // Only reuse when the document already has a non-empty procedure index.
   // A stale 'ls' document with zero procedures (or one whose backend errors
   // with "The document has no content") would otherwise trick us into
@@ -282,7 +348,7 @@ async function waitForOfficialSnapshot({
   failOnTruncation,
 }) {
   const deadline = Date.now() + timeoutMs;
-  const expectedName = basename(executablePath);
+  const expectedNames = documentNameCandidates(executablePath);
   let lastError = null;
 
   while (Date.now() < deadline) {
@@ -290,9 +356,9 @@ async function waitForOfficialSnapshot({
       const currentDocument = await safeCurrentDocument(officialBackend);
       const documents = await safeDocumentList(officialBackend);
       const shouldProbe =
-        currentDocument === expectedName ||
+        expectedNames.has(currentDocument) ||
         (currentDocument && currentDocument !== baselineCurrentDocument) ||
-        documents.includes(expectedName);
+        documents.some((name) => expectedNames.has(name));
 
       if (shouldProbe) {
         const procedures = await officialBackend.callTool("list_procedures", {});
@@ -314,7 +380,7 @@ async function waitForOfficialSnapshot({
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 
-  throw new Error(`Timed out waiting for Hopper to analyze '${expectedName}' through the official backend.${lastError ? ` Last error: ${String(lastError.message ?? lastError)}` : ""}`);
+  throw new Error(`Timed out waiting for Hopper to analyze one of '${[...expectedNames].join("', '")}' through the official backend.${lastError ? ` Last error: ${String(lastError.message ?? lastError)}` : ""}`);
 }
 
 async function safeCurrentDocument(officialBackend) {
@@ -529,13 +595,14 @@ async function runHopperExporter({
   waitForAnalysis,
   fullExport,
   failOnTruncation,
+  closeAfterExport,
   buildLaunchSpec,
   diagnostics,
 }) {
   const workdir = await mkdtemp(join(tmpdir(), "hopper-live-"));
   const outputPath = join(workdir, "session.json");
   const scriptPath = join(workdir, "export_live_session.py");
-  await writeFile(scriptPath, buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, includePseudocode, maxPseudocodeFunctions, waitForAnalysis, fullExport, failOnTruncation }), "utf8");
+  await writeFile(scriptPath, buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, includePseudocode, maxPseudocodeFunctions, waitForAnalysis, fullExport, failOnTruncation, closeAfterExport }), "utf8");
 
   const launch = buildLaunchSpec(scriptPath);
   const { command, args, mode } = launch;
@@ -652,7 +719,7 @@ function launcherFailureHint(details) {
   return " Hopper CLI failed before the exporter script ran.";
 }
 
-function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, includePseudocode, maxPseudocodeFunctions, waitForAnalysis, fullExport, failOnTruncation }) {
+function buildExportScript({ outputPath, maxFunctions, maxStrings, maxBlocksPerFunction, maxInstructionsPerBlock, includePseudocode, maxPseudocodeFunctions, waitForAnalysis, fullExport, failOnTruncation, closeAfterExport }) {
   return String.raw`
 import hashlib
 import json
@@ -668,6 +735,7 @@ MAX_PSEUDOCODE_FUNCTIONS = ${pythonLiteral(maxPseudocodeFunctions)}
 WAIT_FOR_ANALYSIS = ${pythonBool(waitForAnalysis)}
 FULL_EXPORT = ${pythonBool(fullExport)}
 FAIL_ON_TRUNCATION = ${pythonBool(failOnTruncation)}
+CLOSE_AFTER_EXPORT = ${pythonBool(closeAfterExport)}
 
 def hx(value):
     try:
@@ -1056,14 +1124,16 @@ try:
     }
     with open(OUTPUT_PATH, "w") as out:
         json.dump(session, out, ensure_ascii=True)
+    if CLOSE_AFTER_EXPORT:
+        doc.closeDocument()
 except Exception as error:
     with open(OUTPUT_PATH, "w") as out:
         json.dump({"error": str(error), "traceback": traceback.format_exc()}, out)
 `;
 }
 
-function buildOpenExecutableAppleScript({ executablePath, analysis, parseObjectiveC, parseSwift }) {
-  return [
+function buildOpenExecutableAppleScript({ executablePath, analysis, parseObjectiveC, parseSwift, parseExceptions = true, scriptPath = null }) {
+  const parts = [
     'tell application "Hopper Disassembler" to open executable POSIX file ',
     quoteAppleScriptString(executablePath),
     " analysis ",
@@ -1072,18 +1142,38 @@ function buildOpenExecutableAppleScript({ executablePath, analysis, parseObjecti
     parseObjectiveC ? "true" : "false",
     " parse swift ",
     parseSwift ? "true" : "false",
-  ].join("");
+    " parse exceptions ",
+    parseExceptions ? "true" : "false",
+  ];
+  if (scriptPath) {
+    parts.push(" execute Python script POSIX file ", quoteAppleScriptString(scriptPath));
+  }
+  return parts.join("");
 }
 
-function buildLaunchSpec({ executablePath, analysis, parseObjectiveC, parseSwift, hopperLauncher }) {
+function buildLaunchSpec({ executablePath, analysis, parseObjectiveC, parseSwift, parseExceptions = true, hopperLauncher }) {
   const launcher = hopperLauncher ?? DEFAULT_HOPPER_CLI;
   if (isOsaScriptLauncher(launcher)) {
-    const appleScript = buildOpenExecutableAppleScript({ executablePath, analysis, parseObjectiveC, parseSwift });
+    const appleScript = buildOpenExecutableAppleScript({ executablePath, analysis, parseObjectiveC, parseSwift, parseExceptions });
     return {
       command: launcher,
       args: ["-e", appleScript],
       mode: "osascript",
       appleScript,
+    };
+  }
+  if (isHopperCliHelper(launcher)) {
+    return {
+      command: launcher,
+      args: [
+        "-e",
+        executablePath,
+        analysis ? "-a" : "-A",
+        parseObjectiveC ? "-o" : "-O",
+        parseSwift ? "-f" : "-F",
+        parseExceptions ? "-z" : "-Z",
+      ],
+      mode: "cli",
     };
   }
   return {
@@ -1096,8 +1186,68 @@ function buildLaunchSpec({ executablePath, analysis, parseObjectiveC, parseSwift
   };
 }
 
+function buildLiveExportLaunchSpec({ executablePath, scriptPath, analysis, parseObjectiveC, parseSwift, parseExceptions = true, hopperLauncher }) {
+  const launcher = hopperLauncher ?? DEFAULT_HOPPER_CLI;
+  if (isOsaScriptLauncher(launcher)) {
+    const appleScript = buildOpenExecutableAppleScript({
+      executablePath,
+      analysis,
+      parseObjectiveC,
+      parseSwift,
+      parseExceptions,
+      scriptPath,
+    });
+    return {
+      command: launcher,
+      args: ["-e", appleScript],
+      mode: "osascript",
+      appleScript,
+    };
+  }
+  if (isHopperCliHelper(launcher)) {
+    return {
+      command: launcher,
+      args: [
+        "-e",
+        executablePath,
+        analysis ? "-a" : "-A",
+        parseObjectiveC ? "-o" : "-O",
+        parseSwift ? "-f" : "-F",
+        parseExceptions ? "-z" : "-Z",
+        "-Y",
+        scriptPath,
+      ],
+      mode: "cli-python-export",
+    };
+  }
+  return {
+    command: launcher,
+    args: [
+      "-executable",
+      executablePath,
+      "-python",
+      scriptPath,
+    ],
+    mode: "cli-python-export",
+  };
+}
+
 function isOsaScriptLauncher(value) {
   return /(?:^|\/)osascript$/i.test(String(value ?? ""));
+}
+
+function isHopperCliHelper(value) {
+  return /(?:^|\/)hopper$/i.test(String(value ?? ""));
+}
+
+function documentNameCandidates(executablePath) {
+  const base = basename(String(executablePath ?? ""));
+  return new Set([base, `${base}.hop`].filter(Boolean));
+}
+
+function documentMatchesExecutableName(documentName, executablePath) {
+  if (!documentName) return false;
+  return documentNameCandidates(executablePath).has(String(documentName));
 }
 
 function pythonBool(value) {

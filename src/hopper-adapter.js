@@ -18,9 +18,9 @@ export class HopperAdapter {
       privateApi: false,
       dynamicDebugger: false,
       liveIngest: true,
-      currentDocumentIngest: false,
+      currentDocumentIngest: true,
       transactionApply: false,
-      reason: "Live ingest uses Hopper's official launcher + Python scripting. Current-document ingest and transaction commits need a persistent in-process Hopper bridge.",
+      reason: "Live ingest uses Hopper's launcher plus a Hopper-side Python exporter for exact document capture. Transaction commits still require a persistent in-process Hopper bridge.",
     };
   }
 

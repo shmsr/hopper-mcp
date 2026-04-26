@@ -24,6 +24,8 @@ export async function importMachO(path, {
   includeSigning = true,
   includeEntropy = true,
   includeObjC = true,
+  hopperIndex = null,
+  hopperLabels = null,
 } = {}) {
   if (!path || typeof path !== "string") {
     throw new Error("import_macho requires executable_path (string).");
@@ -40,7 +42,12 @@ export async function importMachO(path, {
 
   const parsedSymbols = parseNm(symbols.stdout);
   const imports = parsedSymbols.imports;
-  const exportedFunctions = parsedSymbols.defined.slice(0, 1000);
+  // Cap was historically 1000 (small Apple binaries), but stripped-but-still-
+  // mangled Rust/Swift binaries routinely have tens of thousands of local
+  // text symbols. Slicing too low means real function names like
+  // __ZN13cursorsandbox5macos22apply_sandbox_and_exec... never enter the
+  // session and the user gets `sub_<addr>` placeholders. Mirror maxFunctions.
+  const exportedFunctions = parsedSymbols.defined.slice(0, Math.max(1000, maxFunctions));
   const loadCommandData = parseLoadCommands(loadCommands.stdout);
   const strings = parseStringsWithOffsets(stringRows.stdout, maxStrings, loadCommandData.offsetMaps);
   const dylibs = parseDylibs(libraries.stdout);
@@ -53,7 +60,13 @@ export async function importMachO(path, {
     const discovery = isIntel
       ? await discoverX86Functions(path, { arch: selectedArch, maxFunctions })
       : await discoverFunctionsFromDisassembly(path, { arch: selectedArch, maxFunctions });
-    functions = mergeFunctionSets(functions, discovery, strings);
+    // Use the __TEXT,__text section end to cap the last function's size when
+    // there's no successor entry to compute a gap against.
+    const textSection = (loadCommandData.segments ?? [])
+      .flatMap((seg) => (seg.sections ?? []).map((sec) => ({ ...sec, segname: seg.name })))
+      .find((sec) => sec.segname === "__TEXT" && (sec.name === "__text" || sec.name === "text"));
+    const textEnd = textSection ? hexToInt(textSection.end) : null;
+    functions = mergeFunctionSets(functions, discovery, strings, { textEnd, hopperIndex });
   }
 
   const capabilities = classifyImports(imports);
@@ -75,6 +88,18 @@ export async function importMachO(path, {
   const sessionStub = { imports, strings };
   const antiAnalysisFindings = detectAntiAnalysis(sessionStub);
   const imphash = computeImphash(imports);
+
+  // Annotate strings with Hopper labels when present. Hopper assigns
+  // synthetic labels like `aUsrlibdyld` to string-pool entries that nm
+  // doesn't know about — exposing them lets users search by Hopper label.
+  if (hopperLabels instanceof Map && hopperLabels.size && Array.isArray(strings)) {
+    for (const s of strings) {
+      const addrNum = hexToInt(s.addr ?? s.address);
+      if (addrNum === null) continue;
+      const label = hopperLabels.get(addrNum);
+      if (label) s.hopperLabel = label;
+    }
+  }
 
   return {
     sessionId: `real-${binaryId}`,
@@ -107,6 +132,12 @@ export async function importMachO(path, {
     swiftSymbols: imports.filter((name) => name.startsWith("_$s")).slice(0, 500),
     functions,
     antiAnalysisFindings,
+    // Expose Hopper's full named-address dictionary as a serializable object
+    // so downstream tools (queries, snapshots) can resolve any addr → label.
+    // This is strictly larger than the function-only set in `functions`.
+    hopperLabels: hopperLabels instanceof Map
+      ? Object.fromEntries([...hopperLabels].map(([addr, name]) => [`0x${addr.toString(16)}`, name]))
+      : null,
   };
 }
 
@@ -239,9 +270,19 @@ export async function discoverFunctionsFromDisassembly(path, { arch = "auto", ma
     }
 
     // Call edge: bl 0x<target>
+    // Track both the discovery-anchored function (`from`) and the actual call
+    // instruction address (`fromInstr`). When mergeFunctionSets later switches
+    // the function partition (e.g. nm symbols are authoritative and a single
+    // discovery range gets split into multiple real functions), `fromInstr`
+    // lets us re-attribute the edge to the correct sub-function instead of
+    // smearing all calls onto the discovery anchor.
     const blMatch = instr.match(/^bl\s+0x([0-9a-fA-F]+)/);
     if (blMatch && currentFunc) {
-      callEdges.push({ from: currentFunc.addr, to: fmtAddr(parseInt(blMatch[1], 16)) });
+      callEdges.push({
+        from: currentFunc.addr,
+        fromInstr: fmtAddr(addr),
+        to: fmtAddr(parseInt(blMatch[1], 16)),
+      });
     }
 
     // ADRP tracking: adrp x<reg>, <page> ; 0x<addr>
@@ -302,65 +343,362 @@ export async function discoverFunctionsFromDisassembly(path, { arch = "auto", ma
   return { functions, callEdges, adrpRefs };
 }
 
-export function mergeFunctionSets(existing, discovery, strings) {
-  const byAddr = new Map();
-  for (const fn of existing) byAddr.set(fn.addr, fn);
+// Tolerance window for reconciling a discovery prologue start against an
+// nm-defined symbol. Apple/C convention saves x29,x30 first, so discovery
+// often agrees with nm exactly. Rust saves x29,x30 LAST, so the prologue
+// heuristic anchors up to ~5 instructions (≤ 0x14 bytes) after the real
+// entrypoint. 0x40 also covers Swift-style longer prologues with extra
+// callee-saved register pairs.
+const PROLOGUE_TOLERANCE = 0x40;
 
-  // Build string address lookup
-  const stringByAddr = new Map();
-  for (const s of strings) stringByAddr.set(s.addr, s.value);
+// Build the deep-import function set with nm-defined symbols treated as
+// authoritative entrypoints. The previous implementation used prologue-
+// detected ranges as the spine and tried to retro-fit nm names in by
+// "covering range" lookup, but discovery routinely overshoots the next real
+// entrypoint (Rust prologues are tail-loaded), so a single discovery range
+// could span multiple real functions and silently absorb the wrong nm name.
+// The fix: use nm symbols as the authoritative function boundary list, fold
+// in discovery starts only where they sit in gaps with no nm coverage, and
+// compute sizes from address gaps rather than from where the next prologue
+// happened to land.
+//
+// When a Hopper procedure index is supplied (opts.hopperIndex), Hopper's
+// entrypoints are treated as equally authoritative as nm — they go into the
+// same dedup pass, their sizes win when explicit, and discovery starts that
+// match either source are still dropped. This is how the importer fuses
+// Hopper's analysis (which knows about indirect-jump tables, hand-written
+// asm, and Hopper-renamed symbols) with nm/discovery without losing either
+// side's evidence.
+//
+// Inputs:
+//   existing: records produced by buildFunctions() (includes nm-defined
+//     symbols with source="nm" plus synthetic cluster nodes at 0xfff*).
+//   discovery: { functions, callEdges, adrpRefs } from
+//     discoverFunctionsFromDisassembly.
+//   strings: parsed string table; used to attach string evidence to
+//     functions whose ADRP+ADD/LDR pairs target known strings.
+//   opts.textEnd: end VA of the __TEXT,__text section, used to cap the
+//     final function's size when there is no successor entry.
+//   opts.hopperIndex: optional Map<addrNum, {addr,name,size,signature,locals,
+//     basicBlocks,basicBlockCount}> from fetchHopperProcedureIndex().
+export function mergeFunctionSets(existing, discovery, strings, opts = {}) {
+  const { textEnd = null, hopperIndex = null } = opts;
 
-  // Build callee/caller maps from edges
-  const calleeMap = new Map();  // from -> [to]
-  const callerMap = new Map();  // to -> [from]
-  for (const edge of discovery.callEdges) {
-    if (!calleeMap.has(edge.from)) calleeMap.set(edge.from, []);
-    calleeMap.get(edge.from).push(edge.to);
-    if (!callerMap.has(edge.to)) callerMap.set(edge.to, []);
-    callerMap.get(edge.to).push(edge.from);
+  // Partition the input. Cluster/synthetic nodes (0xfff*) pass through
+  // untouched — they're not real functions, just tag groupings. Anything
+  // else with source="nm" is a real, named entrypoint we trust.
+  const clusterNodes = [];
+  const nmEntries = [];
+  for (const fn of existing) {
+    if (/^0xfff[0-9a-f]+$/.test(fn.addr) || fn.source === "semantic-import-cluster") {
+      clusterNodes.push(fn);
+      continue;
+    }
+    if (fn.source === "nm" || fn.source === "nm+otool" || fn.source === "nm+otool+hopper" || fn.source === "nm+hopper") {
+      const start = hexToInt(fn.addr);
+      if (start === null) continue;
+      nmEntries.push({
+        addrNum: start,
+        record: {
+          ...fn,
+          callers: Array.isArray(fn.callers) ? [...fn.callers] : [],
+          callees: Array.isArray(fn.callees) ? [...fn.callees] : [],
+          strings: Array.isArray(fn.strings) ? [...fn.strings] : [],
+          imports: Array.isArray(fn.imports) ? [...fn.imports] : [],
+        },
+      });
+    }
+    // Anything else (e.g. stale otool-discovery records from a previous
+    // merge call, as in the unit tests) is intentionally rebuilt from
+    // discovery below — no point preserving partition state we're about
+    // to recompute.
   }
+  nmEntries.sort((a, b) => a.addrNum - b.addrNum);
+  const nmAddrSet = new Set(nmEntries.map((e) => e.addrNum));
+  const nmAddrSorted = nmEntries.map((e) => e.addrNum);
 
-  // Build function string refs from adrpRefs
-  const funcStrings = new Map();  // funcAddr -> [string values]
-  for (const ref of discovery.adrpRefs) {
-    const strVal = stringByAddr.get(ref.targetAddr);
-    if (strVal) {
-      if (!funcStrings.has(ref.functionAddr)) funcStrings.set(ref.functionAddr, []);
-      funcStrings.get(ref.functionAddr).push(strVal);
+  // Hopper entries — folded in the same way nm is. We keep the Hopper info
+  // alongside so we can enrich an nm match (signature/basicblocks) or
+  // synthesize a fresh record for Hopper-only entrypoints below.
+  const hopperByAddr = new Map();
+  if (hopperIndex && typeof hopperIndex.entries === "function") {
+    for (const [addrNum, info] of hopperIndex) {
+      if (typeof addrNum !== "number" || !Number.isFinite(addrNum)) continue;
+      hopperByAddr.set(addrNum, info);
     }
   }
+  const hopperAddrSorted = [...hopperByAddr.keys()].sort((a, b) => a - b);
+  const authoritativeAddrSorted = hopperAddrSorted.length
+    ? [...new Set([...nmAddrSorted, ...hopperAddrSorted])].sort((a, b) => a - b)
+    : nmAddrSorted;
 
+  // Discovery starts: keep only those that don't sit within ±tolerance of
+  // any authoritative entry (nm or Hopper). An adjacent discovery start is
+  // the same function — the authoritative source wins.
+  const discoveryEntries = [];
   for (const fn of discovery.functions) {
-    if (byAddr.has(fn.addr)) {
-      // Enrich existing
-      const existing = byAddr.get(fn.addr);
-      existing.size = existing.size ?? fn.size;
-      existing.callees = [...new Set([...(existing.callees || []), ...(calleeMap.get(fn.addr) || [])])];
-      existing.callers = [...new Set([...(existing.callers || []), ...(callerMap.get(fn.addr) || [])])];
-      existing.strings = [...new Set([...(existing.strings || []), ...(funcStrings.get(fn.addr) || [])])];
-      existing.source = "nm+otool";
-    } else {
-      byAddr.set(fn.addr, {
+    const addrNum = hexToInt(fn.addr);
+    if (addrNum === null) continue;
+    if (closestWithin(authoritativeAddrSorted, addrNum, PROLOGUE_TOLERANCE) !== null) continue;
+    discoveryEntries.push({
+      addrNum,
+      record: {
         addr: fn.addr,
         name: `sub_${fn.addr.replace("0x", "")}`,
         size: fn.size,
         summary: null,
         confidence: 0.65,
-        callers: [...new Set(callerMap.get(fn.addr) || [])],
-        callees: [...new Set(calleeMap.get(fn.addr) || [])],
-        strings: [...new Set(funcStrings.get(fn.addr) || [])],
+        callers: [],
+        callees: [],
+        strings: [],
         imports: [],
         source: "otool-discovery",
         fingerprint: {
           cfgShape: "discovered",
           importSignature: [],
-          stringBag: (funcStrings.get(fn.addr) || []).slice(0, 10),
+          stringBag: [],
         },
-      });
+      },
+    });
+  }
+
+  // Combined entrypoint list — nm first (so it wins ties), then Hopper-only
+  // (we synthesize records for entries Hopper has but nm doesn't), then
+  // discovery (already filtered against both). The dedup below collapses
+  // any same-addr pairs.
+  const hopperOnlyEntries = [];
+  for (const [addrNum, hop] of hopperByAddr) {
+    if (nmAddrSet.has(addrNum)) continue;
+    hopperOnlyEntries.push({
+      addrNum,
+      record: synthesizeHopperRecord(addrNum, hop),
+    });
+  }
+  const entries = [...nmEntries, ...hopperOnlyEntries, ...discoveryEntries]
+    .sort((a, b) => a.addrNum - b.addrNum);
+  const dedup = [];
+  for (const e of entries) {
+    if (dedup.length && dedup[dedup.length - 1].addrNum === e.addrNum) continue;
+    dedup.push(e);
+  }
+
+  // Enrich nm records that have a Hopper match at the exact same address.
+  // We keep the nm-attached imports/strings (built from the symbol table)
+  // and overlay Hopper's signature/locals/basicBlocks. Hopper's name only
+  // overrides when nm has nothing useful (placeholder sub_, empty).
+  for (const e of dedup) {
+    const hop = hopperByAddr.get(e.addrNum);
+    if (!hop) continue;
+    enrichWithHopper(e.record, hop);
+  }
+
+  // Compute size from gap to the next entrypoint. For the last entry, fall
+  // back to the __TEXT,__text end if known, otherwise leave the existing
+  // size (which may be discovery's prologue-derived size, or null for a
+  // bare nm record). Hopper's explicit size wins when present — it knows
+  // about non-contiguous procedure layouts that gap-based sizing can't see.
+  for (let i = 0; i < dedup.length; i++) {
+    const cur = dedup[i];
+    const next = dedup[i + 1];
+    const hopperSize = Number(cur.record.hopperSize ?? NaN);
+    let size = null;
+    if (Number.isFinite(hopperSize) && hopperSize > 0) {
+      size = hopperSize;
+    } else if (next) {
+      size = next.addrNum - cur.addrNum;
+    } else if (textEnd) {
+      size = textEnd - cur.addrNum;
+    }
+    if (size !== null && size > 0) cur.record.size = size;
+  }
+
+  // Mark which nm entries had a near-by discovery anchor (informational);
+  // also flag exact prologue mismatches so callers can spot Rust-style
+  // shifted prologues. When Hopper agreed at the same addr we already set
+  // source=nm+hopper in enrichWithHopper, so we just upgrade further to
+  // nm+otool+hopper here.
+  const discoveryAddrSorted = discovery.functions
+    .map((fn) => hexToInt(fn.addr))
+    .filter((n) => n !== null)
+    .sort((a, b) => a - b);
+  for (const e of dedup) {
+    if (!nmAddrSet.has(e.addrNum)) continue;
+    const nearby = closestWithin(discoveryAddrSorted, e.addrNum, PROLOGUE_TOLERANCE);
+    if (nearby !== null) {
+      e.record.source = combineSource(e.record.source, "otool");
+      if (nearby !== e.addrNum) e.record.symbolEntrypoint = e.record.addr;
+    }
+    // else: nm-only (no discovery anchor in tolerance window)
+  }
+
+  // Re-attribute call edges and ADRP refs by instruction address. This is
+  // the key correctness step: a single discovery range may span multiple
+  // real functions, so attributing edges to discovery's anchor would
+  // smear them across several callers. Using fromInstr / instrAddr places
+  // each edge in the function whose [start, end) contains the instruction.
+  const ranges = dedup.map((e) => {
+    const size = Number(e.record.size ?? 0);
+    return {
+      start: e.addrNum,
+      end: size > 0 ? e.addrNum + size : e.addrNum + 4,
+      record: e.record,
+    };
+  });
+  // ranges already sorted by start ascending
+  const containingRange = (addrNum) => {
+    if (addrNum === null) return null;
+    // Linear scan — N is bounded by maxFunctions (≤30k) and this runs once
+    // per import, so binary search is not worth the complexity yet.
+    for (const r of ranges) {
+      if (addrNum < r.start) return null;
+      if (addrNum < r.end) return r;
+    }
+    return null;
+  };
+
+  for (const edge of discovery.callEdges) {
+    const instrAddrNum = hexToInt(edge.fromInstr ?? edge.from);
+    const fromRange = containingRange(instrAddrNum);
+    if (!fromRange) continue;
+    fromRange.record.callees.push(edge.to);
+    const targetRange = containingRange(hexToInt(edge.to));
+    if (targetRange) targetRange.record.callers.push(fromRange.record.addr);
+  }
+
+  const stringByAddr = new Map();
+  for (const s of strings) stringByAddr.set(s.addr, s.value);
+  for (const ref of discovery.adrpRefs) {
+    const strVal = stringByAddr.get(ref.targetAddr);
+    if (!strVal) continue;
+    const r = containingRange(hexToInt(ref.instrAddr));
+    if (!r) continue;
+    r.record.strings.push(strVal);
+  }
+
+  // Dedup the per-function lists.
+  for (const r of ranges) {
+    r.record.callees = [...new Set(r.record.callees)];
+    r.record.callers = [...new Set(r.record.callers)];
+    r.record.strings = [...new Set(r.record.strings)];
+    if (r.record.fingerprint && Array.isArray(r.record.strings)) {
+      r.record.fingerprint = {
+        ...r.record.fingerprint,
+        stringBag: r.record.strings.slice(0, 10),
+      };
     }
   }
 
-  return [...byAddr.values()];
+  return [...dedup.map((e) => e.record), ...clusterNodes];
+}
+
+// Synthesize a function record for a Hopper procedure that nm didn't see.
+// Hopper has the entrypoint, name, size, and (optionally) basicblocks/
+// signature/locals — but not the per-instruction call/string evidence,
+// which the edge re-attribution step downstream will fill in.
+function synthesizeHopperRecord(addrNum, hop) {
+  const addr = fmtAddr(addrNum);
+  const size = Number(hop?.size ?? NaN);
+  const record = {
+    addr,
+    name: typeof hop?.name === "string" && hop.name ? hop.name : `sub_${addr.replace("0x", "")}`,
+    size: Number.isFinite(size) && size > 0 ? size : null,
+    summary: null,
+    confidence: 0.85,
+    callers: [],
+    callees: [],
+    strings: [],
+    imports: [],
+    source: "hopper",
+    hopperSize: Number.isFinite(size) && size > 0 ? size : null,
+    fingerprint: {
+      cfgShape: "hopper",
+      importSignature: [],
+      stringBag: [],
+    },
+  };
+  if (hop?.signature) record.signature = hop.signature;
+  if (Array.isArray(hop?.locals) && hop.locals.length) record.locals = hop.locals;
+  if (Array.isArray(hop?.basicBlocks) && hop.basicBlocks.length) record.basicBlocks = hop.basicBlocks;
+  if (Number.isFinite(Number(hop?.basicBlockCount)) && Number(hop.basicBlockCount) > 0) {
+    record.basicBlockCount = Number(hop.basicBlockCount);
+  }
+  return record;
+}
+
+// Overlay Hopper data onto an existing nm record. nm contributes the symbol
+// table evidence (mangled name, imports list, real callers/callees from
+// otool); Hopper contributes the signature/locals/basicblocks we can't
+// reconstruct from heuristics. Names: nm wins unless nm only has a sub_/
+// empty placeholder.
+function enrichWithHopper(record, hop) {
+  if (typeof hop?.name === "string" && hop.name && hop.name !== record.name) {
+    if (!record.name || /^sub_[0-9a-f]+$/.test(record.name)) {
+      record.name = hop.name;
+    } else {
+      record.hopperName = hop.name;
+    }
+  }
+  const size = Number(hop?.size ?? NaN);
+  if (Number.isFinite(size) && size > 0) record.hopperSize = size;
+  if (hop?.signature) record.signature = hop.signature;
+  if (Array.isArray(hop?.locals) && hop.locals.length && !record.locals?.length) {
+    record.locals = hop.locals;
+  }
+  if (Array.isArray(hop?.basicBlocks) && hop.basicBlocks.length && !record.basicBlocks?.length) {
+    record.basicBlocks = hop.basicBlocks;
+  }
+  if (
+    Number.isFinite(Number(hop?.basicBlockCount))
+    && Number(hop.basicBlockCount) > 0
+    && !Number.isFinite(Number(record.basicBlockCount))
+  ) {
+    record.basicBlockCount = Number(hop.basicBlockCount);
+  }
+  record.source = combineSource(record.source, "hopper");
+}
+
+// Combine source tags. "nm" + "otool" → "nm+otool"; adding "hopper" yields
+// "nm+otool+hopper". Token order is stable: nm, otool, hopper.
+function combineSource(...sources) {
+  const seen = new Set();
+  for (const s of sources) {
+    if (!s) continue;
+    for (const t of String(s).split("+")) {
+      if (t) seen.add(t);
+    }
+  }
+  const order = ["nm", "otool", "hopper"];
+  const ordered = [];
+  for (const tok of order) if (seen.has(tok)) { ordered.push(tok); seen.delete(tok); }
+  for (const tok of seen) ordered.push(tok);
+  return ordered.join("+");
+}
+
+// Returns the closest value in `sorted` to `target` whose absolute distance
+// is ≤ `tolerance`, or null if none qualify. `sorted` must be ascending.
+function closestWithin(sorted, target, tolerance) {
+  if (sorted.length === 0) return null;
+  // Linear scan with early bailout. Inputs are in the tens-of-thousands range
+  // and this is called per discovery start; if it shows up in profiles we
+  // can swap to a binary search.
+  let best = null;
+  let bestDist = Infinity;
+  for (const v of sorted) {
+    const dist = Math.abs(v - target);
+    if (dist < bestDist) {
+      best = v;
+      bestDist = dist;
+    }
+    if (v - target > tolerance) break;
+  }
+  return bestDist <= tolerance ? best : null;
+}
+
+function hexToInt(addr) {
+  if (typeof addr !== "string") return null;
+  const m = addr.match(/^0x([0-9a-fA-F]+)$/);
+  if (!m) return null;
+  return parseInt(m[1], 16);
 }
 
 // ─── Targeted disassembly ─────────────────────────────────────────────────
@@ -437,6 +775,29 @@ export async function findXrefs(path, { arch = "auto", targetAddr, maxResults = 
   const adrpState = {};
   let currentFunc = null;
 
+  // otool -tv resolves bl/b targets to symbol names when the symbol table
+  // names the target — e.g. `bl __ZN3std3env7vars_os17h...` instead of
+  // `bl 0x1001ad674`. Without translating those symbolic operands we'd
+  // miss every xref to a named function. Build name→address from nm and
+  // accept either form.
+  const nameToAddr = await safe(() => buildSymbolAddressMap(path, selectedArch), new Map());
+  const targetNames = new Set();
+  for (const [name, addr] of nameToAddr.entries()) {
+    if (addr === target) targetNames.add(name);
+  }
+
+  // Sorted unique nm addresses, used to drive currentFunc as we scan
+  // disassembly. nm symbols are authoritative function boundaries; the
+  // prologue heuristic is only a fallback for regions with no nm coverage.
+  // Without this, currentFunc would anchor on `stp x29,x30` lines, which
+  // for Rust prologues sits ~0x14 bytes after the real entrypoint and
+  // would report xrefs as belonging to addresses that no longer exist as
+  // function entries in the merged session.
+  const nmAddrsSorted = [
+    ...new Set([...nameToAddr.values()].filter((v) => Number.isFinite(v))),
+  ].sort((a, b) => a - b);
+  let nmCursor = 0;
+
   const child = spawn("otool", ["-arch", selectedArch, "-tv", path], { stdio: ["ignore", "pipe", "pipe"] });
   let buffer = "";
   let stopped = false;
@@ -458,16 +819,42 @@ export async function findXrefs(path, { arch = "auto", targetAddr, maxResults = 
     const addr = parseInt(m[1], 16);
     const instr = m[2].trim();
 
-    // Track function boundaries
-    if (isFramePrologue(instr)) {
-      currentFunc = fmtAddr(addr);
+    // Track function boundaries — nm symbols first (authoritative),
+    // prologue heuristic as a fallback for unnamed regions.
+    while (nmCursor < nmAddrsSorted.length && nmAddrsSorted[nmCursor] <= addr) {
+      currentFunc = fmtAddr(nmAddrsSorted[nmCursor]);
+      nmCursor++;
       for (const k of Object.keys(adrpState)) delete adrpState[k];
     }
+    if (isFramePrologue(instr)) {
+      const lastNm = currentFunc ? parseInt(currentFunc.slice(2), 16) : null;
+      // Only let the prologue advance currentFunc when it's beyond any
+      // nearby nm symbol (i.e. we're in an unnamed gap). Within ~0x40 of
+      // an nm symbol the prologue is the SAME function — Rust saves x29
+      // last so the prologue line follows the entrypoint.
+      if (lastNm === null || addr - lastNm > 0x40) {
+        currentFunc = fmtAddr(addr);
+        for (const k of Object.keys(adrpState)) delete adrpState[k];
+      }
+    }
 
-    const branchMatch = instr.match(/^(bl|b)\s+0x([0-9a-fA-F]+)/);
-    if (branchMatch && parseInt(branchMatch[2], 16) === target) {
-      pushResult({ addr: fmtAddr(addr), type: branchMatch[1] === "bl" ? "call" : "branch", function: currentFunc });
+    const branchHexMatch = instr.match(/^(bl|b)\s+0x([0-9a-fA-F]+)/);
+    if (branchHexMatch && parseInt(branchHexMatch[2], 16) === target) {
+      pushResult({ addr: fmtAddr(addr), type: branchHexMatch[1] === "bl" ? "call" : "branch", function: currentFunc });
       if (stopped) return;
+    } else if (targetNames.size) {
+      // Symbolic form: `bl __ZN3std...` (no 0x). We trim trailing comments
+      // (otool sometimes appends `; <symbol>` annotations).
+      const branchSymMatch = instr.match(/^(bl|b)\s+([A-Za-z_$][\w.$]*)/);
+      if (branchSymMatch && targetNames.has(branchSymMatch[2])) {
+        pushResult({
+          addr: fmtAddr(addr),
+          type: branchSymMatch[1] === "bl" ? "call" : "branch",
+          function: currentFunc,
+          via: branchSymMatch[2],
+        });
+        if (stopped) return;
+      }
     }
 
     // ADRP+ADD/LDR resolution
@@ -523,6 +910,25 @@ export async function findXrefs(path, { arch = "auto", targetAddr, maxResults = 
 }
 
 // ─── Helper ───────────────────────────────────────────────────────────────
+
+// Build a name → vmaddress map from nm output. Used by findXrefs to translate
+// otool-resolved symbolic branches (`bl __ZN…`) back into address comparisons.
+async function buildSymbolAddressMap(path, arch) {
+  const result = await execFileAsync("nm", ["-arch", arch, "-n", path], { maxBuffer: 64 * 1024 * 1024 }).catch((err) => {
+    if (err.stdout || err.stderr) return { stdout: err.stdout ?? "", stderr: err.stderr ?? "" };
+    throw err;
+  });
+  const map = new Map();
+  for (const line of result.stdout.split("\n")) {
+    const m = line.match(/^([0-9a-fA-F]+)\s+[A-Za-z]\s+(\S+)/);
+    if (!m) continue;
+    const addr = parseInt(m[1], 16);
+    if (!Number.isFinite(addr)) continue;
+    const name = m[2];
+    if (!map.has(name)) map.set(name, addr);
+  }
+  return map;
+}
 
 function fmtAddr(n) {
   return `0x${n.toString(16)}`;
@@ -661,11 +1067,17 @@ function parseNm(output) {
       continue;
     }
 
-    const definedMatch = line.match(/^\s*([0-9a-fA-F]+)\s+.*\sexternal\s+(\S+)/);
-    if (definedMatch) {
+    // Accept both `external` (capital-T text symbols) and `non-external`
+    // (lowercase-t local text symbols). Rust/Swift binaries strip externs
+    // but keep mangled local names — those are exactly the function names
+    // the user wants surfaced. Filter to __TEXT,__text so we don't pull in
+    // data symbols.
+    const definedMatch = line.match(/^\s*([0-9a-fA-F]+)\s+\(([^)]+)\)\s+(?:non-)?external\s+(\S+)/);
+    if (definedMatch && /^__TEXT,/.test(definedMatch[2])) {
       defined.push({
         addr: `0x${definedMatch[1].replace(/^0+/, "") || "0"}`,
-        name: definedMatch[2],
+        name: definedMatch[3],
+        section: definedMatch[2],
       });
     }
   }

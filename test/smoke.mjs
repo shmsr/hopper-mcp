@@ -58,6 +58,28 @@ const preview = await rpc("tools/call", {
   arguments: { transaction_id: transactionId },
 });
 const commit = await rpc("tools/call", { name: "commit_transaction", arguments: { transaction_id: transactionId } });
+const currentDocument = await rpc("tools/call", { name: "current_document", arguments: {} });
+const procedures = await rpc("tools/call", { name: "list_procedures", arguments: {} });
+const procedureInfo = await rpc("tools/call", {
+  name: "procedure_info",
+  arguments: { procedure: "validate_license_key" },
+});
+const procedureAddress = await rpc("tools/call", {
+  name: "procedure_address",
+  arguments: { procedure: "validate_license_key" },
+});
+const strings = await rpc("tools/call", {
+  name: "search_strings",
+  arguments: { pattern: "license" },
+});
+const addrName = await rpc("tools/call", {
+  name: "address_name",
+  arguments: { address: "0x100003f50" },
+});
+const searchedName = await rpc("tools/call", {
+  name: "search_name",
+  arguments: { pattern: "validate_license_key" },
+});
 const text = analysis.content[0].text;
 
 if (!resources.resources.some((resource) => resource.uri === "hopper://function/0x100003f50")) {
@@ -71,6 +93,27 @@ if (!metadata.contents[0].text.includes("SampleMachO") || !summary.contents[0].t
 }
 if (!preview.content[0].text.includes("sub_100003f50") || !commit.content[0].text.includes("validate_license_key")) {
   throw new Error("Transactional rename preview/commit did not include expected old and new values.");
+}
+if (JSON.parse(currentDocument.content[0].text) !== "SampleMachO") {
+  throw new Error("current_document did not mirror the local snapshot.");
+}
+if (JSON.parse(procedures.content[0].text)["0x100003f50"] !== "validate_license_key") {
+  throw new Error("list_procedures did not expose local snapshot procedures.");
+}
+if (JSON.parse(procedureInfo.content[0].text).entrypoint !== "0x100003f50") {
+  throw new Error("procedure_info did not resolve the renamed procedure.");
+}
+if (JSON.parse(procedureAddress.content[0].text) !== "0x100003f50") {
+  throw new Error("procedure_address did not resolve the renamed procedure.");
+}
+if (!Object.values(JSON.parse(strings.content[0].text)).some((value) => String(value).includes("license"))) {
+  throw new Error("search_strings did not return official-style address-keyed results.");
+}
+if (JSON.parse(addrName.content[0].text) !== "validate_license_key") {
+  throw new Error("address_name did not return the local function name.");
+}
+if (JSON.parse(searchedName.content[0].text)["0x100003f50"] !== "validate_license_key") {
+  throw new Error("search_name did not include local function names.");
 }
 
 child.stdin.end();

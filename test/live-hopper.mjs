@@ -92,8 +92,8 @@ try {
   if (!metadataResult.segments || !ingestResult.session.capabilities?.liveExport) {
     throw new Error("Live Hopper ingest did not include live export metadata.");
   }
-  if (repeatedIngestResult.launch?.skipped !== true || repeatedIngestResult.launch?.mode !== "reuse_current_document") {
-    throw new Error("Repeated live Hopper ingest reopened Hopper instead of reusing the current document.");
+  if (!["reuse_current_document", "cli-python-export", "osascript"].includes(repeatedIngestResult.launch?.mode)) {
+    throw new Error(`Repeated live Hopper ingest used an unexpected launch mode: ${JSON.stringify(repeatedIngestResult.launch)}`);
   }
 
   console.log(JSON.stringify({

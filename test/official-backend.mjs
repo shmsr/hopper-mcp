@@ -50,6 +50,22 @@ try {
   }));
   if (!Array.isArray(documents)) throw new Error("Official backend list_documents did not return an array.");
 
+  const mirroredDocuments = payload(await rpc("tools/call", {
+    name: "list_documents",
+    arguments: { backend: "official" },
+  }));
+  if (!Array.isArray(mirroredDocuments)) {
+    throw new Error("Mirrored list_documents backend=official did not return an array.");
+  }
+
+  const currentDocument = payload(await rpc("tools/call", {
+    name: "current_document",
+    arguments: { backend: "official" },
+  }));
+  if (currentDocument !== null && typeof currentDocument !== "string") {
+    throw new Error("Mirrored current_document backend=official did not return a string/null payload.");
+  }
+
   const blocked = payload(await rpc("tools/call", {
     name: "official_hopper_call",
     arguments: { name: "set_comment", arguments: { address: "0x0", comment: "blocked" } },

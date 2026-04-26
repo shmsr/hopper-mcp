@@ -16,7 +16,14 @@ export async function startServer({ env = {} } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "hopper-mcp-test-"));
   const child = spawn(process.execPath, [SERVER], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, HOPPER_MCP_STORE: join(dir, "store.json"), ...env },
+    env: {
+      ...process.env,
+      HOPPER_MCP_STORE: join(dir, "store.json"),
+      // Suppress the default debug log so tests don't pollute data/debug.log.
+      // Individual tests can opt back in via the env override.
+      HOPPER_MCP_DEBUG: "0",
+      ...env,
+    },
   });
 
   let buffer = "";

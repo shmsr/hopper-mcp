@@ -11,6 +11,7 @@ import { OfficialHopperBackend } from "./official-hopper-backend.js";
 import { registerTools } from "./server-tools.js";
 import { registerResources } from "./server-resources.js";
 import { registerPrompts } from "./server-prompts.js";
+import { debugLog, snapshotInFlight, isDebugEnabled, debugLogPath } from "./debug-log.js";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -33,7 +34,15 @@ const adapter = new HopperAdapter({
   officialBackend,
 });
 
+debugLog({
+  kind: "boot",
+  node: process.version,
+  storePath: process.env.HOPPER_MCP_STORE ?? join(ROOT, "data", "knowledge-store.json"),
+  debugLogPath: debugLogPath(),
+});
+
 await store.load();
+debugLog({ kind: "store_loaded", sessions: store.listSessions().length });
 
 const mcp = new McpServer(serverInfo, {
   capabilities: {
@@ -67,12 +76,25 @@ process.on("exit", () => {
 async function gracefulShutdown(signal, exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
+  debugLog({
+    kind: "shutdown",
+    signal,
+    exitCode,
+    inFlight: snapshotInFlight(),
+  });
   try {
     process.stderr.write(`[hopper-mcp] received ${signal}; flushing knowledge store.\n`);
   } catch {}
   try {
-    await store.save();
+    // flushDurable awaits any in-flight save and only enqueues a fresh write
+    // if the store actually diverges from disk. Read-only tool batches leave
+    // _dirty=false, so shutdown returns in ~10ms instead of paying for a full
+    // re-write of the 145 MB JSON that would just rewrite identical bytes —
+    // shrinking the user-visible "tools unavailable" gap if the host respawns.
+    await store.flushDurable();
+    debugLog({ kind: "shutdown_saved", dirty: store._dirty });
   } catch (err) {
+    debugLog({ kind: "shutdown_save_failed", message: err?.message, stack: err?.stack });
     try {
       process.stderr.write(`[hopper-mcp] flush failed: ${err?.stack ?? err}\n`);
     } catch {}
@@ -91,13 +113,26 @@ process.stdin.on("end", () => gracefulShutdown("stdin EOF"));
 // process half-alive with corrupted in-memory state. Flush, then exit non-zero
 // so the host respawns instead of routing more traffic at us.
 process.on("uncaughtException", (err) => {
+  debugLog({
+    kind: "uncaught_exception",
+    message: err?.message,
+    stack: err?.stack,
+    inFlight: snapshotInFlight(),
+  });
   gracefulShutdown(`uncaughtException: ${err?.stack ?? err}`, 1).catch(() => process.exit(1));
 });
 process.on("unhandledRejection", (reason) => {
+  debugLog({
+    kind: "unhandled_rejection",
+    message: reason?.message ?? String(reason),
+    stack: reason?.stack ?? null,
+    inFlight: snapshotInFlight(),
+  });
   gracefulShutdown(`unhandledRejection: ${reason?.stack ?? reason}`, 1).catch(() => process.exit(1));
 });
 
 process.stdin.on("error", (err) => {
+  debugLog({ kind: "stdin_error", code: err?.code, message: err?.message });
   try {
     process.stderr.write(`[hopper-mcp] stdin error: ${err?.message ?? err}\n`);
   } catch {}
@@ -108,14 +143,23 @@ process.stdin.on("error", (err) => {
 // or SIGTERM trigger the actual exit. If the host abandons us without closing
 // stdin, the next signal cleans up.
 process.stdout.on("error", (err) => {
+  debugLog({
+    kind: "stdout_error",
+    code: err?.code,
+    message: err?.message,
+    inFlight: snapshotInFlight(),
+  });
   try {
     process.stderr.write(`[hopper-mcp] stdout error (${err?.code ?? "unknown"}): ${err?.message ?? err}\n`);
   } catch {}
   if (err && err.code === "EPIPE" && !stdoutBroken) {
     stdoutBroken = true;
-    store.save().catch(() => {});
+    // Use flushDurable: if nothing changed since the last save, this is a
+    // no-op rather than a fresh 145 MB write triggered by a broken pipe.
+    store.flushDurable().catch(() => {});
   }
 });
 
 const transport = new StdioServerTransport();
 await mcp.connect(transport);
+debugLog({ kind: "transport_connected", debug: isDebugEnabled() });

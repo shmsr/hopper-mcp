@@ -42,6 +42,7 @@ import {
 import { toolResult, boundedNumber, DEFAULT_MAX_TOOL_TEXT_CHARS } from "./server-format.js";
 import { parseAddress, formatAddress } from "./knowledge-store.js";
 import { buildQueueOperation, buildHypothesisOperation, findSimilarFunctions, resolveFromBinaryStrings, searchSessionBinaryStrings } from "./tool-handlers.js";
+import { wrapToolHandler } from "./debug-log.js";
 
 const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
 const READ_OPEN_WORLD = { readOnlyHint: true, openWorldHint: true };
@@ -54,6 +55,13 @@ const optionalBool = z.boolean().optional();
 
 export function registerTools(server, ctx) {
   const { store, transactions, adapter, officialBackend, serverInfo } = ctx;
+
+  // Auto-wrap every tool handler with debug instrumentation. No-op when
+  // HOPPER_MCP_DEBUG and HOPPER_MCP_DEBUG_LOG are both unset, so the hot
+  // path is unchanged for production callers.
+  const rawRegisterTool = server.registerTool.bind(server);
+  server.registerTool = (name, definition, handler) =>
+    rawRegisterTool(name, definition, wrapToolHandler(name, handler));
 
   const notifyProgress = async (extra, progress, total, message) => {
     const progressToken = extra?._meta?.progressToken;

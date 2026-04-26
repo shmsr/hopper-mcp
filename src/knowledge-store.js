@@ -20,6 +20,13 @@ export class KnowledgeStore {
       : DEFAULT_SESSION_CAP;
     this.state = structuredClone(EMPTY_STORE);
     this._savePromise = null;
+    // Tracks whether in-memory state diverges from disk. save()/scheduleSave()
+    // set it; _writeStateToDisk clears it just before JSON.stringify (so any
+    // mutation racing the write is captured in the next save). flushDurable()
+    // uses it to skip the shutdown write when the store is already on disk —
+    // that turns a 750ms shutdown (full re-write of a 145 MB store) into a
+    // ~10ms exit on read-only-tool batches.
+    this._dirty = false;
   }
 
   async load() {
@@ -59,6 +66,7 @@ export class KnowledgeStore {
 
   // Durable: resolves once the latest enqueued write has hit disk.
   async save() {
+    this._dirty = true;
     return this._enqueueSave();
   }
 
@@ -66,11 +74,26 @@ export class KnowledgeStore {
   // unhandledRejection. Use this from hot paths where the response should
   // not block on a 100 MB JSON.stringify + writeFile.
   scheduleSave() {
+    this._dirty = true;
     this._enqueueSave().catch((err) => {
       try {
         process.stderr.write(`[hopper-mcp] knowledge-store save error: ${err?.stack ?? err}\n`);
       } catch {}
     });
+  }
+
+  // Shutdown-only flush: drain any in-flight writes, then issue exactly one
+  // more save IFF the in-memory state has diverged from disk. Read-only tool
+  // batches leave _dirty=false the whole time, so this returns near-instantly
+  // instead of paying for another full 145 MB write that would just rewrite
+  // the same bytes.
+  async flushDurable() {
+    if (this._savePromise) {
+      try { await this._savePromise; } catch {}
+    }
+    if (this._dirty) {
+      return this._enqueueSave();
+    }
   }
 
   // Single-flight serializer: chains writes so concurrent callers cannot
@@ -84,13 +107,22 @@ export class KnowledgeStore {
   }
 
   async _writeStateToDisk() {
+    // Clear _dirty BEFORE the synchronous stringify so any mutation that
+    // races the in-flight writeFile is correctly observed as "still dirty"
+    // for the NEXT save. Mutations between here and stringify can't happen
+    // (single-threaded JS, stringify is synchronous), so we always capture a
+    // consistent snapshot.
+    this._dirty = false;
     await mkdir(dirname(this.path), { recursive: true });
     const tmp = `${this.path}.${process.pid}.${Date.now()}.tmp`;
+    const snapshot = JSON.stringify(this.state) + "\n";
     try {
-      await writeFile(tmp, JSON.stringify(this.state) + "\n", "utf8");
+      await writeFile(tmp, snapshot, "utf8");
       await rename(tmp, this.path);
     } catch (err) {
-      // Best-effort cleanup so we don't leak tmpfiles on write/rename failure.
+      // Re-mark dirty so the next save retries. Best-effort cleanup so we
+      // don't leak tmpfiles on write/rename failure.
+      this._dirty = true;
       try { await unlink(tmp); } catch {}
       throw err;
     }

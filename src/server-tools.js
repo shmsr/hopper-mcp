@@ -1332,9 +1332,9 @@ export function registerTools(server, ctx) {
     {
       title: "Procedure",
       description:
-        "Read a single field from a procedure: info | assembly | pseudo_code | callers | callees. `procedure` accepts an address or name; defaults to the cursor procedure when omitted.",
+        "Read a single field from a procedure: info | assembly | pseudo_code | callers | callees | comments. `procedure` accepts an address or name; defaults to the cursor procedure when omitted.",
       inputSchema: {
-        field: z.enum(["info", "assembly", "pseudo_code", "callers", "callees"]),
+        field: z.enum(["info", "assembly", "pseudo_code", "callers", "callees", "comments"]),
         procedure: optionalString,
         session_id: optionalString,
         max_lines: optionalNumber,
@@ -1361,6 +1361,20 @@ export function registerTools(server, ctx) {
           const session = store.getSession(sessionId);
           const list = (args.field === "callers" ? fn.callers : fn.callees) ?? [];
           return toolResult(list.map((addr) => store.getFunctionIfKnown(session, addr).name ?? addr));
+        }
+        case "comments": {
+          const session = store.getSession(sessionId);
+          const start = parseAddress(fn.addr) ?? 0;
+          const end = start + (fn.size ?? 0);
+          const inRange = (entry) => {
+            const a = parseAddress(entry.addr) ?? 0;
+            return a >= start && (end === start || a < end);
+          };
+          const prefix = {};
+          const inline = {};
+          for (const c of session.comments ?? []) if (inRange(c)) prefix[formatAddress(c.addr)] = c.comment;
+          for (const c of session.inlineComments ?? []) if (inRange(c)) inline[formatAddress(c.addr)] = c.comment;
+          return toolResult({ prefix, inline });
         }
       }
     },

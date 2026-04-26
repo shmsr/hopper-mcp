@@ -136,3 +136,15 @@ test("analyze_binary rejects unknown kind", async () => {
     await assert.rejects(() => h.call("analyze_binary", { kind: "nope" }));
   } finally { await h.close(); }
 });
+
+test("procedure({field:'comments'}) returns prefix + inline comments map", async () => {
+  const h = await startWithSample();
+  try {
+    const procs = decodeToolResult(await h.call("list", { kind: "procedures" }));
+    const addr = Object.keys(procs)[0];
+    const out = decodeToolResult(await h.call("procedure", { field: "comments", procedure: addr }));
+    assert.ok("prefix" in out && "inline" in out);
+    assert.equal(typeof out.prefix, "object");
+    assert.equal(typeof out.inline, "object");
+  } finally { await h.close(); }
+});

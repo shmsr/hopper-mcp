@@ -76,17 +76,17 @@ That means our mirror can provide MCP resources, caching, and large-binary fallb
 
 ## Combined Backend
 
-This project can also call the official server as a subprocess. Supported mirror tools accept
-`backend: "official"` to route the call to Hopper's official active-document server instead of the local
-snapshot. The `official_hopper_call` tool can call non-mirrored official tools directly.
+This project can also call the official server as a subprocess. Use `official_hopper_call` to invoke any
+official tool directly — there is no per-tool `backend:` flag, since the snapshot mirror tools were retired
+in favour of the explicit passthrough.
 
 Official write/navigation tools are blocked unless `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` is present in the
 server environment and the call passes `confirm_live_write: true`.
 
-The `ingest_official_hopper` and `refresh_snapshot` tools use the official backend to read the current live
-Hopper document into this project's local snapshot store. This keeps the official server as the authority
-for live document state while letting this server expose resources, caching, local Mach-O helpers, and safer
-transaction previews.
+The `ingest_official_hopper` tool uses the official backend to read the current live Hopper document into
+this project's local snapshot store. This keeps the official server as the authority for live document
+state while letting this server expose resources, caching, local Mach-O helpers, and safer transaction
+previews.
 
 `commit_transaction` can route reviewed rename/comment/inline-comment operations to the official backend with
 `backend: "official"` and `confirm_live_write: true`, but the server still requires

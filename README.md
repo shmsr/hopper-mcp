@@ -79,7 +79,7 @@ Local helper tools:
 - `find_xrefs`: scan for direct branches/calls and ADRP+ADD/LDR references to an address.
 - `find_functions`: discover ARM64 frame-prologue functions, optionally with `merge_session: true`.
 
-For official tools that are not mirrored, use `official_hopper_call`. Write/navigation official tools are blocked by default; enabling them requires both `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` in the server environment and `confirm_live_write: true` on the call.
+To call any Hopper official tool directly, use `official_hopper_call`. Write/navigation official tools are blocked by default; enabling them requires both `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` in the server environment and `confirm_live_write: true` on the call.
 
 Direct official calls cap large text results by default so a single decompile does not overwhelm the client. Pass `max_result_chars` to tune the preview size, or `include_full_result: true` if the client can safely handle the full result in `structuredContent`.
 

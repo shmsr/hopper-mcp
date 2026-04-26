@@ -15,7 +15,7 @@ export async function startServer({ env = {} } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "hopper-mcp-test-"));
   const child = spawn(process.execPath, [SERVER], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, HOPPER_MCP_STORE_PATH: join(dir, "store.json"), ...env },
+    env: { ...process.env, HOPPER_MCP_STORE: join(dir, "store.json"), ...env },
   });
 
   let buffer = "";
@@ -42,6 +42,19 @@ export async function startServer({ env = {} } = {}) {
 
   child.stderr.on("data", (chunk) => process.stderr.write(`[server] ${chunk}`));
 
+  function drainPending(err) {
+    for (const { reject } of pending.values())
+      reject(err ?? new Error("server exited unexpectedly"));
+    pending.clear();
+  }
+
+  child.stdout.on("close", () => drainPending(new Error("server stdout closed")));
+  child.on("exit", (code) => {
+    if (code !== 0) drainPending(new Error(`server exited with code ${code}`));
+  });
+  child.on("error", (err) => drainPending(new Error(`server spawn failed: ${err.message}`)));
+  child.stdin.on("error", () => {}); // suppress EPIPE on dead process
+
   function send(method, params) {
     const id = nextId++;
     return new Promise((resolve, reject) => {
@@ -65,7 +78,9 @@ export async function startServer({ env = {} } = {}) {
     raw: send,
     async close() {
       child.stdin.end();
-      try { await once(child, "exit"); } catch {}
+      if (child.exitCode === null) {
+        try { await once(child, "exit"); } catch {}
+      }
       await rm(dir, { recursive: true, force: true });
     },
   };
@@ -83,8 +98,12 @@ export async function startWithSample(opts) {
   const harness = await startServer(opts);
   // Sample is loaded via open_session (ingest_sample is going away in Task 14;
   // we never depend on the deprecated tool from tests).
-  const { sampleSession } = await import("./sample-session.mjs");
-  const result = await harness.call("open_session", { session: sampleSession() });
-  const session = decodeToolResult(result);
-  return { ...harness, sessionId: session.sessionId };
+  try {
+    const result = await harness.call("open_session", { session: sampleSession() });
+    const session = decodeToolResult(result);
+    return { ...harness, sessionId: session.sessionId };
+  } catch (err) {
+    await harness.close().catch(() => {});
+    throw err;
+  }
 }

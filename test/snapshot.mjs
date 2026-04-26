@@ -146,5 +146,13 @@ test("procedure({field:'comments'}) returns prefix + inline comments map", async
     assert.ok("prefix" in out && "inline" in out);
     assert.equal(typeof out.prefix, "object");
     assert.equal(typeof out.inline, "object");
+    // Fixture has a prefix comment at the entrypoint and an inline comment at
+    // an instruction within the function range. Asserting that real strings
+    // come through guards against future regressions to the wrong field name
+    // (which would silently produce undefined values).
+    assert.equal(typeof out.prefix[addr], "string");
+    assert.ok(out.prefix[addr].length > 0);
+    const inlineValues = Object.values(out.inline);
+    assert.ok(inlineValues.length > 0 && inlineValues.every((v) => typeof v === "string" && v.length > 0));
   } finally { await h.close(); }
 });

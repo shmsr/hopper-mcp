@@ -1364,16 +1364,25 @@ export function registerTools(server, ctx) {
         }
         case "comments": {
           const session = store.getSession(sessionId);
-          const start = parseAddress(fn.addr) ?? 0;
-          const end = start + (fn.size ?? 0);
+          const start = parseAddress(fn.addr);
+          if (start === null) return toolResult({ prefix: {}, inline: {} });
+          // When size is unknown we can't reliably scope to a range; restrict
+          // to the entrypoint only rather than silently returning every comment
+          // at-or-after the function start (which would inflate the result for
+          // stripped binaries with unresolved function boundaries).
+          const end = fn.size ? start + fn.size : null;
           const inRange = (entry) => {
-            const a = parseAddress(entry.addr) ?? 0;
-            return a >= start && (end === start || a < end);
+            const a = parseAddress(entry.addr);
+            if (a === null) return false;
+            return end === null ? a === start : a >= start && a < end;
           };
           const prefix = {};
           const inline = {};
-          for (const c of session.comments ?? []) if (inRange(c)) prefix[formatAddress(c.addr)] = c.comment;
-          for (const c of session.inlineComments ?? []) if (inRange(c)) inline[formatAddress(c.addr)] = c.comment;
+          // Mirror the legacy comment / inline_comment tools' fallback shape
+          // (src/server-tools.js:1308, 1325): older sessions may store the text
+          // under .value rather than .comment.
+          for (const c of session.comments ?? []) if (inRange(c)) prefix[formatAddress(c.addr)] = c.comment ?? c.value;
+          for (const c of session.inlineComments ?? []) if (inRange(c)) inline[formatAddress(c.addr)] = c.comment ?? c.value;
           return toolResult({ prefix, inline });
         }
       }

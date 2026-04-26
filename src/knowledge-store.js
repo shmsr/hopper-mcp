@@ -314,6 +314,10 @@ export class KnowledgeStore {
     };
   }
 
+  // Searches session.transactions.pending only; that array is currently the
+  // authoritative store for both open and committed/rolled-back transactions
+  // (transaction-manager mutates status in place rather than moving entries).
+  // If transactions are ever split into separate buckets, widen this lookup.
   getTransactionById(session, txnId) {
     const pending = session.transactions?.pending ?? [];
     const txn = pending.find((t) => t.id === txnId);
@@ -345,9 +349,13 @@ export class KnowledgeStore {
     if (parsed.path === "/objc/classes") return session.objcClasses;
     if (parsed.path === "/swift/symbols") return session.swiftSymbols;
     if (parsed.path === "/transactions/pending") return session.transactions?.pending ?? [];
-    if (parsed.path.startsWith("/transactions/") && parsed.path !== "/transactions/pending") {
-      const id = parsed.path.slice("/transactions/".length);
-      return this.getTransactionById(session, id);
+    // Single-segment id only — rejects empty (`/transactions/`) and nested
+    // (`/transactions/abc/operations`) forms so future sub-resources don't get
+    // pre-empted as a literal id and so empty-id lookups fail with a clearer
+    // error than `No transaction ''...`.
+    const txnMatch = parsed.path.match(/^\/transactions\/([^/]+)$/);
+    if (txnMatch && txnMatch[1] !== "pending") {
+      return this.getTransactionById(session, txnMatch[1]);
     }
 
     const functionMatch = parsed.path.match(/^\/function\/([^/]+)(?:\/(summary|evidence))?$/);

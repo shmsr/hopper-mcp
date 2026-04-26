@@ -144,15 +144,21 @@ test("hopper://transactions/{id} returns the matching transaction", async () => 
     const begin = decodeToolResult(beginRes);
     const id = begin.transactionId ?? begin.id;
     const read = await h.readResource(`hopper://transactions/${id}`);
+    assert.ok(Array.isArray(read.contents) && read.contents.length > 0, "contents should be non-empty");
     const body = JSON.parse(read.contents[0].text);
-    assert.equal(body.id ?? body.transactionId, id);
+    // Pin to the canonical field. transaction-manager stores .id on the
+    // record; .transactionId is only used by the begin/preview return shape.
+    assert.equal(body.id, id);
   } finally { await h.close(); }
 });
 
 test("hopper://transactions/{id} returns 404-equivalent for unknown id", async () => {
   const h = await startWithSample();
   try {
-    await assert.rejects(() => h.readResource("hopper://transactions/unknown-xxx"));
+    await assert.rejects(
+      () => h.readResource("hopper://transactions/unknown-xxx"),
+      /No transaction 'unknown-xxx'/,
+    );
   } finally { await h.close(); }
 });
 

@@ -151,14 +151,17 @@ export function registerResources(server, store) {
     read,
   );
 
+  const transactionDesc = "Read a specific local transaction by id.";
   server.registerResource(
     "transaction",
     new ResourceTemplate("hopper://transactions/{id}", { list: undefined }),
-    {
-      title: "Transaction",
-      description: "Read a specific local transaction by id.",
-      mimeType: "application/json",
-    },
+    { title: "Transaction", description: transactionDesc, mimeType: "application/json" },
+    read,
+  );
+  server.registerResource(
+    "transaction (session)",
+    new ResourceTemplate("hopper://transactions/{id}{?session_id}", { list: undefined }),
+    { title: "Transaction", description: transactionDesc, mimeType: "application/json" },
     read,
   );
 }

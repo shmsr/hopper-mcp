@@ -162,6 +162,322 @@ test("hopper://transactions/{id} returns 404-equivalent for unknown id", async (
   } finally { await h.close(); }
 });
 
+// ── procedure field coverage ──────────────────────────────────────────────
+
+// procedure({field:"info"}) returns an officialProcedureInfo object with entrypoint + name.
+test("procedure({field:'info'}) returns entrypoint-keyed info object", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("procedure", { field: "info", procedure: "0x100003f50" }),
+    );
+    assert.equal(typeof out, "object");
+    assert.equal(out.name, "sub_100003f50");
+    assert.equal(out.entrypoint, "0x100003f50");
+  } finally { await h.close(); }
+});
+
+// procedure({field:"assembly"}) returns a string (may be empty for a fixture without raw bytes).
+test("procedure({field:'assembly'}) returns a string", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("procedure", { field: "assembly", procedure: "0x100003f50" }),
+    );
+    assert.equal(typeof out, "string");
+  } finally { await h.close(); }
+});
+
+// procedure({field:"pseudo_code"}) returns the pseudocode string for a fixture that has it.
+test("procedure({field:'pseudo_code'}) returns pseudocode string containing 'sha256' or 'candidate'", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("procedure", { field: "pseudo_code", procedure: "0x100003f50" }),
+    );
+    assert.equal(typeof out, "string");
+    assert.ok(
+      /sha256|candidate/i.test(out),
+      `expected pseudocode to mention sha256 or candidate; got: ${out}`,
+    );
+  } finally { await h.close(); }
+});
+
+// procedure({field:"callers"}) returns array — sub_100003f50 is called by _main.
+test("procedure({field:'callers'}) returns array containing _main", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("procedure", { field: "callers", procedure: "0x100003f50" }),
+    );
+    assert.ok(Array.isArray(out), "callers should be an array");
+    assert.ok(out.includes("_main"), `expected _main in callers; got ${JSON.stringify(out)}`);
+  } finally { await h.close(); }
+});
+
+// procedure({field:"callees"}) returns array — sub_100003f50 calls sub_100004010.
+test("procedure({field:'callees'}) returns array containing sub_100004010", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("procedure", { field: "callees", procedure: "0x100003f50" }),
+    );
+    assert.ok(Array.isArray(out), "callees should be an array");
+    assert.ok(
+      out.includes("sub_100004010"),
+      `expected sub_100004010 in callees; got ${JSON.stringify(out)}`,
+    );
+  } finally { await h.close(); }
+});
+
+// procedure with an unknown address should reject with an error.
+test("procedure({field:'info'}) rejects unknown address", async () => {
+  const h = await startWithSample();
+  try {
+    await assert.rejects(
+      () => h.call("procedure", { field: "info", procedure: "0xdeadbeef" }),
+    );
+  } finally { await h.close(); }
+});
+
+// ── search coverage ───────────────────────────────────────────────────────
+
+// search({kind:"strings"}) — "license" matches "license_key" in the fixture.
+test("search({kind:'strings', pattern:'license'}) returns non-empty address-keyed object", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("search", { kind: "strings", pattern: "license" }),
+    );
+    assert.equal(typeof out, "object");
+    assert.ok(Object.keys(out).length > 0, "expected at least one matching string");
+  } finally { await h.close(); }
+});
+
+// search({kind:"procedures"}) — "main" matches "_main".
+test("search({kind:'procedures', pattern:'main'}) returns non-empty address-keyed object", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("search", { kind: "procedures", pattern: "main" }),
+    );
+    assert.equal(typeof out, "object");
+    assert.ok(Object.keys(out).length > 0, "expected at least one procedure matching 'main'");
+  } finally { await h.close(); }
+});
+
+// search({kind:"names"}) — "sub_" matches sample function names.
+test("search({kind:'names', pattern:'sub_'}) returns non-empty address-keyed object", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("search", { kind: "names", pattern: "sub_" }),
+    );
+    assert.equal(typeof out, "object");
+    assert.ok(Object.keys(out).length > 0, "expected at least one name matching 'sub_'");
+  } finally { await h.close(); }
+});
+
+// search with an invalid kind should reject.
+test("search({kind:'wrong'}) rejects with schema validation error", async () => {
+  const h = await startWithSample();
+  try {
+    await assert.rejects(() => h.call("search", { kind: "wrong", pattern: "x" }));
+  } finally { await h.close(); }
+});
+
+// ── xrefs ─────────────────────────────────────────────────────────────────
+
+// xrefs({address:"0x100003f50"}) — called by _main (0x100004120); callee edge should appear.
+test("xrefs({address:'0x100003f50'}) returns array containing caller 0x100004120", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("xrefs", { address: "0x100003f50" }),
+    );
+    // snapshotXrefs returns an array of addresses that reference the target.
+    assert.ok(Array.isArray(out), `expected array; got ${JSON.stringify(out)}`);
+    assert.ok(
+      out.includes("0x100004120"),
+      `expected 0x100004120 in xrefs; got ${JSON.stringify(out)}`,
+    );
+  } finally { await h.close(); }
+});
+
+// ── containing_function ───────────────────────────────────────────────────
+
+// An exact entrypoint address returns match="entrypoint".
+test("containing_function({address:'0x100003f50'}) returns match='entrypoint'", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("containing_function", { address: "0x100003f50" }),
+    );
+    assert.equal(out.match, "entrypoint");
+    assert.equal(out.offset, 0);
+  } finally { await h.close(); }
+});
+
+// An address inside sub_100003f50's body (size=192) returns match="containment".
+test("containing_function({address:'0x100003fa8'}) returns match='containment' with offset>0", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("containing_function", { address: "0x100003fa8" }),
+    );
+    assert.equal(out.match, "containment");
+    assert.ok(out.offset > 0, `expected offset > 0; got ${out.offset}`);
+  } finally { await h.close(); }
+});
+
+// An address that falls outside all known function ranges returns match="none".
+test("containing_function({address:'0xdeadbeef'}) returns match='none'", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("containing_function", { address: "0xdeadbeef" }),
+    );
+    assert.equal(out.match, "none");
+  } finally { await h.close(); }
+});
+
+// ── resolve ───────────────────────────────────────────────────────────────
+
+// resolve by address — 0x100003f50 maps to sub_100003f50.
+test("resolve({query:'0x100003f50'}) returns non-empty result array", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("resolve", { query: "0x100003f50" }),
+    );
+    assert.ok(Array.isArray(out) && out.length > 0, "expected at least one result");
+    assert.equal(out[0].kind, "function");
+  } finally { await h.close(); }
+});
+
+// resolve by name — "_main" resolves to the entrypoint function.
+test("resolve({query:'_main'}) returns non-empty result array", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("resolve", { query: "_main" }),
+    );
+    assert.ok(Array.isArray(out) && out.length > 0, "expected at least one result for _main");
+  } finally { await h.close(); }
+});
+
+// resolve by string value — "license_key" appears in both function strings and the strings table.
+test("resolve({query:'license_key'}) returns non-empty result array", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("resolve", { query: "license_key" }),
+    );
+    assert.ok(Array.isArray(out) && out.length > 0, "expected at least one result for license_key");
+  } finally { await h.close(); }
+});
+
+// ── query ─────────────────────────────────────────────────────────────────
+
+// query with name: predicate matching a known function name (DSL uses colon separator).
+test("query({expression:'name:sub_100003f50'}) returns count>=1 and matches array", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("query", { expression: "name:sub_100003f50" }),
+    );
+    assert.equal(typeof out, "object");
+    assert.ok(out.count >= 1, `expected count >= 1; got ${out.count}`);
+    assert.ok(Array.isArray(out.matches), "matches should be an array");
+  } finally { await h.close(); }
+});
+
+// query with imports: predicate — _ptrace is imported by _main (DSL uses colon separator).
+test("query({expression:'imports:_ptrace'}) returns count>=1", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("query", { expression: "imports:_ptrace" }),
+    );
+    assert.ok(out.count >= 1, `expected count >= 1; got ${out.count}`);
+    assert.ok(Array.isArray(out.matches));
+  } finally { await h.close(); }
+});
+
+// ── analyze_function_deep ─────────────────────────────────────────────────
+
+// analyze_function_deep returns a rich object with at minimum a function + pseudocode field.
+test("analyze_function_deep({addr:'0x100003f50'}) returns object with pseudocode and evidenceAnchors", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("analyze_function_deep", { addr: "0x100003f50" }),
+    );
+    assert.equal(typeof out, "object");
+    // The store returns: function, inferredPurpose, confidence, callers, callees,
+    // stringsTouched, importsTouched, selectorsTouched, evidenceAnchors, pseudocode,
+    // assemblySlices, provenance.
+    assert.ok("function" in out, "expected 'function' key");
+    assert.ok("pseudocode" in out, "expected 'pseudocode' key");
+    assert.ok("evidenceAnchors" in out, "expected 'evidenceAnchors' key");
+  } finally { await h.close(); }
+});
+
+// analyze_function_deep with an unknown address should reject.
+test("analyze_function_deep({addr:'0xdeadbeef'}) rejects with unknown-function error", async () => {
+  const h = await startWithSample();
+  try {
+    await assert.rejects(
+      () => h.call("analyze_function_deep", { addr: "0xdeadbeef" }),
+    );
+  } finally { await h.close(); }
+});
+
+// ── get_graph_slice ───────────────────────────────────────────────────────
+
+// get_graph_slice with kind="calls" returns a graph object with nodes and edges.
+test("get_graph_slice radius=1 kind='calls' returns a graph object", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("get_graph_slice", { seed: "0x100003f50", radius: 1, kind: "calls" }),
+    );
+    assert.ok(out && typeof out === "object");
+    assert.ok("nodes" in out || "callers" in out || "callees" in out, "graph slice should expose nodes or call lists");
+  } finally { await h.close(); }
+});
+
+// get_graph_slice with kind="callers" — sub_100003f50 is called by _main.
+test("get_graph_slice kind='callers' returns graph with _main in nodes", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("get_graph_slice", { seed: "0x100003f50", radius: 1, kind: "callers" }),
+    );
+    assert.ok(Array.isArray(out.nodes), "nodes should be an array");
+    const names = out.nodes.map((n) => n.name);
+    assert.ok(names.includes("_main"), `expected _main in callers graph nodes; got ${JSON.stringify(names)}`);
+  } finally { await h.close(); }
+});
+
+// get_graph_slice with kind="callees" — sub_100003f50 calls sub_100004010.
+test("get_graph_slice kind='callees' returns graph with sub_100004010 in nodes", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(
+      await h.call("get_graph_slice", { seed: "0x100003f50", radius: 1, kind: "callees" }),
+    );
+    assert.ok(Array.isArray(out.nodes), "nodes should be an array");
+    const names = out.nodes.map((n) => n.name);
+    assert.ok(
+      names.includes("sub_100004010"),
+      `expected sub_100004010 in callees graph nodes; got ${JSON.stringify(names)}`,
+    );
+  } finally { await h.close(); }
+});
+
+// ── procedure({field:'comments'}) ────────────────────────────────────────
+
 test("procedure({field:'comments'}) returns prefix + inline comments map", async () => {
   const h = await startWithSample();
   try {

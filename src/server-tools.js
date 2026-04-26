@@ -1784,6 +1784,52 @@ export function registerTools(server, ctx) {
   );
 
   server.registerTool(
+    "analyze_binary",
+    {
+      title: "Analyze Binary",
+      description:
+        "Single entry for binary-level forensics. " +
+        "kind: capabilities (imports bucketed) | anti_analysis (anti-debug findings) | entropy (per-section entropy) | code_signing (signing + entitlements) | objc (Objective-C runtime metadata).",
+      inputSchema: {
+        kind: z.enum(["capabilities", "anti_analysis", "entropy", "code_signing", "objc"]),
+        session_id: optionalString,
+      },
+      annotations: READ_ONLY,
+    },
+    async (args) => {
+      const session = store.getSession(sessionFor(args));
+      switch (args.kind) {
+        case "capabilities":  return toolResult(classifyImports(session.imports ?? []));
+        case "anti_analysis": return toolResult(detectAntiAnalysis(session));
+        case "entropy": {
+          const binaryPath = session.binary?.path;
+          if (!binaryPath) throw rpcError(-32602, "analyze_binary(entropy) requires a session with a binary path.");
+          try {
+            return toolResult(await computeSectionEntropy(binaryPath, session.binary?.arch ?? "auto"));
+          } catch (err) {
+            return toolResult({ sections: [], error: err.message ?? String(err) });
+          }
+        }
+        case "code_signing": {
+          const binaryPath = session.binary?.path;
+          if (!binaryPath) throw rpcError(-32602, "analyze_binary(code_signing) requires a session with a binary path.");
+          return toolResult(await extractCodeSigning(binaryPath));
+        }
+        case "objc": {
+          const binaryPath = session.binary?.path;
+          if (!binaryPath) throw rpcError(-32602, "analyze_binary(objc) requires a session with a binary path.");
+          try {
+            const classes = await extractObjCRuntime(binaryPath, session.binary?.arch ?? "auto");
+            return toolResult({ count: classes.length, classes });
+          } catch (err) {
+            return toolResult({ count: 0, classes: [], error: err.message ?? String(err) });
+          }
+        }
+      }
+    },
+  );
+
+  server.registerTool(
     "compute_fingerprints",
     {
       title: "Compute Fingerprints",

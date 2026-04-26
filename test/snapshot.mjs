@@ -90,3 +90,33 @@ test("list({kind:'exports'}) returns array", async () => {
     assert.ok(Array.isArray(out));
   } finally { await h.close(); }
 });
+
+test("analyze_binary({kind:'capabilities'}) returns capability buckets", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(await h.call("analyze_binary", { kind: "capabilities" }));
+    assert.equal(typeof out, "object");
+    // Expect at least the buckets that are non-empty; structure: {bucket: [imports]}.
+    for (const [bucket, list] of Object.entries(out)) {
+      assert.ok(Array.isArray(list));
+      assert.ok(typeof bucket === "string");
+    }
+  } finally { await h.close(); }
+});
+
+for (const kind of ["anti_analysis", "entropy", "code_signing", "objc"]) {
+  test(`analyze_binary({kind:'${kind}'}) returns a non-error result`, async () => {
+    const h = await startWithSample();
+    try {
+      const out = decodeToolResult(await h.call("analyze_binary", { kind }));
+      assert.notEqual(out, null);
+    } finally { await h.close(); }
+  });
+}
+
+test("analyze_binary rejects unknown kind", async () => {
+  const h = await startWithSample();
+  try {
+    await assert.rejects(() => h.call("analyze_binary", { kind: "nope" }));
+  } finally { await h.close(); }
+});

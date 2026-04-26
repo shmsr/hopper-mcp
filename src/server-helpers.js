@@ -11,14 +11,6 @@ export function rpcError(code, message) {
   return error;
 }
 
-export function sessionOrNull(store, sessionId) {
-  try {
-    return store.getSession(sessionId);
-  } catch {
-    return null;
-  }
-}
-
 export function listProcedures(store, sessionId, { maxResults } = {}) {
   const session = store.getSession(sessionId);
   return limitResults(

@@ -28,7 +28,6 @@ import {
 } from "./research-tools.js";
 import {
   rpcError,
-  sessionOrNull,
   listProcedures,
   defaultProcedureQuery,
   defaultAddressQuery,
@@ -1257,17 +1256,6 @@ function findSimilarFunctions(store, { sessionId, addr, targetSessionId, minSimi
     target: { sessionId: session.sessionId, addr: target.addr, name: target.name ?? null, fingerprint: target.fingerprint },
     matches: results.slice(0, maxResults),
   };
-}
-
-function localNameItems(session) {
-  const merged = new Map();
-  for (const item of session.names ?? []) {
-    if (item?.addr) merged.set(formatAddress(item.addr), { ...item, addr: formatAddress(item.addr) });
-  }
-  for (const fn of Object.values(session.functions ?? {})) {
-    if (fn?.addr && fn?.name) merged.set(formatAddress(fn.addr), { addr: formatAddress(fn.addr), name: fn.name });
-  }
-  return [...merged.values()];
 }
 
 async function resolveFromBinaryStrings(store, query, { sessionId, maxResults }) {

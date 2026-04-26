@@ -2,12 +2,9 @@
 // procedure index (entrypoint addr → name/size/[basicblocks/signature/locals])
 // that can be fused into our local nm-driven analysis.
 //
-// Two callers use this:
-//   1. importMachO deep mode (when a Hopper backend is wired in) — the index
-//      is folded into mergeFunctionSets so Hopper's split decisions and
-//      basicblock counts override our prologue-derived ranges.
-//   2. compare_with_hopper diagnostic — runs the local pipeline and the
-//      Hopper index side-by-side and reports the drift.
+// importMachO deep mode (when a Hopper backend is wired in) calls this — the
+// index is folded into mergeFunctionSets so Hopper's split decisions and
+// basicblock counts override our prologue-derived ranges.
 //
 // We intentionally keep the "lite" fetch path (list_procedures +
 // list_procedure_size) as the default — those are O(1) round-trips and

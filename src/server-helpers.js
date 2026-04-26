@@ -107,29 +107,6 @@ function scoreProcedureNameMatch(fn, lower) {
   return 0;
 }
 
-export function officialSegment(segment) {
-  const start = parseAddress(segment.start);
-  const length = Number(segment.length ?? 0);
-  const end = segment.end ?? (start !== null && length > 0 ? formatAddress(start + length) : null);
-  return {
-    name: segment.name ?? null,
-    start: segment.start ?? null,
-    end,
-    writable: String(Boolean(segment.writable ?? segment.writeable ?? segment.protection?.includes?.("w"))),
-    executable: String(Boolean(segment.executable ?? segment.protection?.includes?.("x"))),
-    sections: (segment.sections ?? []).map((section) => {
-      const sectionStart = parseAddress(section.start);
-      const sectionLength = Number(section.length ?? 0);
-      return {
-        name: section.name ?? null,
-        start: section.start ?? null,
-        end:
-          section.end ??
-          (sectionStart !== null && sectionLength > 0 ? formatAddress(sectionStart + sectionLength) : null),
-      };
-    }),
-  };
-}
 
 export function officialProcedureInfo(fn) {
   return {

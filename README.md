@@ -14,33 +14,10 @@ Default write behavior is local-only: transaction commits update the JSON store 
 ## Run
 
 ```bash
-npm run start
-```
-
-Quick checks:
-
-```bash
-npm run test:protocol
-npm run smoke
-npm run test:real
-```
-
-Live Hopper check:
-
-```bash
-LIVE_HOPPER_PARSE_OBJC=0 LIVE_HOPPER_PARSE_SWIFT=0 LIVE_HOPPER_TIMEOUT_MS=90000 LIVE_HOPPER_MAX_FUNCTIONS=20 LIVE_HOPPER_MAX_STRINGS=50 npm run test:live
-```
-
-Full tool check:
-
-```bash
-LIVE_HOPPER_PARSE_OBJC=0 LIVE_HOPPER_PARSE_SWIFT=0 LIVE_HOPPER_ANALYSIS=0 LIVE_HOPPER_TIMEOUT_MS=90000 LIVE_HOPPER_MAX_FUNCTIONS=20 LIVE_HOPPER_MAX_STRINGS=50 npm run test:tools
-```
-
-Official Hopper MCP backend check:
-
-```bash
-npm run test:official
+npm run start     # launch the MCP server over stdio
+npm test          # run the offline test suite (119 tests, ~12s)
+npm run test:live # run the live-Hopper suite (HOPPER_MCP_LIVE=1, requires Hopper installed)
+npm run test:all  # offline + live, when both are available
 ```
 
 If macOS blocks Automation, allow the launcher app to control Hopper in `System Settings > Privacy & Security > Automation`.
@@ -81,7 +58,7 @@ To capture pseudocode in the snapshot, opt in explicitly:
 }
 ```
 
-Pseudocode export can be slow, so it is off by default. Without it, `procedure_pseudo_code` returns a clear “not captured” result.
+Pseudocode export can be slow, so it is off by default. Without it, `procedure(field: pseudo_code)` returns a clear "not captured" result.
 
 Deep local import:
 
@@ -102,29 +79,6 @@ Local helper tools:
 - `find_xrefs`: scan for direct branches/calls and ADRP+ADD/LDR references to an address.
 - `find_functions`: discover ARM64 frame-prologue functions, optionally with `merge_session: true`.
 
-Official-style Hopper snapshot tools:
-
-- `list_documents`, `current_document`
-- `list_segments`
-- `list_procedures`, `list_procedure_size`, `list_procedure_info`, `search_procedures`
-- `procedure_info`, `procedure_address`, `procedure_assembly`, `procedure_pseudo_code`
-- `procedure_callers`, `procedure_callees`, `xrefs`
-- `current_address`, `current_procedure`
-- `list_strings`, `list_names`, `search_name`, `address_name`, `list_bookmarks`
-
-These tools mirror Hopper concepts using the last ingested snapshot. They do not query the frontmost Hopper UI live after export; that still needs the future persistent Hopper-side adapter.
-The mirror follows the official server's observed shapes where possible: procedure/string/name lists are address-keyed objects, search tools accept `pattern` and optional `case_sensitive`, and procedure assembly/pseudocode/current address/name calls return strings. The extended `search_strings` path still accepts `regex` plus `semantic: true` for richer local-store results.
-
-To query Hopper's installed official MCP server through this server, pass:
-
-```json
-{
-  "backend": "official"
-}
-```
-
-on supported mirror tools such as `list_documents`, `procedure_info`, `procedure_assembly`, `xrefs`, and `list_names`. This gives live active-document behavior while keeping the rest of this server available for resources, caching, local Mach-O import, and transaction preview.
-
 For official tools that are not mirrored, use `official_hopper_call`. Write/navigation official tools are blocked by default; enabling them requires both `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` in the server environment and `confirm_live_write: true` on the call.
 
 Direct official calls cap large text results by default so a single decompile does not overwhelm the client. Pass `max_result_chars` to tune the preview size, or `include_full_result: true` if the client can safely handle the full result in `structuredContent`.
@@ -141,7 +95,7 @@ To refresh this server's local snapshot from Hopper's official live backend, cal
 }
 ```
 
-as `ingest_official_hopper` or `refresh_snapshot`. This gives our resource/cache layer a current official-Hopper snapshot without relying on private Hopper APIs. Keep `include_assembly`, `include_pseudocode`, and `include_call_graph` off unless needed; they require per-procedure official backend calls and can be slow on large documents.
+as `ingest_official_hopper`. This gives our resource/cache layer a current official-Hopper snapshot without relying on private Hopper APIs. Keep `include_assembly`, `include_pseudocode`, and `include_call_graph` off unless needed; they require per-procedure official backend calls and can be slow on large documents.
 
 To commit a reviewed local transaction through the official backend:
 
@@ -153,7 +107,7 @@ To commit a reviewed local transaction through the official backend:
 }
 ```
 
-The server must also be started with `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1`. Unsupported operations, such as `queue_type_patch`, are rejected rather than silently applied only to the local cache.
+The server must also be started with `HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1`. Operations with no official-backend equivalent (such as `queue(kind: type_patch)`) are rejected rather than silently applied only to the local cache.
 
 ## Add To Clients
 
@@ -229,91 +183,45 @@ To remove older Hopper entries, delete any other `hopper`, `HopperMCPServer`, or
 
 ## MCP Surface
 
-Resources:
+Tools follow a strict invariant: every tool is one of (a) a snapshot reader,
+(b) the live passthrough `official_hopper_call`, or (c) a mutator. There is no
+per-tool `backend:` flag — live access goes through `official_hopper_call`,
+and live writes go through `commit_transaction(backend:"official")` (gated by
+`HOPPER_MCP_ENABLE_OFFICIAL_WRITES=1` and `confirm_live_write: true`).
 
-- `hopper://session/current`
-- `hopper://binary/metadata`
-- `hopper://binary/imports`
-- `hopper://binary/exports`
-- `hopper://binary/strings`
-- `hopper://names`
-- `hopper://bookmarks`
-- `hopper://comments`
-- `hopper://inline-comments`
-- `hopper://cursor`
-- `hopper://functions`
-- `hopper://function/{addr}`
-- `hopper://function/{addr}/summary`
-- `hopper://function/{addr}/evidence`
-- `hopper://graph/callers/{addr}`
-- `hopper://graph/callees/{addr}`
-- `hopper://objc/classes`
-- `hopper://swift/symbols`
-- `hopper://transactions/pending`
-
-Resource templates:
-
-- `hopper://function/{addr}`
-- `hopper://function/{addr}/summary`
-- `hopper://function/{addr}/evidence`
-- `hopper://graph/callers/{addr}?radius={radius}`
-- `hopper://graph/callees/{addr}?radius={radius}`
-
-Tools:
-
+**Meta (2)**
 - `capabilities`
 - `official_hopper_call`
-- `official_hopper_tools`
-- `ingest_official_hopper`
-- `refresh_snapshot`
-- `open_session`
-- `ingest_sample`
-- `ingest_live_hopper`
+
+**Lifecycle / ingest (6)**
 - `import_macho`
+- `ingest_live_hopper`
+- `ingest_official_hopper`
+- `open_session`
+- `close_session`
+- `set_current_session`
+
+**Local binary helpers (3)**
 - `disassemble_range`
 - `find_xrefs`
 - `find_functions`
-- `resolve`
-- `analyze_function_deep`
-- `get_graph_slice`
-- `search_strings`
-- `list_documents`
-- `current_document`
-- `list_segments`
-- `list_procedures`
-- `list_procedure_size`
-- `list_procedure_info`
-- `list_strings`
-- `search_procedures`
-- `procedure_info`
-- `procedure_address`
-- `procedure_assembly`
-- `procedure_pseudo_code`
-- `procedure_callers`
-- `procedure_callees`
-- `xrefs`
-- `current_address`
-- `current_procedure`
-- `list_names`
-- `search_name`
-- `address_name`
-- `list_bookmarks`
-- `begin_transaction`
-- `queue_rename`
-- `queue_comment`
-- `queue_inline_comment`
-- `queue_type_patch`
-- `preview_transaction`
-- `commit_transaction`
-- `rollback_transaction`
 
-Internal test helpers such as `debug_echo` are hidden unless
-`HOPPER_MCP_ENABLE_DEBUG_TOOLS=1` is set.
+**Snapshot reads (9)**
+- `procedure(field: info|assembly|pseudo_code|callers|callees|comments)`
+- `search(kind: strings|procedures|names)`
+- `list(kind: procedures|strings|names|segments|bookmarks|imports|exports)`
+- `xrefs`, `containing_function`, `resolve`, `query`, `analyze_function_deep`, `get_graph_slice`
 
-Prompts:
+**Transactions (6)**
+- `begin_transaction`, `queue(kind: …)`, `hypothesis(action: …)`, `preview_transaction`, `commit_transaction`, `rollback_transaction`
 
-- `function_triage`
-- `hypothesis_workspace`
+**Forensics (4)**
+- `analyze_binary(kind: capabilities|anti_analysis|entropy|code_signing|objc)`
+- `compute_fingerprints`, `find_similar_functions`, `diff_sessions`
+
+**Resources** — 30 entries; see `src/server-resources.js`.
+
+**Prompts** — `function_triage`, `hypothesis_workspace`.
 
 ## Protocol Notes
 

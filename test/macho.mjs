@@ -38,8 +38,13 @@ test("import_macho deep mode discovers more procedures than shallow", async () =
       executable_path: ECHO, deep: true, max_functions: 500, overwrite: true,
     }));
     const deepCount = Object.keys(decodeToolResult(await h.call("list", { kind: "procedures" }))).length;
-    assert.ok(deepCount >= shallowCount,
-      `deep (${deepCount}) should not be smaller than shallow (${shallowCount})`);
+    // Strict `>`: shallow on a tiny binary returns only the synthetic
+    // 0xfff00000 binary_overview sentinel (count=1), so `>=` would pass for
+    // any non-empty deep result without proving deep found anything new.
+    // Strict `>` requires deep to add at least one real function on top of
+    // any synthetic-cluster nodes the importer emits.
+    assert.ok(deepCount > shallowCount,
+      `deep (${deepCount}) must exceed shallow (${shallowCount})`);
   } finally { await h.close(); }
 });
 
@@ -92,17 +97,37 @@ test("find_functions returns at least one function", async () => {
 test("find_xrefs finds at least one branch xref", async () => {
   const h = await startServer();
   try {
-    decodeToolResult(await h.call("import_macho", { executable_path: ECHO }));
-    const procs = decodeToolResult(await h.call("list", { kind: "procedures" }));
-    const targetAddr = Object.keys(procs)[0];
-    const result = decodeToolResult(await h.call("find_xrefs", {
-      executable_path: ECHO,
-      target_addr: targetAddr,
+    // Strategy: pick a target we KNOW is called by walking disassembly for a
+    // `bl 0x...` instruction. Sample function entrypoints from find_functions
+    // are not reliable xref targets — most user-binary calls go through
+    // symbol-named stubs that resolve to addresses outside the prologue scan
+    // sample (verified empirically: 0/20 sample addrs in /bin/ls had xrefs).
+    const LS = "/bin/ls";
+    decodeToolResult(await h.call("import_macho", {
+      executable_path: LS, deep: true, max_functions: 500,
     }));
-    // result is an array of xrefs (or an object with an xrefs array).
-    // We only assert the call succeeds and returns something non-null.
-    // Some functions may have zero callers; just check the call didn't error.
-    assert.ok(result !== null && result !== undefined, "find_xrefs returned a result");
+    const ff = decodeToolResult(await h.call("find_functions", { executable_path: LS }));
+    let knownTarget = null;
+    outer: for (const fn of ff.sample ?? []) {
+      const dis = decodeToolResult(await h.call("disassemble_range", {
+        executable_path: LS,
+        start_addr: fn.addr,
+        end_addr: "0x" + (parseInt(fn.addr, 16) + 0x400).toString(16),
+      }));
+      for (const line of dis.lines ?? []) {
+        if (line.mnemonic !== "bl" && line.mnemonic !== "b") continue;
+        const m = line.operands?.match(/0x([0-9a-fA-F]+)/);
+        if (m) { knownTarget = "0x" + m[1]; break outer; }
+      }
+    }
+    assert.ok(knownTarget,
+      `expected to find a bl/b instruction with hex operand in /bin/ls disassembly`);
+    const result = decodeToolResult(await h.call("find_xrefs", {
+      executable_path: LS, target_addr: knownTarget,
+    }));
+    const xrefs = Array.isArray(result) ? result : (result?.xrefs ?? []);
+    assert.ok(xrefs.length >= 1,
+      `expected ≥1 xref to known-called target ${knownTarget}, got ${xrefs.length}`);
   } finally { await h.close(); }
 });
 
@@ -142,6 +167,8 @@ test("import_macho with arch selection works on a fat binary", async () => {
     } catch (err) {
       // Fat binary not available or slice missing on this host — graceful fallback:
       // verify that import_macho accepts arch param on a thin binary without erroring.
+      // Log to stderr so CI surfaces the degradation; the test still passes.
+      console.warn(`[macho test 7] fat-binary unavailable (${err.message}); falling back to thin /bin/echo`);
       result = decodeToolResult(await h.call("import_macho", {
         executable_path: ECHO,
         arch: "arm64e",

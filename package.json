@@ -9,22 +9,10 @@
   },
   "scripts": {
     "start": "node ./src/mcp-server.js",
-    "check": "node --check ./src/mcp-server.js && node --check ./src/server-tools.js && node --check ./src/server-resources.js && node --check ./src/server-prompts.js && node --check ./src/server-helpers.js && node --check ./src/server-format.js && node --check ./test/fixtures/sample-session.mjs && node --check ./src/hopper-live.js && node --check ./src/macho-importer.js && node --check ./src/official-hopper-backend.js && node --check ./src/official-snapshot.js && node --check ./src/hopper-bridge.js && node --check ./src/knowledge-store.js && node --check ./src/transaction-manager.js && node --check ./src/research-tools.js && node --check ./test/protocol-compat.mjs && node --check ./test/smoke.mjs && node --check ./test/real-app.mjs && node --check ./test/live-hopper.mjs && node --check ./test/official-backend.mjs && node --check ./test/all-tools-real.mjs && node --check ./test/research-tools.mjs && node --check ./test/research-integration.mjs && node --check ./test/multi-binary.mjs && node --check ./test/deep-coverage.mjs && node --check ./test/binary-zoo.mjs && node --check ./test/live-hopper-aggressive.mjs && node --check ./test/knowledge-store.mjs && node --check ./test/session-lifecycle.mjs && node --check ./test/procedure-resolution.mjs && node --check ./test/hopper-real-app.mjs",
-    "smoke": "node ./test/smoke.mjs",
-    "test:protocol": "node ./test/protocol-compat.mjs",
-    "test:real": "node ./test/real-app.mjs",
-    "test:live": "node ./test/live-hopper.mjs",
-    "test:official": "node ./test/official-backend.mjs",
-    "test:tools": "node ./test/all-tools-real.mjs",
-    "test:research": "node --test ./test/research-tools.mjs && node ./test/research-integration.mjs",
-    "test:store": "node --test ./test/knowledge-store.mjs",
-    "test:multi": "node ./test/multi-binary.mjs",
-    "test:deep": "node ./test/deep-coverage.mjs",
-    "test:zoo": "node ./test/binary-zoo.mjs",
-    "test:lifecycle": "node ./test/session-lifecycle.mjs",
-    "test:resolution": "node ./test/procedure-resolution.mjs",
-    "test:live:aggressive": "node ./test/live-hopper-aggressive.mjs",
-    "test:hopper-real-app": "node ./test/hopper-real-app.mjs"
+    "check": "node --check src/*.js && node --check test/*.mjs && node --check test/fixtures/*.mjs",
+    "test": "npm run check && node --test test/protocol.mjs test/smoke.mjs test/store.mjs test/lifecycle.mjs test/macho.mjs test/snapshot.mjs test/transactions.mjs test/research.mjs",
+    "test:live": "HOPPER_MCP_LIVE=1 node --test test/live.mjs",
+    "test:all": "npm test && npm run test:live"
   },
   "engines": {
     "node": ">=20"

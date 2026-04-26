@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir, rename, unlink, readdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, basename } from "node:path";
 
 const EMPTY_STORE = {
   schemaVersion: 1,
@@ -34,16 +34,26 @@ export class KnowledgeStore {
     await this._sweepOrphanTmps();
   }
 
+  // Called once from load() at startup, before the MCP transport accepts
+  // requests, so no in-flight _writeStateToDisk can have a tmpfile open at
+  // this point. Anything matching `<basename>.<pid>.<ts>.tmp` is from a
+  // crashed prior process and safe to remove.
   async _sweepOrphanTmps() {
     const dir = dirname(this.path);
-    const base = this.path.split("/").pop();
+    const base = basename(this.path);
     let entries;
     try { entries = await readdir(dir); } catch { return; }
     const prefix = `${base}.`;
     const suffix = ".tmp";
     for (const name of entries) {
       if (!name.startsWith(prefix) || !name.endsWith(suffix)) continue;
-      try { await unlink(`${dir}/${name}`); } catch {}
+      try {
+        await unlink(`${dir}/${name}`);
+      } catch (err) {
+        try {
+          process.stderr.write(`[hopper-mcp] knowledge-store sweep failed for ${name}: ${err?.stack ?? err}\n`);
+        } catch {}
+      }
     }
   }
 

@@ -26,15 +26,40 @@ for (const kind of ["capabilities", "anti_analysis", "entropy", "code_signing", 
 // functions in the session and returns { updated: N }. The plan template assumed
 // an addr arg that does not exist in the implementation.
 
-test("compute_fingerprints returns stable updated count", async () => {
+test("compute_fingerprints produces deterministic per-function hashes", async () => {
   const { sessionId, ...h } = await startWithSample();
+  // The function at 0x100003f50 has imports + strings + basicBlocks, giving a rich fingerprint.
+  const ADDR = "0x100003f50";
   try {
-    const a = decodeToolResult(await h.call("compute_fingerprints", { session_id: sessionId }));
-    const b = decodeToolResult(await h.call("compute_fingerprints", { session_id: sessionId }));
-    assert.ok(typeof a === "object" && a !== null, "first result is an object");
-    assert.ok(typeof a.updated === "number" && a.updated >= 1,
-      `expected updated >= 1, got ${a.updated}`);
-    assert.deepEqual(a, b, "two calls return identical results");
+    // First round: fingerprint all functions, then retrieve the per-function hash via
+    // find_similar_functions — the only public tool that returns target.fingerprint.
+    const r1 = decodeToolResult(await h.call("compute_fingerprints", { session_id: sessionId }));
+    assert.ok(typeof r1.updated === "number" && r1.updated >= 1,
+      `expected updated >= 1, got ${r1.updated}`);
+    const sim1 = decodeToolResult(
+      await h.call("find_similar_functions", {
+        addr: ADDR,
+        session_id: sessionId,
+        min_similarity: 0,
+      })
+    );
+    const fp1 = sim1.target.fingerprint;
+    assert.ok(fp1 !== null && typeof fp1 === "object", "first fingerprint is an object");
+
+    // Second round: recompute and retrieve again.
+    const r2 = decodeToolResult(await h.call("compute_fingerprints", { session_id: sessionId }));
+    assert.equal(r2.updated, r1.updated, "updated count is stable across calls");
+    const sim2 = decodeToolResult(
+      await h.call("find_similar_functions", {
+        addr: ADDR,
+        session_id: sessionId,
+        min_similarity: 0,
+      })
+    );
+    const fp2 = sim2.target.fingerprint;
+
+    // Core determinism assertion: the actual hash bytes must be identical.
+    assert.deepEqual(fp1, fp2, "fingerprint hashes are byte-identical across two compute_fingerprints calls");
   } finally { await h.close(); }
 });
 

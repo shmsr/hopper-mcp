@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename, unlink, readdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
 const EMPTY_STORE = {
@@ -31,6 +31,20 @@ export class KnowledgeStore {
       this.state = structuredClone(EMPTY_STORE);
       await this.save();
     }
+    await this._sweepOrphanTmps();
+  }
+
+  async _sweepOrphanTmps() {
+    const dir = dirname(this.path);
+    const base = this.path.split("/").pop();
+    let entries;
+    try { entries = await readdir(dir); } catch { return; }
+    const prefix = `${base}.`;
+    const suffix = ".tmp";
+    for (const name of entries) {
+      if (!name.startsWith(prefix) || !name.endsWith(suffix)) continue;
+      try { await unlink(`${dir}/${name}`); } catch {}
+    }
   }
 
   // Durable: resolves once the latest enqueued write has hit disk.
@@ -62,8 +76,14 @@ export class KnowledgeStore {
   async _writeStateToDisk() {
     await mkdir(dirname(this.path), { recursive: true });
     const tmp = `${this.path}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(tmp, JSON.stringify(this.state) + "\n", "utf8");
-    await rename(tmp, this.path);
+    try {
+      await writeFile(tmp, JSON.stringify(this.state) + "\n", "utf8");
+      await rename(tmp, this.path);
+    } catch (err) {
+      // Best-effort cleanup so we don't leak tmpfiles on write/rename failure.
+      try { await unlink(tmp); } catch {}
+      throw err;
+    }
   }
 
   listSessions() {

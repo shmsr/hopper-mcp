@@ -8,6 +8,10 @@ export function sampleSession() {
       format: "Mach-O",
       arch: "arm64",
       baseAddress: "0x100000000",
+      segments: [
+        { name: "__TEXT", start: "0x100000000", length: 32768, executable: true, writable: false, sections: [] },
+        { name: "__DATA", start: "0x100008000", length: 8192,  executable: false, writable: true,  sections: [] },
+      ],
     },
     capabilities: { officialApi: true, privateApi: false, dynamicDebugger: false },
     imports: ["_SecItemCopyMatching", "_CC_SHA256", "_ptrace", "_objc_msgSend"],

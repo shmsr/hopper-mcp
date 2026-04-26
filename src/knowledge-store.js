@@ -410,15 +410,16 @@ export class KnowledgeStore {
     };
   }
 
-  // Single dispatch point used by the `list` tool. Each kind returns a shape
-  // compatible with the corresponding pre-overhaul `list_*` tool.
+  // Single dispatch point used by the `list` tool. Most kinds return shapes
+  // compatible with the corresponding pre-overhaul list_* tool. `names`
+  // returns the richer {name, demangled} shape.
   listByKind(sessionId, kind, detail = "brief") {
     const session = this.getSession(sessionId);
     switch (kind) {
       case "procedures": return this._listProcedures(session, detail);
       case "strings":    return this._listStrings(session);
       case "names":      return this._listNames(session);
-      case "segments":   return session.segments ?? [];
+      case "segments":   return (session.binary?.segments ?? []).map(projectSegment);
       case "bookmarks":  return session.bookmarks ?? [];
       case "imports":    return session.imports ?? [];
       case "exports":    return session.exports ?? [];
@@ -433,13 +434,17 @@ export class KnowledgeStore {
     for (const fn of fns) {
       const addr = formatAddress(fn.addr);
       if (detail === "size") {
-        out[addr] = { name: fn.name ?? null, size: fn.size ?? 0, basicblock_count: fn.basicBlocks?.length ?? 0 };
+        out[addr] = {
+          name: fn.name ?? null,
+          size: fn.size ?? null,
+          basicblock_count: fn.basicBlockCount ?? fn.basicBlocks?.length ?? 0,
+        };
       } else if (detail === "info") {
         out[addr] = {
           name: fn.name ?? null,
           entrypoint: addr,
-          length: fn.size ?? 0,
-          basicblock_count: fn.basicBlocks?.length ?? 0,
+          length: fn.size ?? null,
+          basicblock_count: fn.basicBlockCount ?? fn.basicBlocks?.length ?? 0,
           basicblocks: fn.basicBlocks ?? [],
           signature: fn.signature ?? null,
           locals: fn.locals ?? [],
@@ -463,6 +468,13 @@ export class KnowledgeStore {
     const out = {};
     for (const n of session.names ?? []) {
       out[formatAddress(n.addr)] = { name: n.name, demangled: n.demangled ?? null };
+    }
+    // Merge in function names so renames show up in `list({kind:"names"})` too.
+    for (const fn of Object.values(session.functions ?? {})) {
+      if (fn?.addr && fn?.name) {
+        const addr = formatAddress(fn.addr);
+        if (!(addr in out)) out[addr] = { name: fn.name, demangled: null };
+      }
     }
     return out;
   }
@@ -624,6 +636,33 @@ function inferPurpose(fn) {
   if (imports.includes("url") || imports.includes("network")) return "Likely participates in networking behavior.";
   if (imports.includes("ptrace") || strings.includes("debug")) return "Potential anti-debug or debugger-awareness logic.";
   return "Purpose is not yet inferred; inspect evidence anchors before naming.";
+}
+
+// Inline projection for segments — mirrors officialSegment in server-helpers.js
+// without importing it (server-helpers imports from this module, so the inverse
+// would create a circular dependency).
+function projectSegment(segment) {
+  const start = parseAddress(segment.start);
+  const length = Number(segment.length ?? 0);
+  const end = segment.end ?? (start !== null && length > 0 ? formatAddress(start + length) : null);
+  return {
+    name: segment.name ?? null,
+    start: segment.start ?? null,
+    end,
+    writable: String(Boolean(segment.writable ?? segment.writeable ?? segment.protection?.includes?.("w"))),
+    executable: String(Boolean(segment.executable ?? segment.protection?.includes?.("x"))),
+    sections: (segment.sections ?? []).map((section) => {
+      const sectionStart = parseAddress(section.start);
+      const sectionLength = Number(section.length ?? 0);
+      return {
+        name: section.name ?? null,
+        start: section.start ?? null,
+        end:
+          section.end ??
+          (sectionStart !== null && sectionLength > 0 ? formatAddress(sectionStart + sectionLength) : null),
+      };
+    }),
+  };
 }
 
 function parseHopperUri(uri) {

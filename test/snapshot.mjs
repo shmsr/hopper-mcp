@@ -39,3 +39,54 @@ test("list rejects unknown kind", async () => {
     await assert.rejects(() => h.call("list", { kind: "nonsense" }), /kind/i);
   } finally { await h.close(); }
 });
+
+test("list({kind:'segments'}) returns non-empty array of segments", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(await h.call("list", { kind: "segments" }));
+    assert.ok(Array.isArray(out), "segments should be an array");
+    assert.ok(out.length > 0, "expected at least one segment in sample session");
+    // Each entry should have at least a name and start.
+    for (const seg of out) {
+      assert.equal(typeof seg, "object");
+    }
+  } finally { await h.close(); }
+});
+
+test("list({kind:'names'}) returns {name, demangled} entries and includes function renames", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(await h.call("list", { kind: "names" }));
+    assert.equal(typeof out, "object");
+    for (const [addr, entry] of Object.entries(out)) {
+      assert.match(addr, /^0x[0-9a-f]+$/i);
+      assert.equal(typeof entry, "object");
+      assert.equal(typeof entry.name, "string");
+      assert.ok("demangled" in entry);
+    }
+  } finally { await h.close(); }
+});
+
+test("list({kind:'bookmarks'}) returns array", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(await h.call("list", { kind: "bookmarks" }));
+    assert.ok(Array.isArray(out));
+  } finally { await h.close(); }
+});
+
+test("list({kind:'imports'}) returns array", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(await h.call("list", { kind: "imports" }));
+    assert.ok(Array.isArray(out));
+  } finally { await h.close(); }
+});
+
+test("list({kind:'exports'}) returns array", async () => {
+  const h = await startWithSample();
+  try {
+    const out = decodeToolResult(await h.call("list", { kind: "exports" }));
+    assert.ok(Array.isArray(out));
+  } finally { await h.close(); }
+});

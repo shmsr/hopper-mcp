@@ -91,8 +91,18 @@ export async function startServer({ env = {} } = {}) {
 }
 
 // Decode the JSON content block from a tools/call result.
+// structuredContent wraps arrays/scalars as { result: v } (see server-format.js).
+// Unwrap that envelope so callers always receive the raw value (array, object, scalar).
 export function decodeToolResult(result) {
-  if (result.structuredContent !== undefined) return result.structuredContent;
+  const sc = result.structuredContent;
+  if (sc !== undefined) {
+    // Unwrap the { result: v } envelope that structuredToolContent emits for
+    // non-plain-object values (arrays, strings, numbers).
+    if (sc !== null && typeof sc === "object" && Object.keys(sc).length === 1 && "result" in sc) {
+      return sc.result;
+    }
+    return sc;
+  }
   const block = result.content?.find((c) => c.type === "text");
   return block ? JSON.parse(block.text) : null;
 }

@@ -45,7 +45,7 @@ test("upsertSession with overwrite:false rejects duplicate sessionId", async () 
     await store.upsertSession({ sessionId: "a", binary: { name: "A" }, functions: [], strings: [] });
     await assert.rejects(
       () => store.upsertSession({ sessionId: "a", binary: { name: "A2" }, functions: [], strings: [] }, { overwrite: false }),
-      /already exists|duplicate|exists/i,
+      /already exists/i,
     );
   } finally {
     await store.save(); // drain scheduleSave() before rm to avoid ENOTEMPTY race
@@ -60,7 +60,7 @@ test("setCurrentSession rejects unknown id and accepts known id", async () => {
   try {
     await store.upsertSession({ sessionId: "a", binary: { name: "A" }, functions: [], strings: [] });
     await store.upsertSession({ sessionId: "b", binary: { name: "B" }, functions: [], strings: [] });
-    assert.throws(() => store.setCurrentSession("nope"), /No Hopper session|not found|unknown/i);
+    assert.throws(() => store.setCurrentSession("nope"), /No Hopper session/i);
     store.setCurrentSession("a");
     assert.equal(store.state.currentSessionId, "a");
   } finally {

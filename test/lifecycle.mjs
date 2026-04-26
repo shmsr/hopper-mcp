@@ -32,6 +32,9 @@ test("open_session(overwrite:false) on existing id is rejected", async () => {
   const h = await startServer();
   try {
     await h.call("open_session", { session: { ...sampleSession(), sessionId: "dup" } });
-    await assert.rejects(() => h.call("open_session", { session: { ...sampleSession(), sessionId: "dup" }, overwrite: false }));
+    await assert.rejects(
+      () => h.call("open_session", { session: { ...sampleSession(), sessionId: "dup" }, overwrite: false }),
+      /already exists/i,
+    );
   } finally { await h.close(); }
 });

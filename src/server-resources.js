@@ -150,4 +150,15 @@ export function registerResources(server, store) {
     },
     read,
   );
+
+  server.registerResource(
+    "transaction",
+    new ResourceTemplate("hopper://transactions/{id}", { list: undefined }),
+    {
+      title: "Transaction",
+      description: "Read a specific local transaction by id.",
+      mimeType: "application/json",
+    },
+    read,
+  );
 }

@@ -137,6 +137,25 @@ test("analyze_binary rejects unknown kind", async () => {
   } finally { await h.close(); }
 });
 
+test("hopper://transactions/{id} returns the matching transaction", async () => {
+  const h = await startWithSample();
+  try {
+    const beginRes = await h.call("begin_transaction", { name: "test-txn" });
+    const begin = decodeToolResult(beginRes);
+    const id = begin.transactionId ?? begin.id;
+    const read = await h.readResource(`hopper://transactions/${id}`);
+    const body = JSON.parse(read.contents[0].text);
+    assert.equal(body.id ?? body.transactionId, id);
+  } finally { await h.close(); }
+});
+
+test("hopper://transactions/{id} returns 404-equivalent for unknown id", async () => {
+  const h = await startWithSample();
+  try {
+    await assert.rejects(() => h.readResource("hopper://transactions/unknown-xxx"));
+  } finally { await h.close(); }
+});
+
 test("procedure({field:'comments'}) returns prefix + inline comments map", async () => {
   const h = await startWithSample();
   try {

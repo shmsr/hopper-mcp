@@ -314,6 +314,13 @@ export class KnowledgeStore {
     };
   }
 
+  getTransactionById(session, txnId) {
+    const pending = session.transactions?.pending ?? [];
+    const txn = pending.find((t) => t.id === txnId);
+    if (!txn) throw new Error(`No transaction '${txnId}' in session '${session.sessionId}'.`);
+    return txn;
+  }
+
   getResource(uri) {
     const parsed = parseHopperUri(uri);
     const session = this.getSession(parsed.sessionId ?? "current");
@@ -338,6 +345,10 @@ export class KnowledgeStore {
     if (parsed.path === "/objc/classes") return session.objcClasses;
     if (parsed.path === "/swift/symbols") return session.swiftSymbols;
     if (parsed.path === "/transactions/pending") return session.transactions?.pending ?? [];
+    if (parsed.path.startsWith("/transactions/") && parsed.path !== "/transactions/pending") {
+      const id = parsed.path.slice("/transactions/".length);
+      return this.getTransactionById(session, id);
+    }
 
     const functionMatch = parsed.path.match(/^\/function\/([^/]+)(?:\/(summary|evidence))?$/);
     if (functionMatch) {

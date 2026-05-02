@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+: "${HOPPER_MCP_STORE:=$ROOT/data/knowledge-store.json}"
+export HOPPER_MCP_STORE
+
+if [ "${HOPPER_MCPD_BIN:-}" ] && [ -x "$HOPPER_MCPD_BIN" ]; then
+  exec "$HOPPER_MCPD_BIN" "$@"
+fi
+
+if [ -x "$ROOT/target/release/hopper-mcpd" ]; then
+  exec "$ROOT/target/release/hopper-mcpd" "$@"
+fi
+
+if [ -x "$ROOT/target/debug/hopper-mcpd" ]; then
+  exec "$ROOT/target/debug/hopper-mcpd" "$@"
+fi
+
+exec cargo run --manifest-path "$ROOT/Cargo.toml" -p hopper-mcpd -- "$@"

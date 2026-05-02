@@ -1,0 +1,59 @@
+{
+  "defaults": {
+    "timeout_ms": 180000,
+    "max_functions": 50,
+    "max_strings": 120,
+    "close_after_export": true
+  },
+  "targets": [
+    {
+      "id": "capture-one",
+      "app_bundle": "/Applications/Capture One.app",
+      "optional": true,
+      "max_elapsed_ms": 120000,
+      "min_functions": 1
+    },
+    {
+      "id": "google-chrome",
+      "app_bundle": "/Applications/Google Chrome.app",
+      "optional": true,
+      "max_elapsed_ms": 120000,
+      "min_functions": 1
+    },
+    {
+      "id": "visual-studio-code",
+      "app_bundle": "/Applications/Visual Studio Code.app",
+      "optional": true,
+      "max_elapsed_ms": 120000,
+      "min_functions": 1
+    },
+    {
+      "id": "safari",
+      "app_bundle": "/Applications/Safari.app",
+      "optional": true,
+      "max_elapsed_ms": 120000,
+      "min_functions": 1
+    },
+    {
+      "id": "davinci-resolve",
+      "app_bundle": "/Applications/DaVinci Resolve/DaVinci Resolve.app",
+      "optional": true,
+      "max_elapsed_ms": 180000,
+      "min_functions": 1
+    },
+    {
+      "id": "adobe-photoshop-2026",
+      "app_bundle": "/Applications/Adobe Photoshop 2026/Adobe Photoshop 2026.app",
+      "optional": true,
+      "max_elapsed_ms": 180000,
+      "min_functions": 1
+    },
+    {
+      "id": "xcode",
+      "app_bundle": "/Applications/Xcode.app",
+      "optional": true,
+      "max_elapsed_ms": 180000,
+      "min_functions": 1
+    }
+  ]
+}

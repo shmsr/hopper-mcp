@@ -1,0 +1,7 @@
+data/*.json
+data/*.log
+!data/.gitkeep
+node_modules/
+target/
+dist/
+.cache/

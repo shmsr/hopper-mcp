@@ -1,0 +1,49 @@
+{
+  "defaults": {
+    "timeout_ms": 120000,
+    "max_functions": 30,
+    "max_strings": 80,
+    "close_after_export": true
+  },
+  "targets": [
+    {
+      "id": "echo",
+      "path": "/bin/echo",
+      "wait_for_analysis": true,
+      "min_functions": 1,
+      "min_strings": 1,
+      "max_elapsed_ms": 60000
+    },
+    {
+      "id": "ls",
+      "path": "/bin/ls",
+      "min_functions": 1,
+      "max_elapsed_ms": 60000
+    },
+    {
+      "id": "true",
+      "path": "/usr/bin/true",
+      "min_functions": 1,
+      "max_elapsed_ms": 60000
+    },
+    {
+      "id": "codesign",
+      "path": "/usr/bin/codesign",
+      "min_functions": 1,
+      "max_elapsed_ms": 60000
+    },
+    {
+      "id": "security",
+      "path": "/usr/bin/security",
+      "min_functions": 1,
+      "max_elapsed_ms": 60000
+    },
+    {
+      "id": "finder",
+      "app_bundle": "/System/Library/CoreServices/Finder.app",
+      "live": false,
+      "max_functions": 20,
+      "max_strings": 50
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+[package]
+name = "hopper-mcpd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust MCP daemon for Hopper reverse-engineering snapshots."
+
+[[bin]]
+name = "hopper-mcpd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+hopper-wire = { path = "../hopper-wire" }
+regex = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+wait-timeout = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.10"

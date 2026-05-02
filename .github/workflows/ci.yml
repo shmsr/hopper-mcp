@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-check:
+    name: release check
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run non-live release gate
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          npm run --silent release:check > reports/release-check.json
+          status=$?
+          cat reports/release-check.json
+          exit $status
+
+      - name: Upload non-live release gate report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hopper-nonlive-release-gate-report
+          path: reports/release-check.json
+          if-no-files-found: ignore
+
+  live-release-check:
+    name: live Hopper release check
+    runs-on: [self-hosted, macOS, hopper]
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 90
+    concurrency:
+      group: hopper-mcp-live-release-check
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify Hopper installation
+        run: cargo run -p hopper-mcpd -- doctor --require-hopper
+
+      - name: Run live release gate
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          npm run --silent release:check:live > reports/release-check-live.json
+          status=$?
+          cat reports/release-check-live.json
+          exit $status
+
+      - name: Run large-app soak
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          npm run --silent test:live:corpus:large-apps -- --report reports/live-corpus-large-apps.json
+          status=$?
+          cat reports/live-corpus-large-apps.json
+          exit $status
+
+      - name: Run private backend gate
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          npm run --silent release:check:private-backend > reports/release-check-private-backend.json
+          status=$?
+          cat reports/release-check-private-backend.json
+          exit $status
+
+      - name: Run signed plugin gate
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          npm run --silent release:check:plugin-live > reports/release-check-plugin-live.json
+          status=$?
+          cat reports/release-check-plugin-live.json
+          exit $status
+
+      - name: Run distribution gate
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          npm run --silent release:check:distribution > reports/release-check-distribution.json
+          status=$?
+          cat reports/release-check-distribution.json
+          exit $status
+
+      - name: Run public release gate
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          npm run --silent release:check:public-release > reports/release-check-public-release.json
+          status=$?
+          cat reports/release-check-public-release.json
+          exit $status
+
+      - name: Cleanup Hopper runner state
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          npm run --silent cleanup:hopper-state > reports/cleanup-hopper-state.json
+          status=$?
+          cat reports/cleanup-hopper-state.json
+          exit $status
+
+      - name: Upload structured gate reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hopper-release-gate-reports
+          path: reports/*.json
+          if-no-files-found: ignore

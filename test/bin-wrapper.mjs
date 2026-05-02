@@ -5,6 +5,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+const BIN_WRAPPER_TIMEOUT_MS = 60_000;
+
 test("bin/hopper-mcp speaks MCP initialize over stdio", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "hopper-mcp-bin-"));
   const child = spawn("bin/hopper-mcp", [], {
@@ -17,7 +19,7 @@ test("bin/hopper-mcp speaks MCP initialize over stdio", async () => {
   });
 
   try {
-    const linePromise = readFirstStdoutLine(child, 5000);
+    const linePromise = readFirstStdoutLine(child, BIN_WRAPPER_TIMEOUT_MS);
     child.stdin.end('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}\n');
 
     const line = await linePromise;

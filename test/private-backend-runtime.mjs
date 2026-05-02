@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
+const PROBE_TIMEOUT_MS = 15_000;
+
 test("private-backend-runtime probe launches Hopper with plugin socket env and verifies the plugin-service bridge", async () => {
   const built = await run("npm", ["run", "build:agent"]);
   assert.equal(built.code, 0, built.stderr);
@@ -66,7 +68,7 @@ done
         "--target",
         "/bin/echo",
         "--timeout-ms",
-        "15000",
+        String(PROBE_TIMEOUT_MS),
       ]);
       assert.equal(result.code, 0, `${result.stderr}\n${serviceStderr}`);
       const payload = JSON.parse(result.stdout);
@@ -75,7 +77,7 @@ done
       assert.equal(payload.procedures.procedures[0].addr, "0x5000");
       assert.equal(payload.cleanup.agentTerminated, true);
       assert.equal(payload.cleanup.hopperTerminated, true);
-      await waitForFile(launchLog);
+      await waitForFile(launchLog, PROBE_TIMEOUT_MS);
       const launchEnv = await readFile(launchLog, "utf8");
       assert.match(launchEnv, /^DYLD_INSERT_LIBRARIES=\s*$/m);
       assert.match(launchEnv, new RegExp(`HOPPER_MCP_PLUGIN_SOCKET=${escapeRegex(socket)}`));
@@ -151,7 +153,7 @@ done
         "--target",
         "/bin/echo",
         "--timeout-ms",
-        "15000",
+        String(PROBE_TIMEOUT_MS),
       ]);
       assert.equal(result.code, 0, `${result.stderr}\n${serverStderr}`);
       const payload = JSON.parse(result.stdout);
